@@ -1,0 +1,320 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+STATE_DIR="$ROOT_DIR/.qwen-vast"
+STATE_FILE="$STATE_DIR/state.json"
+ENV_FILE="$STATE_DIR/env"
+KNOWN_HOSTS="$STATE_DIR/known_hosts"
+TUNNEL_LOG="$STATE_DIR/tunnel.log"
+
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"
+
+if [[ -f "$ROOT_DIR/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$ROOT_DIR/.env"
+  set +a
+fi
+
+GPU_QUERY="${GPU_QUERY:-num_gpus=1 gpu_name in [\"RTX_6000Ada\",\"L40S\",\"RTX_A6000\"] gpu_ram>=48 cpu_ram>=64000 reliability>0.98 inet_down>=500 cuda_vers>=12.8 disk_space>=60 rented=False direct_port_count>=1}"
+MAX_DPH="${MAX_DPH:-0.80}"
+DISK_GB="${DISK_GB:-60}"
+LOCAL_PORT="${LOCAL_PORT:-18080}"
+START_TIMEOUT="${START_TIMEOUT:-1200}"
+KEEP_ON_FAILURE="${KEEP_ON_FAILURE:-0}"
+MODEL="${MODEL:-Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf}"
+CTX_SIZE="${CTX_SIZE:-245760}"
+USE_FASTMTP="${USE_FASTMTP:-1}"
+REASONING_EFFORT="${REASONING_EFFORT:-xhigh}"
+HF_REVISION="${HF_REVISION:-993a5971fda8f30dd1b7eb2654792ba4415c7460}"
+LABEL="${VAST_LABEL:-qwen38-$(date +%s)}"
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo >&2 "ERROR: missing dependency: $1"
+    exit 2
+  }
+}
+
+for cmd in vastai jq curl ssh python3 openssl; do need "$cmd"; done
+
+if [[ -z "${HF_TOKEN:-}" ]]; then
+  echo >&2 "ERROR: HF_TOKEN is required because the model repository is gated."
+  echo >&2 "Accept the model access conditions on Hugging Face, then set HF_TOKEN in .env."
+  exit 2
+fi
+
+if [[ -z "${GHCR_IMAGE:-}" || "$GHCR_IMAGE" == *"OWNER/REPO"* ]]; then
+  echo >&2 "ERROR: set GHCR_IMAGE in .env, e.g. ghcr.io/yourname/qwen38-vast:latest"
+  exit 2
+fi
+
+if [[ -f "$STATE_FILE" ]]; then
+  old_id="$(jq -r '.instance_id // empty' "$STATE_FILE" 2>/dev/null || true)"
+  if [[ -n "$old_id" ]]; then
+    if old_json="$(vastai show instance "$old_id" --raw 2>/dev/null)"; then
+      old_status="$(jq -r '.actual_status // .status // "unknown"' <<<"$old_json" 2>/dev/null || echo unknown)"
+      if [[ "$old_status" != "exited" && "$old_status" != "offline" ]]; then
+        echo >&2 "ERROR: state file already references Vast instance $old_id ($old_status)."
+        echo >&2 "Run ./qwen-status or ./qwen-down first."
+        exit 3
+      fi
+    fi
+  fi
+  rm -f "$STATE_FILE" "$ENV_FILE" "$TUNNEL_LOG" "$KNOWN_HOSTS"
+fi
+
+if python3 - "$LOCAL_PORT" <<'PY'
+import socket, sys
+port = int(sys.argv[1])
+s = socket.socket()
+try:
+    s.bind(("127.0.0.1", port))
+except OSError:
+    raise SystemExit(1)
+finally:
+    s.close()
+PY
+then
+  :
+else
+  echo >&2 "ERROR: local port $LOCAL_PORT is already in use. Change LOCAL_PORT in .env."
+  exit 2
+fi
+
+MODEL_API_KEY="${MODEL_API_KEY:-sk-local-$(openssl rand -hex 24)}"
+instance_id=""
+tunnel_pid=""
+ready=0
+
+cleanup_paid_instance() {
+  local reason="$1"
+  [[ -n "$tunnel_pid" ]] && kill "$tunnel_pid" >/dev/null 2>&1 || true
+  if [[ -n "$instance_id" && "$KEEP_ON_FAILURE" != "1" ]]; then
+    echo >&2 "[cleanup] $reason; destroying Vast instance $instance_id to stop billing..."
+    vastai destroy instance "$instance_id" --raw >/dev/null 2>&1 || true
+    rm -f "$STATE_FILE" "$ENV_FILE"
+  elif [[ -n "$instance_id" ]]; then
+    echo >&2 "[cleanup] $reason; KEEP_ON_FAILURE=1, leaving instance $instance_id running."
+  fi
+}
+
+on_signal() {
+  cleanup_paid_instance "interrupted"
+  exit 130
+}
+trap on_signal INT TERM
+
+printf '[search] %s\n' "$GPU_QUERY"
+offers_raw="$(vastai search offers "$GPU_QUERY" --order dph_total --limit 25 --storage "$DISK_GB" --raw)"
+
+offers="$(jq -c '
+  if type == "array" then .
+  elif (.offers? | type) == "array" then .offers
+  elif .offers? then [.offers]
+  elif (.bundles? | type) == "array" then .bundles
+  else [] end
+' <<<"$offers_raw")"
+
+offer="$(jq -c --argjson max "$MAX_DPH" '
+  [ .[]
+    | ._effective_dph = (.dph_total // .dph_base // 999999)
+    | select(._effective_dph <= $max)
+  ]
+  | sort_by(._effective_dph)
+  | .[0] // empty
+' <<<"$offers")"
+
+if [[ -z "$offer" || "$offer" == "null" ]]; then
+  echo >&2 "ERROR: no matching offer at or below \$$MAX_DPH/h."
+  echo >&2 "Raise MAX_DPH or loosen GPU_QUERY in .env."
+  exit 4
+fi
+
+offer_id="$(jq -r '.id // .ask_contract_id // empty' <<<"$offer")"
+gpu_name="$(jq -r '.gpu_name // "unknown"' <<<"$offer")"
+dph="$(jq -r '._effective_dph' <<<"$offer")"
+inet_down="$(jq -r '.inet_down // "?"' <<<"$offer")"
+reliability="$(jq -r '.reliability2 // .reliability // "?"' <<<"$offer")"
+location="$(jq -r '.geolocation // "?"' <<<"$offer")"
+
+if [[ -z "$offer_id" ]]; then
+  echo >&2 "ERROR: could not read offer ID from Vast response."
+  exit 4
+fi
+
+printf '[rent] %s | $%.4f/h | down=%s Mbps | reliability=%s | %s | offer=%s\n' \
+  "$gpu_name" "$dph" "$inet_down" "$reliability" "$location" "$offer_id"
+
+docker_env="-e HF_TOKEN=${HF_TOKEN} -e LLAMA_API_KEY=${MODEL_API_KEY} -e MODEL=${MODEL} -e CTX_SIZE=${CTX_SIZE} -e USE_FASTMTP=${USE_FASTMTP} -e REASONING_EFFORT=${REASONING_EFFORT} -e HF_REVISION=${HF_REVISION} -e BIND_HOST=127.0.0.1"
+onstart='mkdir -p /var/log/qwen38; nohup /usr/local/bin/start.sh >/var/log/qwen38/server.log 2>&1 &'
+
+create_raw="$(vastai create instance "$offer_id" \
+  --image "$GHCR_IMAGE" \
+  --disk "$DISK_GB" \
+  --label "$LABEL" \
+  --env "$docker_env" \
+  --ssh --direct \
+  --onstart-cmd "$onstart" \
+  --raw)" || {
+    echo >&2 "ERROR: Vast failed to create the instance."
+    exit 5
+  }
+
+instance_id="$(jq -r '.new_contract // .instance_id // .id // empty' <<<"$create_raw")"
+if [[ -z "$instance_id" ]]; then
+  echo >&2 "ERROR: Vast create response did not contain an instance ID:"
+  echo >&2 "$create_raw"
+  exit 5
+fi
+
+jq -n \
+  --argjson instance_id "$instance_id" \
+  --arg offer_id "$offer_id" \
+  --arg gpu "$gpu_name" \
+  --argjson dph "$dph" \
+  --arg model "$MODEL" \
+  --argjson ctx "$CTX_SIZE" \
+  --arg api_key "$MODEL_API_KEY" \
+  --arg image "$GHCR_IMAGE" \
+  --arg label "$LABEL" \
+  '{instance_id:$instance_id,offer_id:$offer_id,gpu:$gpu,dph:$dph,model:$model,ctx_size:$ctx,api_key:$api_key,image:$image,label:$label}' \
+  > "$STATE_FILE"
+chmod 600 "$STATE_FILE"
+
+echo "[boot] Vast instance $instance_id created; waiting for SSH..."
+start_epoch="$(date +%s)"
+ssh_url=""
+while :; do
+  now="$(date +%s)"
+  if (( now - start_epoch > START_TIMEOUT )); then
+    cleanup_paid_instance "startup timeout while waiting for SSH"
+    exit 6
+  fi
+
+  instance_json="$(vastai show instance "$instance_id" --raw 2>/dev/null || true)"
+  status="$(jq -r '.actual_status // .status // "loading"' <<<"${instance_json:-{}}" 2>/dev/null || echo loading)"
+  case "$status" in
+    exited|unknown|offline)
+      cleanup_paid_instance "instance entered status '$status'"
+      exit 6
+      ;;
+  esac
+
+  if [[ "$status" == "running" ]]; then
+    ssh_url="$(vastai ssh-url "$instance_id" 2>/dev/null | grep -Eo 'ssh://[^[:space:]]+' | tail -n1 || true)"
+    if [[ -n "$ssh_url" ]]; then
+      break
+    fi
+  fi
+  sleep 5
+done
+
+read -r ssh_user ssh_host ssh_port < <(python3 - "$ssh_url" <<'PY'
+from urllib.parse import urlparse
+import sys
+u = urlparse(sys.argv[1])
+print(u.username or "root", u.hostname or "", u.port or 22)
+PY
+)
+
+if [[ -z "$ssh_host" ]]; then
+  cleanup_paid_instance "could not parse SSH URL '$ssh_url'"
+  exit 6
+fi
+
+ssh_opts=(
+  -o BatchMode=yes
+  -o ConnectTimeout=8
+  -o ServerAliveInterval=15
+  -o ServerAliveCountMax=3
+  -o StrictHostKeyChecking=accept-new
+  -o "UserKnownHostsFile=$KNOWN_HOSTS"
+  -p "$ssh_port"
+)
+
+echo "[ssh] waiting for ${ssh_user}@${ssh_host}:${ssh_port}..."
+while ! ssh "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" true >/dev/null 2>&1; do
+  now="$(date +%s)"
+  if (( now - start_epoch > START_TIMEOUT )); then
+    cleanup_paid_instance "startup timeout while waiting for SSH daemon"
+    exit 6
+  fi
+  sleep 5
+done
+
+nohup ssh "${ssh_opts[@]}" \
+  -o ExitOnForwardFailure=yes \
+  -N -L "${LOCAL_PORT}:127.0.0.1:8080" \
+  "${ssh_user}@${ssh_host}" \
+  >"$TUNNEL_LOG" 2>&1 &
+tunnel_pid=$!
+sleep 2
+if ! kill -0 "$tunnel_pid" >/dev/null 2>&1; then
+  cat "$TUNNEL_LOG" >&2 || true
+  cleanup_paid_instance "SSH tunnel failed"
+  exit 7
+fi
+
+jq \
+  --arg ssh_url "$ssh_url" \
+  --argjson local_port "$LOCAL_PORT" \
+  --argjson tunnel_pid "$tunnel_pid" \
+  '. + {ssh_url:$ssh_url,local_port:$local_port,tunnel_pid:$tunnel_pid}' \
+  "$STATE_FILE" > "$STATE_FILE.tmp"
+mv "$STATE_FILE.tmp" "$STATE_FILE"
+chmod 600 "$STATE_FILE"
+
+base_url="http://127.0.0.1:${LOCAL_PORT}/v1"
+cat > "$ENV_FILE" <<ENV
+export OPENAI_BASE_URL='${base_url}'
+export OPENAI_API_BASE='${base_url}'
+export OPENAI_API_KEY='${MODEL_API_KEY}'
+export QWEN_MODEL='${MODEL}'
+export QWEN_VAST_INSTANCE_ID='${instance_id}'
+ENV
+chmod 600 "$ENV_FILE"
+
+echo "[model] SSH tunnel is up; waiting for GGUF download + llama-server..."
+last_log=0
+while :; do
+  if curl -fsS --connect-timeout 2 --max-time 5 \
+      -H "Authorization: Bearer ${MODEL_API_KEY}" \
+      "http://127.0.0.1:${LOCAL_PORT}/health" >/dev/null 2>&1; then
+    ready=1
+    break
+  fi
+
+  if ! kill -0 "$tunnel_pid" >/dev/null 2>&1; then
+    cat "$TUNNEL_LOG" >&2 || true
+    cleanup_paid_instance "SSH tunnel exited before model became ready"
+    exit 7
+  fi
+
+  now="$(date +%s)"
+  if (( now - start_epoch > START_TIMEOUT )); then
+    echo >&2 "[model] last remote log lines:"
+    ssh "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" 'tail -n 20 /var/log/qwen38/server.log 2>/dev/null || true' >&2 || true
+    cleanup_paid_instance "startup timeout while loading model"
+    exit 8
+  fi
+
+  if (( now - last_log >= 30 )); then
+    last_log="$now"
+    ssh "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" 'tail -n 2 /var/log/qwen38/server.log 2>/dev/null || true' 2>/dev/null | sed 's/^/[remote] /' || true
+  fi
+  sleep 5
+done
+
+trap - INT TERM
+
+printf '\nREADY\n'
+printf '  GPU:       %s\n' "$gpu_name"
+printf '  Cost:      $%.4f/h\n' "$dph"
+printf '  Context:   %s\n' "$CTX_SIZE"
+printf '  API:       %s\n' "$base_url"
+printf '  Instance:  %s\n' "$instance_id"
+printf '\nRun: source .qwen-vast/env\n'
+printf 'Stop billing: ./qwen-down --yes\n'

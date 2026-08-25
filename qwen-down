@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+STATE_DIR="$ROOT_DIR/.qwen-vast"
+STATE_FILE="$STATE_DIR/state.json"
+
+if [[ -f "$ROOT_DIR/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$ROOT_DIR/.env"
+  set +a
+fi
+
+command -v vastai >/dev/null 2>&1 || { echo >&2 "ERROR: vastai CLI not installed"; exit 2; }
+command -v jq >/dev/null 2>&1 || { echo >&2 "ERROR: jq not installed"; exit 2; }
+
+if [[ ! -f "$STATE_FILE" ]]; then
+  echo "No local qwen38 Vast state found."
+  exit 0
+fi
+
+instance_id="$(jq -r '.instance_id // empty' "$STATE_FILE")"
+tunnel_pid="$(jq -r '.tunnel_pid // empty' "$STATE_FILE")"
+gpu="$(jq -r '.gpu // "unknown"' "$STATE_FILE")"
+dph="$(jq -r '.dph // 0' "$STATE_FILE")"
+
+if [[ "${1:-}" != "--yes" ]]; then
+  printf 'Destroy Vast instance %s (%s, $%s/h)? [y/N] ' "$instance_id" "$gpu" "$dph"
+  read -r answer
+  [[ "$answer" =~ ^[Yy]$ ]] || { echo "Cancelled."; exit 0; }
+fi
+
+if [[ -n "$tunnel_pid" ]] && kill -0 "$tunnel_pid" >/dev/null 2>&1; then
+  kill "$tunnel_pid" >/dev/null 2>&1 || true
+fi
+
+if [[ -n "$instance_id" ]]; then
+  echo "Destroying Vast instance $instance_id..."
+  if ! vastai destroy instance "$instance_id" --raw; then
+    echo >&2 "ERROR: destroy failed. State was kept so you can retry."
+    exit 3
+  fi
+fi
+
+rm -rf "$STATE_DIR"
+echo "Destroyed. GPU and instance storage billing for this instance should now stop."

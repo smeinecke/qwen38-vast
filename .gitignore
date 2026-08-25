@@ -1,0 +1,4 @@
+.env
+.qwen-vast/
+*.log
+.DS_Store

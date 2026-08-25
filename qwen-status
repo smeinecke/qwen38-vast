@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+STATE_FILE="$ROOT_DIR/.qwen-vast/state.json"
+
+if [[ -f "$ROOT_DIR/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$ROOT_DIR/.env"
+  set +a
+fi
+
+command -v vastai >/dev/null 2>&1 || { echo >&2 "ERROR: vastai CLI not installed"; exit 2; }
+command -v jq >/dev/null 2>&1 || { echo >&2 "ERROR: jq not installed"; exit 2; }
+
+if [[ ! -f "$STATE_FILE" ]]; then
+  echo "No local qwen38 Vast state found."
+  exit 0
+fi
+
+instance_id="$(jq -r '.instance_id' "$STATE_FILE")"
+local_port="$(jq -r '.local_port // 18080' "$STATE_FILE")"
+api_key="$(jq -r '.api_key // empty' "$STATE_FILE")"
+tunnel_pid="$(jq -r '.tunnel_pid // empty' "$STATE_FILE")"
+
+instance_json="$(vastai show instance "$instance_id" --raw 2>/dev/null || true)"
+if [[ -z "$instance_json" ]]; then
+  echo "Vast instance $instance_id could not be found. Local state may be stale."
+  exit 1
+fi
+
+jq '{id,actual_status,intended_status,gpu_name,dph_total,geolocation,status_msg}' <<<"$instance_json"
+
+if [[ -n "$tunnel_pid" ]] && kill -0 "$tunnel_pid" >/dev/null 2>&1; then
+  echo "SSH tunnel: running (pid $tunnel_pid, localhost:$local_port)"
+else
+  echo "SSH tunnel: not running"
+fi
+
+if [[ -n "$api_key" ]] && curl -fsS --connect-timeout 2 --max-time 4 \
+  -H "Authorization: Bearer $api_key" "http://127.0.0.1:${local_port}/health" >/dev/null 2>&1; then
+  echo "llama-server: healthy"
+else
+  echo "llama-server: not reachable through local tunnel"
+fi

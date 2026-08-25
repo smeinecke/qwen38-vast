@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+STATE_FILE="$ROOT_DIR/.qwen-vast/state.json"
+KNOWN_HOSTS="$ROOT_DIR/.qwen-vast/known_hosts"
+
+if [[ -f "$ROOT_DIR/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$ROOT_DIR/.env"
+  set +a
+fi
+
+[[ -f "$STATE_FILE" ]] || { echo >&2 "No local state. Run ./qwen-up first."; exit 2; }
+ssh_url="$(jq -r '.ssh_url // empty' "$STATE_FILE")"
+[[ -n "$ssh_url" ]] || { echo >&2 "No SSH URL in state yet."; exit 2; }
+
+read -r ssh_user ssh_host ssh_port < <(python3 - "$ssh_url" <<'PY'
+from urllib.parse import urlparse
+import sys
+u = urlparse(sys.argv[1])
+print(u.username or "root", u.hostname or "", u.port or 22)
+PY
+)
+
+exec ssh \
+  -o StrictHostKeyChecking=accept-new \
+  -o "UserKnownHostsFile=$KNOWN_HOSTS" \
+  -p "$ssh_port" \
+  "${ssh_user}@${ssh_host}" \
+  'tail -n 100 -f /var/log/qwen38/server.log'
