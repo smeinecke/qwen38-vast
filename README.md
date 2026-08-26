@@ -9,9 +9,20 @@ Reproducible, disposable deployment for:
 - Vast.ai billed only while the disposable instance exists/runs
 - a local SSH tunnel instead of exposing the inference API directly to the internet
 
-> **v2 cold-start update:** if you used the original version, rebuild/push the new GHCR image before renting another host. Also copy the new `GPU_QUERY` into your local `.env`; `.env` is intentionally gitignored and therefore cannot be updated by `git pull`.
+> **v3 build/cache update:** if you used the original version, rebuild/push the new GHCR image before renting another host. Also copy the new `GPU_QUERY` into your local `.env`; `.env` is intentionally gitignored and therefore cannot be updated by `git pull`.
 
 The Docker image contains **no model weights and no credentials**. GitHub Actions builds the CUDA/llama.cpp runtime and publishes it to GHCR. The runtime now derives from Vast.ai's own CUDA base image so SSH-mode hosts can reuse commonly cached/compatible layers instead of spending minutes installing SSH tooling into a generic CUDA image. `qwen-up` rents a suitable Vast host, starts the image, downloads the GGUF from Hugging Face, creates an SSH tunnel, and waits for `/health`. `qwen-down` destroys the Vast instance.
+
+## GitHub Actions build cache
+
+The image uses two cache levels:
+
+1. Docker/BuildKit layer cache (`type=gha`) skips the complete llama.cpp compile layer when its inputs are unchanged.
+2. `ccache` persists compiled C/C++/CUDA objects across workflow runs. This helps when the llama.cpp commit, FastMTP patch, compiler flags, or nearby Dockerfile layers change and a full Docker-layer hit is no longer possible.
+
+The default build targets CUDA SM **86** (RTX A6000) and **89** (RTX 6000 Ada / RTX 5880 Ada / L40S) only. This intentionally avoids compiling unused CUDA architectures. If you later add Blackwell hosts, set the Docker build arg `CUDA_ARCHITECTURES=86;89;120`.
+
+The first workflow run after enabling this cache is still a cold build. Subsequent unchanged builds should skip compilation entirely; changed builds can reuse matching ccache objects.
 
 ## Defaults
 

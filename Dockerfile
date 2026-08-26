@@ -11,6 +11,25 @@ ARG LLAMA_CPP_COMMIT=4df29be4f4c3673f428170fda944a5b19f743bb8
 ARG FASTMTP_PATCH_URL=https://huggingface.co/HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF/resolve/993a5971fda8f30dd1b7eb2654792ba4415c7460/HauhauCS-FastMTP-llama.cpp.patch
 ARG FASTMTP_PATCH_SHA256=981285400b59dc45cf99936b6ff66d4b3aa0f1b532f85fa51418cb407e51d615
 
+# Compile only for the GPU families selected by qwen-up by default:
+#   86 = Ampere GA102 (RTX A6000)
+#   89 = Ada Lovelace (RTX 6000 Ada, RTX 5880 Ada, L40S)
+# Override with --build-arg CUDA_ARCHITECTURES="86;89;120" if you later
+# want native Blackwell (SM 120) cubins too.
+ARG CUDA_ARCHITECTURES=86;89
+
+# ccache is intentionally installed only in the builder. The final runtime image
+# stays unchanged. The compiler cache itself is a BuildKit cache mount, so it is
+# never copied into the image.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ccache \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV CCACHE_DIR=/root/.cache/ccache \
+    CCACHE_MAXSIZE=3G \
+    CCACHE_COMPRESS=true \
+    CCACHE_COMPRESSLEVEL=6
+
 WORKDIR /src
 RUN git init llama.cpp \
     && cd llama.cpp \
@@ -27,14 +46,20 @@ RUN curl -fL --retry 5 --retry-all-errors --connect-timeout 15 \
 
 # GGML_NATIVE=OFF is important: GitHub-hosted builders have no NVIDIA GPU.
 # CUDA 12.8 lets llama.cpp include Ampere/Ada/Blackwell CUDA targets.
-RUN cmake -S . -B build -G Ninja \
+RUN --mount=type=cache,id=qwen38-ccache,target=/root/.cache/ccache,sharing=locked \
+    cmake -S . -B build -G Ninja \
       -DGGML_CUDA=ON \
       -DGGML_NATIVE=OFF \
       -DBUILD_SHARED_LIBS=OFF \
       -DLLAMA_CURL=OFF \
       -DLLAMA_BUILD_TESTS=OFF \
       -DCMAKE_BUILD_TYPE=Release \
-    && cmake --build build --config Release --target llama-server -j"$(nproc)"
+      -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES}" \
+      -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+      -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+      -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
+    && cmake --build build --config Release --target llama-server -j"$(nproc)" \
+    && ccache --show-stats
 
 FROM ${VAST_BASE} AS runtime
 
