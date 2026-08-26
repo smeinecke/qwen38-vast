@@ -9,14 +9,16 @@ Reproducible, disposable deployment for:
 - Vast.ai billed only while the disposable instance exists/runs
 - a local SSH tunnel instead of exposing the inference API directly to the internet
 
-The Docker image contains **no model weights and no credentials**. GitHub Actions builds the CUDA/llama.cpp runtime and publishes it to GHCR. `qwen-up` rents a suitable Vast host, starts the image, downloads the gated GGUF from Hugging Face, creates an SSH tunnel, and waits for `/health`. `qwen-down` destroys the Vast instance.
+> **v2 cold-start update:** if you used the original version, rebuild/push the new GHCR image before renting another host. Also copy the new `GPU_QUERY` into your local `.env`; `.env` is intentionally gitignored and therefore cannot be updated by `git pull`.
+
+The Docker image contains **no model weights and no credentials**. GitHub Actions builds the CUDA/llama.cpp runtime and publishes it to GHCR. The runtime now derives from Vast.ai's own CUDA base image so SSH-mode hosts can reuse commonly cached/compatible layers instead of spending minutes installing SSH tooling into a generic CUDA image. `qwen-up` rents a suitable Vast host, starts the image, downloads the GGUF from Hugging Face, creates an SSH tunnel, and waits for `/health`. `qwen-down` destroys the Vast instance.
 
 ## Defaults
 
 - Model: `Q4_K_P` (17.9 GB)
 - Context: `245760`
 - FastMTP depth: `3`
-- GPU search: RTX 6000 Ada / L40S / RTX A6000, 48 GB+, 64 GB system RAM+, CUDA 12.8+, 500 Mbps+ download
+- GPU search: RTX 6000 Ada / L40S / RTX 5880 Ada / RTX A6000, 48 GB+, 32 GB system RAM+, CUDA 12.8+, 500 Mbps+ download, 200 MB/s+ disk
 - Maximum all-in Vast price: `$0.80/h`
 - Local OpenAI-compatible endpoint: `http://127.0.0.1:18080/v1`
 
@@ -46,13 +48,9 @@ After the first successful build, open the generated GHCR package settings and c
 
 ## 2. Hugging Face access
 
-The model repository is currently gated. In Hugging Face:
+The HauhauCS repository is currently publicly downloadable, so **no Hugging Face token is required** for the default deployment. `hf download` runs anonymously when `HF_TOKEN` is empty.
 
-1. Open the model repository and accept its access conditions.
-2. Create a fine-grained/read-only access token that can read the model.
-3. Put the token in local `.env`; never commit it.
-
-The token is used only for the model download inside the Vast instance. `start.sh` unsets it before `exec`-ing `llama-server`.
+You may still set a fine-grained/read-only token in local `.env` for authenticated downloads/rate limits or as insurance if the upstream repository's access policy changes later. Never commit it. If present, `start.sh` unsets the token before `exec`-ing `llama-server`.
 
 ## 3. Install local dependencies
 
@@ -83,9 +81,10 @@ chmod 600 .env
 Edit at least:
 
 ```dotenv
-HF_TOKEN=hf_...
 GHCR_IMAGE=ghcr.io/YOUR_USER/YOUR_REPO:latest
 ```
+
+`HF_TOKEN` is optional.
 
 Recommended starting point:
 
@@ -112,7 +111,7 @@ Then raise the Q5 context after verifying VRAM headroom on your chosen 48 GB GPU
 
 The script:
 
-1. searches verified/rentable Vast offers matching `GPU_QUERY`;
+1. searches verified/rentable Vast offers matching `GPU_QUERY` (including a minimum disk read bandwidth);
 2. rejects anything above `MAX_DPH`;
 3. rents the cheapest remaining offer;
 4. starts your GHCR image in Vast SSH mode;
@@ -188,19 +187,19 @@ If no matching host is available below the cap, `qwen-up` exits without renting 
 Fast Ada-only:
 
 ```dotenv
-GPU_QUERY='num_gpus=1 gpu_name=RTX_6000Ada gpu_ram>=48 cpu_ram>=64000 reliability>0.98 inet_down>=500 cuda_vers>=12.8 disk_space>=60 rented=False direct_port_count>=1'
+GPU_QUERY='num_gpus=1 gpu_name=RTX_6000Ada gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1'
 ```
 
 Cheapest 48 GB option:
 
 ```dotenv
-GPU_QUERY='num_gpus=1 gpu_ram>=48 cpu_ram>=64000 reliability>0.98 inet_down>=500 cuda_vers>=12.8 disk_space>=60 rented=False direct_port_count>=1'
+GPU_QUERY='num_gpus=1 gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1'
 ```
 
 Europe example:
 
 ```dotenv
-GPU_QUERY='num_gpus=1 gpu_name in ["RTX_6000Ada","L40S","RTX_A6000"] gpu_ram>=48 cpu_ram>=64000 reliability>0.98 inet_down>=500 cuda_vers>=12.8 disk_space>=60 rented=False direct_port_count>=1 geolocation in [DE,NL,FR,SE,FI]'
+GPU_QUERY='num_gpus=1 gpu_name in ["RTX_6000Ada","L40S","RTX_5880Ada","RTX_A6000"] gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1 geolocation in [DE,NL,FR,SE,FI]'
 ```
 
 ## Why the SSH tunnel?
@@ -210,6 +209,14 @@ The inference port is deliberately bound to `127.0.0.1` inside the Vast containe
 The local generated API key is still enabled as defense in depth.
 
 ## Docker build details
+
+The runtime derives from:
+
+```text
+vastai/base-image:cuda-12.8.1-cudnn-devel-ubuntu24.04-py312
+```
+
+Vast recommends extending its pre-built base images for custom images. They are designed for Vast instance setup and their large base layers are commonly cached on hosts, which reduces cold-start overhead compared with a generic CUDA runtime image. The same base is used by both Docker build stages so GitHub Actions does not need two unrelated multi-gigabyte CUDA base-image families.
 
 The image pins llama.cpp to the commit specified by the HauhauCS FastMTP model card:
 
@@ -225,13 +232,15 @@ At image-build time it downloads the small FastMTP runtime patch from the model 
 
 The model download is also pinned to the release commit `993a5971fda8f30dd1b7eb2654792ba4415c7460` by default (`HF_REVISION`), so a later change on the model repo's `main` branch does not silently change your deployment.
 
-The model weights are intentionally not baked into the image. This keeps GHCR small, lets you switch Q4/Q5 without rebuilding, and avoids shipping gated model data in your public container.
+The model weights are intentionally not baked into the image. This keeps your custom GHCR layers small and lets you switch Q4/Q5 without rebuilding.
 
 ## Fast download path
 
-The runtime pins `huggingface_hub` with `hf_xet` and sets `HF_XET_HIGH_PERFORMANCE=1`. This is why the default Vast search asks for at least ~64 GB system RAM and a fast network connection.
+The runtime pins `huggingface_hub` with `hf_xet` and sets `HF_XET_HIGH_PERFORMANCE=1`. The default search asks for at least 32 GB system RAM, 500 Mbps download, and 200 MB/s local disk read bandwidth.
 
-If a host's download is still poor, increase `inet_down` in `GPU_QUERY` rather than adding persistent Vast storage first. The Q4 target plus FastMTP sidecar is under 20 GB, so a disposable download is usually economical.
+The disk filter matters for cold starts: Vast's SSH compatibility/bootstrap steps and model loading can be painfully slow on low-end SATA hosts even when internet bandwidth is good. Raise `disk_bw` to 300–500 if you prefer faster starts over the absolute cheapest hourly offer.
+
+If a host's model download is still poor, increase `inet_down` in `GPU_QUERY` rather than adding persistent Vast storage first. The Q4 target plus FastMTP sidecar is under 20 GB, so a disposable download is usually economical.
 
 ## Updating llama.cpp / FastMTP
 

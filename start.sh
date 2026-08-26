@@ -30,12 +30,9 @@ download_file() {
   hf download "$HF_REPO" "$filename" --revision "$HF_REVISION" --local-dir "$MODEL_DIR"
 }
 
-# The repository is currently gated. HF_TOKEN is automatically consumed by
-# huggingface_hub. Anonymous access is still attempted so this keeps working
-# if the gate is removed later.
-if [[ -z "${HF_TOKEN:-}" ]]; then
-  echo >&2 "WARNING: HF_TOKEN is not set; gated Hugging Face downloads may fail."
-fi
+# The model repository is publicly downloadable at the time this image was
+# prepared. HF_TOKEN is optional; huggingface_hub will automatically use it if
+# supplied (for rate limits or if upstream access rules change later).
 
 download_file "$MODEL"
 

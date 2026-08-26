@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# Vast returns decimal numbers with a dot. Force locale-independent numeric
+# parsing/printf so German locales do not turn 0.4167 into an invalid number.
+export LC_NUMERIC=C
+
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 STATE_DIR="$ROOT_DIR/.qwen-vast"
 STATE_FILE="$STATE_DIR/state.json"
@@ -18,7 +22,7 @@ if [[ -f "$ROOT_DIR/.env" ]]; then
   set +a
 fi
 
-GPU_QUERY="${GPU_QUERY:-num_gpus=1 gpu_name in [\"RTX_6000Ada\",\"L40S\",\"RTX_A6000\"] gpu_ram>=48 cpu_ram>=64000 reliability>0.98 inet_down>=500 cuda_vers>=12.8 disk_space>=60 rented=False direct_port_count>=1}"
+GPU_QUERY="${GPU_QUERY:-num_gpus=1 gpu_name in [\"RTX_6000Ada\",\"L40S\",\"RTX_5880Ada\",\"RTX_A6000\"] gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1}"
 MAX_DPH="${MAX_DPH:-0.80}"
 DISK_GB="${DISK_GB:-60}"
 LOCAL_PORT="${LOCAL_PORT:-18080}"
@@ -39,12 +43,6 @@ need() {
 }
 
 for cmd in vastai jq curl ssh python3 openssl; do need "$cmd"; done
-
-if [[ -z "${HF_TOKEN:-}" ]]; then
-  echo >&2 "ERROR: HF_TOKEN is required because the model repository is gated."
-  echo >&2 "Accept the model access conditions on Hugging Face, then set HF_TOKEN in .env."
-  exit 2
-fi
 
 if [[ -z "${GHCR_IMAGE:-}" || "$GHCR_IMAGE" == *"OWNER/REPO"* ]]; then
   echo >&2 "ERROR: set GHCR_IMAGE in .env, e.g. ghcr.io/yourname/qwen38-vast:latest"
@@ -137,6 +135,7 @@ offer_id="$(jq -r '.id // .ask_contract_id // empty' <<<"$offer")"
 gpu_name="$(jq -r '.gpu_name // "unknown"' <<<"$offer")"
 dph="$(jq -r '._effective_dph' <<<"$offer")"
 inet_down="$(jq -r '.inet_down // "?"' <<<"$offer")"
+disk_bw="$(jq -r '.disk_bw // "?"' <<<"$offer")"
 reliability="$(jq -r '.reliability2 // .reliability // "?"' <<<"$offer")"
 location="$(jq -r '.geolocation // "?"' <<<"$offer")"
 
@@ -145,10 +144,13 @@ if [[ -z "$offer_id" ]]; then
   exit 4
 fi
 
-printf '[rent] %s | $%.4f/h | down=%s Mbps | reliability=%s | %s | offer=%s\n' \
-  "$gpu_name" "$dph" "$inet_down" "$reliability" "$location" "$offer_id"
+printf '[rent] %s | $%.4f/h | down=%s Mbps | disk=%s MB/s | reliability=%s | %s | offer=%s\n' \
+  "$gpu_name" "$dph" "$inet_down" "$disk_bw" "$reliability" "$location" "$offer_id"
 
-docker_env="-e HF_TOKEN=${HF_TOKEN} -e LLAMA_API_KEY=${MODEL_API_KEY} -e MODEL=${MODEL} -e CTX_SIZE=${CTX_SIZE} -e USE_FASTMTP=${USE_FASTMTP} -e REASONING_EFFORT=${REASONING_EFFORT} -e HF_REVISION=${HF_REVISION} -e BIND_HOST=127.0.0.1"
+docker_env="-e LLAMA_API_KEY=${MODEL_API_KEY} -e MODEL=${MODEL} -e CTX_SIZE=${CTX_SIZE} -e USE_FASTMTP=${USE_FASTMTP} -e REASONING_EFFORT=${REASONING_EFFORT} -e HF_REVISION=${HF_REVISION} -e BIND_HOST=127.0.0.1"
+if [[ -n "${HF_TOKEN:-}" ]]; then
+  docker_env+=" -e HF_TOKEN=${HF_TOKEN}"
+fi
 onstart='mkdir -p /var/log/qwen38; nohup /usr/local/bin/start.sh >/var/log/qwen38/server.log 2>&1 &'
 
 create_raw="$(vastai create instance "$offer_id" \
