@@ -22,18 +22,133 @@ if [[ -f "$ROOT_DIR/.env" ]]; then
   set +a
 fi
 
-GPU_QUERY="${GPU_QUERY:-num_gpus=1 gpu_name in [\"RTX_6000Ada\",\"L40S\",\"RTX_5880Ada\",\"RTX_A6000\"] gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1}"
+usage() {
+  cat <<'USAGE'
+Usage:
+  ./qwen-up [PROFILE]
+  ./qwen-up --profile PROFILE
+
+Profiles:
+  a6000          RTX A6000 / Ampere SM86, 64k context (throughput-first)
+  ada-128k       RTX 6000 Ada / L40S / SM89, 128k context
+  blackwell-128k RTX 5090 / RTX PRO 6000 Blackwell / SM120, 128k context
+
+Aliases:
+  ampere, sm86             -> a6000
+  ada, sm89                -> ada-128k
+  blackwell, 5090, sm120   -> blackwell-128k
+
+Examples:
+  ./qwen-up a6000
+  ./qwen-up blackwell-128k
+  CTX_SIZE_OVERRIDE=98304 ./qwen-up a6000
+
+The selected profile controls the stable GHCR image tag, Vast GPU search and
+context default. Use *_OVERRIDE variables only when intentionally overriding a
+profile for a one-off test.
+USAGE
+}
+
+profile_arg=""
+case "${1:-}" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  -p|--profile)
+    [[ -n "${2:-}" ]] || { echo >&2 "ERROR: --profile requires a value"; exit 2; }
+    profile_arg="$2"
+    shift 2
+    ;;
+  "")
+    ;;
+  -*)
+    echo >&2 "ERROR: unknown option: $1"
+    usage >&2
+    exit 2
+    ;;
+  *)
+    profile_arg="$1"
+    shift
+    ;;
+esac
+
+if (( $# > 0 )); then
+  echo >&2 "ERROR: unexpected argument: $1"
+  usage >&2
+  exit 2
+fi
+
+PROFILE="${profile_arg:-${QWEN_PROFILE:-a6000}}"
+case "$PROFILE" in
+  a6000|ampere|sm86)
+    PROFILE=a6000
+    IMAGE_TAG=a6000
+    CUDA_ARCH=86
+    PROFILE_CTX_SIZE=65536
+    PROFILE_GPU_QUERY='num_gpus=1 gpu_name=RTX_A6000 gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1'
+    ;;
+  ada-128k|ada|sm89)
+    PROFILE=ada-128k
+    IMAGE_TAG=ada-128k
+    CUDA_ARCH=89
+    PROFILE_CTX_SIZE=131072
+    PROFILE_GPU_QUERY='num_gpus=1 gpu_name in ["RTX_6000Ada","L40S","RTX_5880Ada"] gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1'
+    ;;
+  blackwell-128k|blackwell|5090|sm120)
+    PROFILE=blackwell-128k
+    IMAGE_TAG=blackwell-128k
+    CUDA_ARCH=120
+    PROFILE_CTX_SIZE=131072
+    PROFILE_GPU_QUERY='num_gpus=1 gpu_name in ["RTX_5090","RTX_PRO_6000"] gpu_ram>=32 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1'
+    ;;
+  *)
+    echo >&2 "ERROR: unknown profile '$PROFILE'"
+    usage >&2
+    exit 2
+    ;;
+esac
+
+# Migration guard: older revisions used CTX_SIZE/GPU_QUERY directly in .env.
+# Ignore them here so choosing a profile on the CLI always does what it says.
+# Explicit *_OVERRIDE values are still available for one-off experiments.
+if [[ -n "${CTX_SIZE:-}" ]]; then
+  echo >&2 "[config] note: legacy CTX_SIZE is ignored; use CTX_SIZE_OVERRIDE instead."
+fi
+if [[ -n "${GPU_QUERY:-}" ]]; then
+  echo >&2 "[config] note: legacy GPU_QUERY is ignored; use GPU_QUERY_OVERRIDE instead."
+fi
+
+CTX_SIZE="${CTX_SIZE_OVERRIDE:-$PROFILE_CTX_SIZE}"
+GPU_QUERY="${GPU_QUERY_OVERRIDE:-$PROFILE_GPU_QUERY}"
 MAX_DPH="${MAX_DPH:-0.80}"
 DISK_GB="${DISK_GB:-60}"
 LOCAL_PORT="${LOCAL_PORT:-18080}"
 START_TIMEOUT="${START_TIMEOUT:-1200}"
 KEEP_ON_FAILURE="${KEEP_ON_FAILURE:-0}"
 MODEL="${MODEL:-Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf}"
-CTX_SIZE="${CTX_SIZE:-245760}"
 USE_FASTMTP="${USE_FASTMTP:-1}"
 REASONING_EFFORT="${REASONING_EFFORT:-xhigh}"
 HF_REVISION="${HF_REVISION:-993a5971fda8f30dd1b7eb2654792ba4415c7460}"
-LABEL="${VAST_LABEL:-qwen38-$(date +%s)}"
+LABEL="${VAST_LABEL:-qwen38-${PROFILE}-$(date +%s)}"
+
+# Prefer the new repository-only setting. For compatibility, an old
+# GHCR_IMAGE=...:latest value is accepted as a source for the repository name;
+# its old tag is deliberately replaced by the selected stable profile tag.
+if [[ -n "${GHCR_IMAGE_BASE:-}" ]]; then
+  image_base="${GHCR_IMAGE_BASE%/}"
+elif [[ -n "${GHCR_IMAGE:-}" && "$GHCR_IMAGE" != *"OWNER/REPO"* ]]; then
+  image_base="${GHCR_IMAGE%:*}"
+else
+  image_base=""
+fi
+
+if [[ -z "$image_base" || "$image_base" == *"OWNER/REPO"* ]]; then
+  echo >&2 "ERROR: set GHCR_IMAGE_BASE in .env, e.g. ghcr.io/yourname/qwen38-vast"
+  exit 2
+fi
+
+SELECTED_IMAGE="${GHCR_IMAGE_OVERRIDE:-${image_base}:${IMAGE_TAG}}"
 
 need() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -43,11 +158,6 @@ need() {
 }
 
 for cmd in vastai jq curl ssh python3 openssl; do need "$cmd"; done
-
-if [[ -z "${GHCR_IMAGE:-}" || "$GHCR_IMAGE" == *"OWNER/REPO"* ]]; then
-  echo >&2 "ERROR: set GHCR_IMAGE in .env, e.g. ghcr.io/yourname/qwen38-vast:latest"
-  exit 2
-fi
 
 if [[ -f "$STATE_FILE" ]]; then
   old_id="$(jq -r '.instance_id // empty' "$STATE_FILE" 2>/dev/null || true)"
@@ -105,6 +215,7 @@ on_signal() {
 }
 trap on_signal INT TERM
 
+printf '[profile] %s | sm_%s | ctx=%s | image=%s\n' "$PROFILE" "$CUDA_ARCH" "$CTX_SIZE" "$SELECTED_IMAGE"
 printf '[search] %s\n' "$GPU_QUERY"
 offers_raw="$(vastai search offers "$GPU_QUERY" --order dph_total --limit 25 --storage "$DISK_GB" --raw)"
 
@@ -127,7 +238,7 @@ offer="$(jq -c --argjson max "$MAX_DPH" '
 
 if [[ -z "$offer" || "$offer" == "null" ]]; then
   echo >&2 "ERROR: no matching offer at or below \$$MAX_DPH/h."
-  echo >&2 "Raise MAX_DPH or loosen GPU_QUERY in .env."
+  echo >&2 "Raise MAX_DPH or set GPU_QUERY_OVERRIDE for this test."
   exit 4
 fi
 
@@ -147,14 +258,14 @@ fi
 printf '[rent] %s | $%.4f/h | down=%s Mbps | disk=%s MB/s | reliability=%s | %s | offer=%s\n' \
   "$gpu_name" "$dph" "$inet_down" "$disk_bw" "$reliability" "$location" "$offer_id"
 
-docker_env="-e LLAMA_API_KEY=${MODEL_API_KEY} -e MODEL=${MODEL} -e CTX_SIZE=${CTX_SIZE} -e USE_FASTMTP=${USE_FASTMTP} -e REASONING_EFFORT=${REASONING_EFFORT} -e HF_REVISION=${HF_REVISION} -e BIND_HOST=127.0.0.1"
+docker_env="-e QWEN_PROFILE=${PROFILE} -e LLAMA_API_KEY=${MODEL_API_KEY} -e MODEL=${MODEL} -e CTX_SIZE=${CTX_SIZE} -e USE_FASTMTP=${USE_FASTMTP} -e REASONING_EFFORT=${REASONING_EFFORT} -e HF_REVISION=${HF_REVISION} -e BIND_HOST=127.0.0.1"
 if [[ -n "${HF_TOKEN:-}" ]]; then
   docker_env+=" -e HF_TOKEN=${HF_TOKEN}"
 fi
 onstart='mkdir -p /var/log/qwen38; nohup /usr/local/bin/start.sh >/var/log/qwen38/server.log 2>&1 &'
 
 create_raw="$(vastai create instance "$offer_id" \
-  --image "$GHCR_IMAGE" \
+  --image "$SELECTED_IMAGE" \
   --disk "$DISK_GB" \
   --label "$LABEL" \
   --env "$docker_env" \
@@ -180,9 +291,11 @@ jq -n \
   --arg model "$MODEL" \
   --argjson ctx "$CTX_SIZE" \
   --arg api_key "$MODEL_API_KEY" \
-  --arg image "$GHCR_IMAGE" \
+  --arg image "$SELECTED_IMAGE" \
   --arg label "$LABEL" \
-  '{instance_id:$instance_id,offer_id:$offer_id,gpu:$gpu,dph:$dph,model:$model,ctx_size:$ctx,api_key:$api_key,image:$image,label:$label}' \
+  --arg profile "$PROFILE" \
+  --arg cuda_arch "$CUDA_ARCH" \
+  '{instance_id:$instance_id,offer_id:$offer_id,gpu:$gpu,dph:$dph,model:$model,ctx_size:$ctx,api_key:$api_key,image:$image,label:$label,profile:$profile,cuda_arch:$cuda_arch}' \
   > "$STATE_FILE"
 chmod 600 "$STATE_FILE"
 
@@ -275,6 +388,7 @@ export OPENAI_BASE_URL='${base_url}'
 export OPENAI_API_BASE='${base_url}'
 export OPENAI_API_KEY='${MODEL_API_KEY}'
 export QWEN_MODEL='${MODEL}'
+export QWEN_PROFILE='${PROFILE}'
 export QWEN_VAST_INSTANCE_ID='${instance_id}'
 ENV
 chmod 600 "$ENV_FILE"
@@ -313,6 +427,8 @@ done
 trap - INT TERM
 
 printf '\nREADY\n'
+printf '  Profile:   %s (sm_%s)\n' "$PROFILE" "$CUDA_ARCH"
+printf '  Image:     %s\n' "$SELECTED_IMAGE"
 printf '  GPU:       %s\n' "$gpu_name"
 printf '  Cost:      $%.4f/h\n' "$dph"
 printf '  Context:   %s\n' "$CTX_SIZE"

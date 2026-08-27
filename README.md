@@ -4,58 +4,69 @@ Reproducible, disposable deployment for:
 
 - `HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF`
 - llama.cpp + HauhauCS FastMTP
-- one 48 GB NVIDIA GPU
-- ~200k–250k context
+- one architecture-matched NVIDIA GPU (A6000, Ada, or Blackwell)
+- profile-driven 64k/128k context defaults
 - Vast.ai billed only while the disposable instance exists/runs
 - a local SSH tunnel instead of exposing the inference API directly to the internet
 
-> **v3 build/cache update:** if you used the original version, rebuild/push the new GHCR image before renting another host. Also copy the new `GPU_QUERY` into your local `.env`; `.env` is intentionally gitignored and therefore cannot be updated by `git pull`.
+> **v4 migration:** rebuild/push the GHCR images and update your local `.env` from `.env.example`. Use `GHCR_IMAGE_BASE=ghcr.io/OWNER/REPO` instead of `:latest`; `qwen-up` now selects the architecture tag and context profile. Legacy `CTX_SIZE`/`GPU_QUERY` values are intentionally ignored in favor of explicit `*_OVERRIDE` variables.
 
 The Docker image contains **no model weights and no credentials**. GitHub Actions builds the CUDA/llama.cpp runtime and publishes it to GHCR. The runtime now derives from Vast.ai's own CUDA base image so SSH-mode hosts can reuse commonly cached/compatible layers instead of spending minutes installing SSH tooling into a generic CUDA image. `qwen-up` rents a suitable Vast host, starts the image, downloads the GGUF from Hugging Face, creates an SSH tunnel, and waits for `/health`. `qwen-down` destroys the Vast instance.
 
-## GitHub Actions build cache
+## GitHub Actions builds and stable image tags
 
-The image uses two cache levels:
+GitHub Actions builds three architecture-specific images in parallel on normal
+GitHub-hosted runners. Each job compiles exactly one CUDA architecture, so one
+slow target cannot consume the build time for all GPUs and no image carries
+unused CUDA cubins.
 
-1. Docker/BuildKit layer cache (`type=gha`) skips the complete llama.cpp compile layer when its inputs are unchanged.
-2. `ccache` persists compiled C/C++/CUDA objects across workflow runs. This helps when the llama.cpp commit, FastMTP patch, compiler flags, or nearby Dockerfile layers change and a full Docker-layer hit is no longer possible.
+| Profile | CUDA target | Stable GHCR tag | Runtime default |
+|---|---:|---|---:|
+| `a6000` | SM 86 | `:a6000` | 65,536 context |
+| `ada-128k` | SM 89 | `:ada-128k` | 131,072 context |
+| `blackwell-128k` | SM 120 | `:blackwell-128k` | 131,072 context |
 
-The default build targets CUDA SM **86** (RTX A6000) and **89** (RTX 6000 Ada / RTX 5880 Ada / L40S) only. This intentionally avoids compiling unused CUDA architectures. If you later add Blackwell hosts, set the Docker build arg `CUDA_ARCHITECTURES=86;89;120`.
+Every build also publishes architecture-specific immutable SHA tags such as
+`:a6000-sha-...`. Release tags become e.g. `:a6000-v4.0.0`. Normal deployment
+uses the stable profile names, so `.env` never needs to contain a digest/hash.
 
-The first workflow run after enabling this cache is still a cold build. Subsequent unchanged builds should skip compilation entirely; changed builds can reuse matching ccache objects.
+The build matrix uses `ubuntu-24.04`, `fail-fast: false`, `max-parallel: 3` and a
+330-minute per-job timeout. Ninja already parallelizes compilation across every
+CPU core inside each runner; splitting one CMake build across additional fresh
+runners would require distributing/interchanging a build tree and is not worth
+the complexity. The useful parallelism boundary is therefore one runner per CUDA
+architecture.
+
+Each architecture has its own BuildKit and ccache scope. This avoids mixing
+SM86/SM89/SM120 CUDA object files while retaining incremental build acceleration.
 
 ## Defaults
 
 - Model: `Q4_K_P` (17.9 GB)
-- Context: `245760`
-- FastMTP depth: `3`
-- GPU search: RTX 6000 Ada / L40S / RTX 5880 Ada / RTX A6000, 48 GB+, 32 GB system RAM+, CUDA 12.8+, 500 Mbps+ download, 200 MB/s+ disk
+- `a6000`: 64k context, throughput-first
+- `ada-128k`: 128k context
+- `blackwell-128k`: 128k context, throughput-first Blackwell target
+- FastMTP depth/runtime: configured by `start.sh`
 - Maximum all-in Vast price: `$0.80/h`
 - Local OpenAI-compatible endpoint: `http://127.0.0.1:18080/v1`
 
-Qwen3.8-27B has native 262,144-token context and a hybrid attention layout (16 full-attention layers out of 64), so long context is substantially more memory-friendly than a classic dense full-attention 27B model.
+Qwen3.8-27B has native 262,144-token context and a hybrid attention layout. The
+profiles intentionally use smaller defaults because long occupied context reduces
+decode throughput substantially during interactive coding sessions.
 
 ## 1. Create the public GitHub repository
 
-Create an empty public repository, copy these files into it, and push to `main`:
-
-```bash
-git init
-git add .
-git commit -m "Initial Qwen3.8 Vast deployment"
-git branch -M main
-git remote add origin git@github.com:YOUR_USER/YOUR_REPO.git
-git push -u origin main
-```
-
-The workflow in `.github/workflows/docker.yml` builds the patched CUDA image and pushes:
+Create an empty public repository, copy these files into it, and push to `main`.
+The workflow publishes:
 
 ```text
-ghcr.io/YOUR_USER/YOUR_REPO:latest
-ghcr.io/YOUR_USER/YOUR_REPO:sha-...
+ghcr.io/YOUR_USER/YOUR_REPO:a6000
+ghcr.io/YOUR_USER/YOUR_REPO:ada-128k
+ghcr.io/YOUR_USER/YOUR_REPO:blackwell-128k
 ```
 
-After the first successful build, open the generated GHCR package settings and change package visibility to **Public**. This lets Vast pull the image anonymously. The repository can be public while `.env` remains local and gitignored.
+After the first successful build, open the generated GHCR package settings and
+change package visibility to **Public**.
 
 ## 2. Hugging Face access
 
@@ -92,37 +103,28 @@ chmod 600 .env
 Edit at least:
 
 ```dotenv
-GHCR_IMAGE=ghcr.io/YOUR_USER/YOUR_REPO:latest
+GHCR_IMAGE_BASE=ghcr.io/YOUR_USER/YOUR_REPO
 ```
 
-`HF_TOKEN` is optional.
-
-Recommended starting point:
-
-```dotenv
-MODEL=Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf
-CTX_SIZE=245760
-MAX_DPH=0.80
-```
-
-For more quantization quality, try Q5:
-
-```dotenv
-MODEL=Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q5_K_P.gguf
-CTX_SIZE=204800
-```
-
-Then raise the Q5 context after verifying VRAM headroom on your chosen 48 GB GPU.
+`HF_TOKEN` is optional. The image tag is selected by the `qwen-up` profile.
+Context and GPU search defaults are profile-owned; use explicit `*_OVERRIDE`
+variables only for one-off experiments.
 
 ## 5. Start
 
 ```bash
-./qwen-up
+./qwen-up a6000
+./qwen-up ada-128k
+./qwen-up blackwell-128k
 ```
+
+Calling `./qwen-up` without an argument uses `QWEN_PROFILE` from `.env` (default
+`a6000`). Aliases such as `ampere`, `ada`, `blackwell`, `5090`, `sm86`, `sm89`
+and `sm120` are accepted.
 
 The script:
 
-1. searches verified/rentable Vast offers matching `GPU_QUERY` (including a minimum disk read bandwidth);
+1. selects a GPU query, GHCR tag and context from the requested profile;
 2. rejects anything above `MAX_DPH`;
 3. rents the cheapest remaining offer;
 4. starts your GHCR image in Vast SSH mode;
@@ -193,24 +195,25 @@ MAX_DPH=0.55
 
 If no matching host is available below the cap, `qwen-up` exits without renting anything.
 
-`GPU_QUERY` is normal Vast search syntax. Examples:
+Profile-specific GPU queries are built into `qwen-up`. For a one-off custom
+Vast query, set `GPU_QUERY_OVERRIDE`. Examples:
 
 Fast Ada-only:
 
 ```dotenv
-GPU_QUERY='num_gpus=1 gpu_name=RTX_6000Ada gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1'
+GPU_QUERY_OVERRIDE='num_gpus=1 gpu_name=RTX_6000Ada gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1'
 ```
 
 Cheapest 48 GB option:
 
 ```dotenv
-GPU_QUERY='num_gpus=1 gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1'
+GPU_QUERY_OVERRIDE='num_gpus=1 gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1'
 ```
 
 Europe example:
 
 ```dotenv
-GPU_QUERY='num_gpus=1 gpu_name in ["RTX_6000Ada","L40S","RTX_5880Ada","RTX_A6000"] gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1 geolocation in [DE,NL,FR,SE,FI]'
+GPU_QUERY_OVERRIDE='num_gpus=1 gpu_name in ["RTX_6000Ada","L40S","RTX_5880Ada","RTX_A6000"] gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1 geolocation in [DE,NL,FR,SE,FI]'
 ```
 
 ## Why the SSH tunnel?

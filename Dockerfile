@@ -11,12 +11,14 @@ ARG LLAMA_CPP_COMMIT=4df29be4f4c3673f428170fda944a5b19f743bb8
 ARG FASTMTP_PATCH_URL=https://huggingface.co/HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF/resolve/993a5971fda8f30dd1b7eb2654792ba4415c7460/HauhauCS-FastMTP-llama.cpp.patch
 ARG FASTMTP_PATCH_SHA256=981285400b59dc45cf99936b6ff66d4b3aa0f1b532f85fa51418cb407e51d615
 
-# Compile only for the GPU families selected by qwen-up by default:
-#   86 = Ampere GA102 (RTX A6000)
-#   89 = Ada Lovelace (RTX 6000 Ada, RTX 5880 Ada, L40S)
-# Override with --build-arg CUDA_ARCHITECTURES="86;89;120" if you later
-# want native Blackwell (SM 120) cubins too.
-ARG CUDA_ARCHITECTURES=86;89
+# The GitHub Actions matrix builds one native CUDA target per image. Keeping a
+# single SM target per image cuts cold compile time and avoids shipping unused
+# cubins. Local builds may still pass a semicolon-separated list explicitly.
+#   86  = Ampere GA102 (RTX A6000)
+#   89  = Ada Lovelace (RTX 6000 Ada, RTX 5880 Ada, L40S)
+#   120 = Blackwell GeForce/RTX PRO (RTX 5090, RTX PRO 6000 Blackwell)
+ARG CUDA_ARCHITECTURES=86
+ARG QWEN_BUILD_PROFILE=custom
 
 # ccache is intentionally installed only in the builder. The final runtime image
 # stays unchanged. The compiler cache itself is a BuildKit cache mount, so it is
@@ -64,6 +66,11 @@ RUN --mount=type=cache,id=qwen38-ccache,target=/root/.cache/ccache,sharing=locke
 FROM ${VAST_BASE} AS runtime
 
 ARG HF_HUB_VERSION=1.28.0
+ARG CUDA_ARCHITECTURES=86
+ARG QWEN_BUILD_PROFILE=custom
+
+LABEL io.qwen38.profile="${QWEN_BUILD_PROFILE}" \
+      io.qwen38.cuda-arch="${CUDA_ARCHITECTURES}"
 
 # The Vast base image already contains Python, uv, SSH tooling and the CUDA
 # runtime/development libraries. Add only the small Python dependency needed to

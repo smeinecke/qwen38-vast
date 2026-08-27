@@ -1,5 +1,16 @@
 # Changelog
 
+## v4 - parallel architecture builds and profile-driven startup
+
+- Replaced the 90-minute self-hosted build with three parallel GitHub-hosted matrix jobs (`SM86`, `SM89`, `SM120`), each with its own 330-minute limit.
+- Each image now compiles exactly one CUDA architecture and uses an architecture-specific BuildKit/ccache scope.
+- Added stable GHCR tags: `:a6000`, `:ada-128k`, and `:blackwell-128k`, plus per-profile SHA/release tags.
+- Added `qwen-up PROFILE` / `--profile PROFILE` selection with aliases (`ampere`, `ada`, `blackwell`, `5090`, `sm86`, `sm89`, `sm120`).
+- Profiles select the matching image tag, Vast GPU query and runtime context together.
+- `a6000` and direct-container startup now default to 64k context for better interactive throughput; Ada/Blackwell profiles default to 128k.
+- Replaced implicit `CTX_SIZE`/`GPU_QUERY` profile overrides with explicit `CTX_SIZE_OVERRIDE`/`GPU_QUERY_OVERRIDE` to avoid stale `.env` values silently defeating the selected profile.
+- Added `GHCR_IMAGE_BASE` so `.env` stores only `ghcr.io/OWNER/REPO`; `qwen-up` appends the stable profile tag automatically.
+
 ## v3 - compiler cache and faster CUDA builds
 
 - Added `ccache` for C/C++/CUDA compilation.

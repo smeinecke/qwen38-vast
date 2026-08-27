@@ -1,4 +1,4 @@
-name: Build and publish CUDA image
+name: Build and publish CUDA images
 
 on:
   push:
@@ -15,10 +15,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
-    runs-on: self-hosted
-    timeout-minutes: 90
-
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -26,22 +25,47 @@ jobs:
       - name: Validate shell scripts
         run: bash -n start.sh qwen-up qwen-down qwen-status qwen-logs
 
+  build:
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - profile: a6000
+            cuda_arch: '86'
+            image_tag: a6000
+            description: RTX A6000 / Ampere SM86
+          - profile: ada-128k
+            cuda_arch: '89'
+            image_tag: ada-128k
+            description: RTX 6000 Ada / L40S / SM89
+          - profile: blackwell-128k
+            cuda_arch: '120'
+            image_tag: blackwell-128k
+            description: RTX 5090 / RTX PRO 6000 Blackwell / SM120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
       - name: Set up Docker Buildx
         id: buildx
         uses: docker/setup-buildx-action@v3
 
-      # Docker's normal GHA layer cache can skip the whole compile layer when
-      # nothing changed, but BuildKit cache mounts (used by ccache) are not
-      # persisted by the GHA backend on their own. Cache Dance injects/extracts
-      # the ccache mount so changed llama.cpp builds can reuse object files.
+      # Keep one compiler cache per CUDA architecture. CUDA object files are
+      # architecture-specific, so sharing one cache across SM86/89/120 wastes
+      # space and creates needless churn.
       - name: Restore compiler cache
         id: compiler-cache
         uses: actions/cache@v5
         with:
           path: .buildkit-cache-mount
-          key: qwen38-ccache-v1-${{ runner.os }}-${{ hashFiles('Dockerfile') }}
+          key: qwen38-ccache-v2-${{ runner.os }}-sm${{ matrix.cuda_arch }}-${{ hashFiles('Dockerfile') }}
           restore-keys: |
-            qwen38-ccache-v1-${{ runner.os }}-
+            qwen38-ccache-v2-${{ runner.os }}-sm${{ matrix.cuda_arch }}-
 
       - name: Inject compiler cache into BuildKit
         uses: reproducible-containers/buildkit-cache-dance@v3
@@ -64,18 +88,25 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,prefix=sha-
-            type=ref,event=tag
+            type=raw,value=${{ matrix.image_tag }},enable={{is_default_branch}}
+            type=sha,prefix=${{ matrix.image_tag }}-sha-
+            type=ref,event=tag,prefix=${{ matrix.image_tag }}-
+          labels: |
+            org.opencontainers.image.description=Qwen3.8 llama.cpp CUDA runtime - ${{ matrix.description }}
+            io.qwen38.profile=${{ matrix.profile }}
+            io.qwen38.cuda-arch=${{ matrix.cuda_arch }}
 
-      - name: Build and push
+      - name: Build and push ${{ matrix.profile }}
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64
           push: true
+          build-args: |
+            CUDA_ARCHITECTURES=${{ matrix.cuda_arch }}
+            QWEN_BUILD_PROFILE=${{ matrix.profile }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=qwen38-vast
-          cache-to: type=gha,scope=qwen38-vast,mode=max,ignore-error=true
+          cache-from: type=gha,scope=qwen38-sm${{ matrix.cuda_arch }}
+          cache-to: type=gha,scope=qwen38-sm${{ matrix.cuda_arch }},mode=max,ignore-error=true
           provenance: mode=max
