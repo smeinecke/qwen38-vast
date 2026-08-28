@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$ROOT_DIR/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$ROOT_DIR/.env"
+  set +a
+fi
+RUNS_DIR="${QWEN_RUNS_DIR:-$ROOT_DIR/.qwen-runs}"
+FORMAT=table
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  ./qwen-results [--csv|--json]
+
+Reads .qwen-runs/*/benchmarks/*/metrics.json and compares benchmark results.
+USAGE
+}
+
+case "${1:-}" in
+  "") ;;
+  --csv) FORMAT=csv ;;
+  --json) FORMAT=json ;;
+  -h|--help) usage; exit 0 ;;
+  *) echo >&2 "ERROR: unknown option: $1"; usage >&2; exit 2 ;;
+esac
+
+python3 - "$RUNS_DIR" "$FORMAT" <<'PY'
+from __future__ import annotations
+
+import csv
+import json
+import pathlib
+import sys
+
+runs_dir = pathlib.Path(sys.argv[1])
+fmt = sys.argv[2]
+files = sorted(runs_dir.glob("*/benchmarks/*/metrics.json")) if runs_dir.exists() else []
+rows = []
+for path in files:
+    try:
+        d = json.loads(path.read_text())
+    except Exception:
+        continue
+    session = d.get("session") or {}
+    perf = d.get("performance") or {}
+    usage = d.get("usage") or {}
+    gpu = d.get("gpu_summary") or {}
+    rows.append({
+        "run": path.parents[2].name,
+        "bench": path.parent.name,
+        "label": d.get("label") or "",
+        "profile": session.get("profile") or "",
+        "gpu": session.get("gpu") or "",
+        "ctx": session.get("ctx_size") or "",
+        "prompt_tok": usage.get("prompt_tokens") or 0,
+        "prompt_tps": perf.get("prompt_tps"),
+        "output_tok": usage.get("completion_tokens") or 0,
+        "decode_tps": perf.get("decode_tps"),
+        "ttft_s": perf.get("ttft_s"),
+        "mtp_accept": perf.get("draft_accept_rate"),
+        "peak_vram_mib": gpu.get("peak_memory_mib"),
+        "avg_power_w": gpu.get("avg_power_w"),
+        "request_cost_usd": perf.get("request_compute_cost_usd"),
+        "ok": d.get("ok", False),
+        "path": str(path.parent),
+    })
+
+if fmt == "json":
+    print(json.dumps(rows, indent=2, ensure_ascii=False))
+    raise SystemExit
+
+fields = [
+    "run", "bench", "label", "profile", "gpu", "ctx", "prompt_tok",
+    "prompt_tps", "output_tok", "decode_tps", "ttft_s", "mtp_accept",
+    "peak_vram_mib", "avg_power_w", "request_cost_usd", "ok", "path",
+]
+if fmt == "csv":
+    w = csv.DictWriter(sys.stdout, fieldnames=fields)
+    w.writeheader()
+    w.writerows(rows)
+    raise SystemExit
+
+if not rows:
+    print(f"No benchmark results found below {runs_dir}")
+    raise SystemExit
+
+def f(v, digits=1):
+    if v is None or v == "":
+        return "-"
+    try:
+        return f"{float(v):.{digits}f}"
+    except (TypeError, ValueError):
+        return str(v)
+
+def ctx(v):
+    try:
+        n = int(v)
+        if n >= 1024 and n % 1024 == 0:
+            return f"{n // 1024}k"
+        return str(n)
+    except Exception:
+        return str(v)
+
+def short_gpu(v):
+    s = str(v)
+    for prefix in ("NVIDIA GeForce ", "NVIDIA "):
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+    return s
+
+headers = ["run", "label", "profile", "gpu", "ctx", "pp t/s", "tg t/s", "TTFT", "MTP", "VRAM", "power", "req $"]
+rendered = []
+for r in rows:
+    rendered.append([
+        r["run"],
+        r["label"],
+        r["profile"],
+        short_gpu(r["gpu"]),
+        ctx(r["ctx"]),
+        f(r["prompt_tps"], 1),
+        f(r["decode_tps"], 1),
+        f(r["ttft_s"], 2),
+        "-" if r["mtp_accept"] is None else f"{100*float(r['mtp_accept']):.1f}%",
+        "-" if r["peak_vram_mib"] is None else f"{float(r['peak_vram_mib'])/1024:.1f}G",
+        "-" if r["avg_power_w"] is None else f"{float(r['avg_power_w']):.0f}W",
+        "-" if r["request_cost_usd"] is None else f"{float(r['request_cost_usd']):.5f}",
+    ])
+
+widths = [len(h) for h in headers]
+for row in rendered:
+    for i, value in enumerate(row):
+        widths[i] = min(max(widths[i], len(str(value))), 34)
+
+def clip(value, width):
+    s = str(value)
+    return s if len(s) <= width else s[: max(1, width - 1)] + "…"
+
+def line(row):
+    return "  ".join(clip(v, widths[i]).ljust(widths[i]) for i, v in enumerate(row))
+
+print(line(headers))
+print("  ".join("-" * w for w in widths))
+for row in rendered:
+    print(line(row))
+PY

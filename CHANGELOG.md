@@ -1,4 +1,32 @@
+## v6.1 - idempotent shutdown and locale-safe accounting
+
+- Treat Vast `404 / instance not found` as successful shutdown (`already_absent`).
+- Fail only for non-404 destroy errors.
+- Force locale-independent numeric handling so German decimal locales do not break cost formatting.
+- Recover legacy state files without `run_dir` into `.qwen-runs/<timestamp>-recovered-<instance>/`.
+- Record `destroy_outcome` in final metadata.
+
 # Changelog
+
+## v6 - resilient Vast SSH discovery and self-healing tunnels
+
+- Fixed startup hanging at `waiting for SSH` when Vast exposes `ssh_host`/`ssh_port` but `vastai ssh-url` is not in the previously assumed `ssh://...` text format.
+- Added `.qwen-lib.sh` with shared SSH endpoint discovery. It prefers `ssh_host`/`ssh_port` from `show instance --raw` and falls back to both URL and `ssh -p PORT user@host` CLI formats.
+- `qwen-up` persists the local port immediately, logs provisioning progress every 15 seconds, and reports when the SSH endpoint and daemon become available.
+- `qwen-status` refreshes stale connection data and recreates a dead/missing local tunnel automatically.
+- `qwen-logs`, `qwen-bench`, and `qwen-down` refresh SSH connection details from Vast instead of requiring an `ssh_url` that was captured during the original startup process.
+- Existing paid instances created by v5 can therefore be adopted by the updated helper scripts without rerenting them.
+
+## v5 - persistent telemetry and benchmark comparison
+
+- Added persistent `.qwen-runs/<session>/` directories outside transient Vast state.
+- `qwen-up` now records selected offer/profile/image/context, startup timing, GPU snapshot, metrics snapshot and its own console log without persisting the API key.
+- Enabled llama.cpp `--metrics` in `start.sh` and log the llama-server version plus GPU hardware at startup.
+- Added `qwen-bench` for streamed TTFT measurement plus llama.cpp server timings, prompt/decode t/s, MTP draft acceptance, Prometheus counter snapshots, GPU utilization/VRAM/power sampling and per-request compute cost.
+- Added `qwen-results` to compare all saved benchmarks as a terminal table, CSV or JSON.
+- `qwen-logs` now saves a local live-log copy by default.
+- `qwen-status` shows session/run metadata, estimated running cost, selected llama.cpp counters and a live GPU snapshot.
+- `qwen-down` archives the full remote server log, final metrics/GPU/Vast snapshots and writes final duration/estimated compute cost before destroying the instance.
 
 ## v4 - parallel architecture builds and profile-driven startup
 

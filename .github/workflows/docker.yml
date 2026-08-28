@@ -23,7 +23,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Validate shell scripts
-        run: bash -n start.sh qwen-up qwen-down qwen-status qwen-logs
+        run: bash -n start.sh qwen-up qwen-down qwen-status qwen-logs qwen-bench qwen-results
 
   build:
     needs: validate

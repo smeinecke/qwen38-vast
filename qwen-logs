@@ -2,8 +2,14 @@
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-STATE_FILE="$ROOT_DIR/.qwen-vast/state.json"
-KNOWN_HOSTS="$ROOT_DIR/.qwen-vast/known_hosts"
+STATE_DIR="$ROOT_DIR/.qwen-vast"
+STATE_FILE="$STATE_DIR/state.json"
+KNOWN_HOSTS="$STATE_DIR/known_hosts"
+TUNNEL_LOG="$STATE_DIR/tunnel.log"
+SAVE=1
+
+# shellcheck disable=SC1091
+source "$ROOT_DIR/.qwen-lib.sh"
 
 if [[ -f "$ROOT_DIR/.env" ]]; then
   set -a
@@ -12,21 +18,44 @@ if [[ -f "$ROOT_DIR/.env" ]]; then
   set +a
 fi
 
-[[ -f "$STATE_FILE" ]] || { echo >&2 "No local state. Run ./qwen-up first."; exit 2; }
-ssh_url="$(jq -r '.ssh_url // empty' "$STATE_FILE")"
-[[ -n "$ssh_url" ]] || { echo >&2 "No SSH URL in state yet."; exit 2; }
+case "${1:-}" in
+  "") ;;
+  --no-save) SAVE=0 ;;
+  -h|--help)
+    echo "Usage: ./qwen-logs [--no-save]"
+    echo "Tails the remote llama-server log; by default also appends it to server-live.log in the current run directory."
+    exit 0 ;;
+  *) echo >&2 "ERROR: unknown option: $1"; exit 2 ;;
+esac
 
-read -r ssh_user ssh_host ssh_port < <(python3 - "$ssh_url" <<'PY'
-from urllib.parse import urlparse
-import sys
-u = urlparse(sys.argv[1])
-print(u.username or "root", u.hostname or "", u.port or 22)
-PY
+for cmd in vastai jq python3 ssh; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo >&2 "ERROR: missing dependency: $cmd"; exit 2; }
+done
+
+[[ -f "$STATE_FILE" ]] || { echo >&2 "No local state. Run ./qwen-up first."; exit 2; }
+run_dir="$(jq -r '.run_dir // empty' "$STATE_FILE")"
+instance_id="$(jq -r '.instance_id // empty' "$STATE_FILE")"
+
+endpoint="$(qwen_refresh_ssh_state 2>/dev/null || true)"
+if [[ -z "$endpoint" ]]; then
+  echo >&2 "SSH endpoint for Vast instance $instance_id is not available yet."
+  echo >&2 "Run ./qwen-status to see the current provisioning state."
+  exit 2
+fi
+IFS=$'\t' read -r ssh_user ssh_host ssh_port ssh_url <<<"$endpoint"
+mapfile -d '' -t ssh_opts < <(qwen_ssh_opts "$ssh_port")
+
+echo "[ssh] ${ssh_user}@${ssh_host}:${ssh_port}"
+ssh_cmd=(
+  ssh "${ssh_opts[@]}"
+  "${ssh_user}@${ssh_host}"
+  'tail -n 100 -F /var/log/qwen38/server.log'
 )
 
-exec ssh \
-  -o StrictHostKeyChecking=accept-new \
-  -o "UserKnownHostsFile=$KNOWN_HOSTS" \
-  -p "$ssh_port" \
-  "${ssh_user}@${ssh_host}" \
-  'tail -n 100 -f /var/log/qwen38/server.log'
+if (( SAVE == 1 )) && [[ -n "$run_dir" ]]; then
+  mkdir -p "$run_dir"
+  echo "[logs] live copy: $run_dir/server-live.log"
+  "${ssh_cmd[@]}" | tee -a "$run_dir/server-live.log"
+else
+  exec "${ssh_cmd[@]}"
+fi

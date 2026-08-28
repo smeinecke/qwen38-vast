@@ -12,6 +12,9 @@ ENV_FILE="$STATE_DIR/env"
 KNOWN_HOSTS="$STATE_DIR/known_hosts"
 TUNNEL_LOG="$STATE_DIR/tunnel.log"
 
+# shellcheck disable=SC1091
+source "$ROOT_DIR/.qwen-lib.sh"
+
 mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR"
 
@@ -21,6 +24,8 @@ if [[ -f "$ROOT_DIR/.env" ]]; then
   source "$ROOT_DIR/.env"
   set +a
 fi
+
+RUNS_DIR="${QWEN_RUNS_DIR:-$ROOT_DIR/.qwen-runs}"
 
 usage() {
   cat <<'USAGE'
@@ -85,7 +90,7 @@ case "$PROFILE" in
     PROFILE=a6000
     IMAGE_TAG=a6000
     CUDA_ARCH=86
-    PROFILE_CTX_SIZE=65536
+    PROFILE_CTX_SIZE=131072
     PROFILE_GPU_QUERY='num_gpus=1 gpu_name=RTX_A6000 gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1'
     ;;
   ada-128k|ada|sm89)
@@ -197,9 +202,55 @@ instance_id=""
 tunnel_pid=""
 ready=0
 
+RUN_ID="${QWEN_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-${PROFILE}-$$}"
+RUN_DIR="$RUNS_DIR/$RUN_ID"
+RUN_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+RUN_STARTED_EPOCH="$(date +%s)"
+mkdir -p "$RUN_DIR"
+chmod 700 "$RUNS_DIR" "$RUN_DIR" 2>/dev/null || true
+CLIENT_LOG="$RUN_DIR/client.log"
+
+# Keep a local copy of qwen-up's output. The run directory is separate from
+# .qwen-vast so shutdown can remove transient state without losing history.
+exec > >(tee -a "$CLIENT_LOG") 2> >(tee -a "$CLIENT_LOG" >&2)
+
+jq -n \
+  --arg run_id "$RUN_ID" \
+  --arg status "searching" \
+  --arg started_at "$RUN_STARTED_AT" \
+  --arg profile "$PROFILE" \
+  --arg cuda_arch "$CUDA_ARCH" \
+  --arg image "$SELECTED_IMAGE" \
+  --argjson ctx_size "$CTX_SIZE" \
+  --arg model "$MODEL" \
+  --argjson fastmtp "$USE_FASTMTP" \
+  '{schema_version:1,run_id:$run_id,status:$status,started_at:$started_at,profile:$profile,cuda_arch:$cuda_arch,image:$image,ctx_size:$ctx_size,model:$model,use_fastmtp:$fastmtp}' \
+  > "$RUN_DIR/metadata.json"
+chmod 600 "$RUN_DIR/metadata.json"
+
+sync_run_metadata() {
+  local status="$1"
+  [[ -f "$STATE_FILE" ]] || return 0
+  local updated_at
+  updated_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  jq --arg status "$status" --arg updated_at "$updated_at" \
+    'del(.api_key,.tunnel_pid) + {status:$status,metadata_updated_at:$updated_at}' \
+    "$STATE_FILE" > "$RUN_DIR/metadata.json.tmp" && \
+    mv "$RUN_DIR/metadata.json.tmp" "$RUN_DIR/metadata.json"
+  chmod 600 "$RUN_DIR/metadata.json"
+}
+
 cleanup_paid_instance() {
   local reason="$1"
   [[ -n "$tunnel_pid" ]] && kill "$tunnel_pid" >/dev/null 2>&1 || true
+  if [[ -f "$STATE_FILE" ]]; then
+    jq --arg reason "$reason" --arg ended_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      '. + {failure_reason:$reason,ended_at:$ended_at}' "$STATE_FILE" > "$STATE_FILE.tmp" 2>/dev/null && mv "$STATE_FILE.tmp" "$STATE_FILE" || true
+    sync_run_metadata "failed" || true
+  else
+    jq --arg reason "$reason" --arg ended_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      '. + {status:"failed",failure_reason:$reason,ended_at:$ended_at}' "$RUN_DIR/metadata.json" > "$RUN_DIR/metadata.json.tmp" 2>/dev/null && mv "$RUN_DIR/metadata.json.tmp" "$RUN_DIR/metadata.json" || true
+  fi
   if [[ -n "$instance_id" && "$KEEP_ON_FAILURE" != "1" ]]; then
     echo >&2 "[cleanup] $reason; destroying Vast instance $instance_id to stop billing..."
     vastai destroy instance "$instance_id" --raw >/dev/null 2>&1 || true
@@ -283,11 +334,15 @@ if [[ -z "$instance_id" ]]; then
   exit 5
 fi
 
+INSTANCE_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+INSTANCE_STARTED_EPOCH="$(date +%s)"
+
 jq -n \
   --argjson instance_id "$instance_id" \
   --arg offer_id "$offer_id" \
   --arg gpu "$gpu_name" \
   --argjson dph "$dph" \
+  --argjson local_port "$LOCAL_PORT" \
   --arg model "$MODEL" \
   --argjson ctx "$CTX_SIZE" \
   --arg api_key "$MODEL_API_KEY" \
@@ -295,13 +350,30 @@ jq -n \
   --arg label "$LABEL" \
   --arg profile "$PROFILE" \
   --arg cuda_arch "$CUDA_ARCH" \
-  '{instance_id:$instance_id,offer_id:$offer_id,gpu:$gpu,dph:$dph,model:$model,ctx_size:$ctx,api_key:$api_key,image:$image,label:$label,profile:$profile,cuda_arch:$cuda_arch}' \
+  --arg run_id "$RUN_ID" \
+  --arg run_dir "$RUN_DIR" \
+  --arg started_at "$INSTANCE_STARTED_AT" \
+  --argjson started_epoch "$INSTANCE_STARTED_EPOCH" \
+  --arg run_started_at "$RUN_STARTED_AT" \
+  --argjson run_started_epoch "$RUN_STARTED_EPOCH" \
+  --arg location "$location" \
+  --arg inet_down "$inet_down" \
+  --arg disk_bw "$disk_bw" \
+  --arg reliability "$reliability" \
+  --argjson fastmtp "$USE_FASTMTP" \
+  --arg reasoning_effort "$REASONING_EFFORT" \
+  '{schema_version:1,instance_id:$instance_id,offer_id:$offer_id,gpu:$gpu,dph:$dph,local_port:$local_port,model:$model,ctx_size:$ctx,api_key:$api_key,image:$image,label:$label,profile:$profile,cuda_arch:$cuda_arch,run_id:$run_id,run_dir:$run_dir,started_at:$started_at,started_epoch:$started_epoch,run_started_at:$run_started_at,run_started_epoch:$run_started_epoch,location:$location,inet_down:$inet_down,disk_bw:$disk_bw,reliability:$reliability,use_fastmtp:$fastmtp,reasoning_effort:$reasoning_effort}' \
   > "$STATE_FILE"
 chmod 600 "$STATE_FILE"
+sync_run_metadata "provisioning"
 
-echo "[boot] Vast instance $instance_id created; waiting for SSH..."
+echo "[boot] Vast instance $instance_id created; waiting for SSH endpoint..."
 start_epoch="$(date +%s)"
 ssh_url=""
+ssh_user=""
+ssh_host=""
+ssh_port=""
+last_boot_log=0
 while :; do
   now="$(date +%s)"
   if (( now - start_epoch > START_TIMEOUT )); then
@@ -318,47 +390,47 @@ while :; do
       ;;
   esac
 
-  if [[ "$status" == "running" ]]; then
-    ssh_url="$(vastai ssh-url "$instance_id" 2>/dev/null | grep -Eo 'ssh://[^[:space:]]+' | tail -n1 || true)"
-    if [[ -n "$ssh_url" ]]; then
+  endpoint="$(qwen_resolve_ssh_endpoint "$instance_id" "$instance_json" 2>/dev/null || true)"
+  if [[ -n "$endpoint" ]]; then
+    IFS=$'\t' read -r ssh_user ssh_host ssh_port ssh_url <<<"$endpoint"
+    if [[ -n "$ssh_host" && "$ssh_port" =~ ^[0-9]+$ ]]; then
+      jq --arg ssh_url "$ssh_url" --arg ssh_host "$ssh_host" --arg ssh_user "$ssh_user" --argjson ssh_port "$ssh_port" \
+        '. + {ssh_url:$ssh_url,ssh_host:$ssh_host,ssh_port:$ssh_port,ssh_user:$ssh_user}' \
+        "$STATE_FILE" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+      chmod 600 "$STATE_FILE"
       break
+    fi
+  fi
+
+  if (( now - last_boot_log >= 15 )); then
+    last_boot_log="$now"
+    published_host="$(jq -r '.ssh_host // empty' <<<"${instance_json:-{}}" 2>/dev/null || true)"
+    published_port="$(jq -r '.ssh_port // empty' <<<"${instance_json:-{}}" 2>/dev/null || true)"
+    if [[ -n "$published_host" || -n "$published_port" ]]; then
+      printf '[boot] status=%s | ssh_host=%s ssh_port=%s | waiting for complete endpoint...\n' "$status" "${published_host:-?}" "${published_port:-?}"
+    else
+      printf '[boot] status=%s | SSH endpoint not published yet...\n' "$status"
     fi
   fi
   sleep 5
 done
 
-read -r ssh_user ssh_host ssh_port < <(python3 - "$ssh_url" <<'PY'
-from urllib.parse import urlparse
-import sys
-u = urlparse(sys.argv[1])
-print(u.username or "root", u.hostname or "", u.port or 22)
-PY
-)
-
-if [[ -z "$ssh_host" ]]; then
-  cleanup_paid_instance "could not parse SSH URL '$ssh_url'"
-  exit 6
-fi
-
-ssh_opts=(
-  -o BatchMode=yes
-  -o ConnectTimeout=8
-  -o ServerAliveInterval=15
-  -o ServerAliveCountMax=3
-  -o StrictHostKeyChecking=accept-new
-  -o "UserKnownHostsFile=$KNOWN_HOSTS"
-  -p "$ssh_port"
-)
-
-echo "[ssh] waiting for ${ssh_user}@${ssh_host}:${ssh_port}..."
+mapfile -d '' -t ssh_opts < <(qwen_ssh_opts "$ssh_port")
+echo "[ssh] endpoint discovered: ${ssh_user}@${ssh_host}:${ssh_port}; waiting for SSH daemon..."
+last_ssh_log=0
 while ! ssh "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" true >/dev/null 2>&1; do
   now="$(date +%s)"
   if (( now - start_epoch > START_TIMEOUT )); then
     cleanup_paid_instance "startup timeout while waiting for SSH daemon"
     exit 6
   fi
+  if (( now - last_ssh_log >= 15 )); then
+    last_ssh_log="$now"
+    printf '[ssh] endpoint published, daemon/auth not ready yet (%ss elapsed)...\n' "$(( now - start_epoch ))"
+  fi
   sleep 5
 done
+echo "[ssh] connection ready"
 
 nohup ssh "${ssh_opts[@]}" \
   -o ExitOnForwardFailure=yes \
@@ -381,6 +453,12 @@ jq \
   "$STATE_FILE" > "$STATE_FILE.tmp"
 mv "$STATE_FILE.tmp" "$STATE_FILE"
 chmod 600 "$STATE_FILE"
+sync_run_metadata "loading-model"
+
+# Best-effort hardware snapshot. Telemetry must never prevent startup.
+ssh "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" \
+  'nvidia-smi --query-gpu=timestamp,index,name,driver_version,memory.total,power.limit --format=csv,noheader 2>/dev/null || nvidia-smi 2>/dev/null || true' \
+  > "$RUN_DIR/gpu-start.txt" 2>/dev/null || true
 
 base_url="http://127.0.0.1:${LOCAL_PORT}/v1"
 cat > "$ENV_FILE" <<ENV
@@ -426,6 +504,20 @@ done
 
 trap - INT TERM
 
+ready_epoch="$(date +%s)"
+ready_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+startup_seconds="$(( ready_epoch - INSTANCE_STARTED_EPOCH ))"
+jq --arg ready_at "$ready_at" --argjson ready_epoch "$ready_epoch" --argjson startup_seconds "$startup_seconds" \
+  '. + {ready_at:$ready_at,ready_epoch:$ready_epoch,startup_seconds:$startup_seconds}' \
+  "$STATE_FILE" > "$STATE_FILE.tmp"
+mv "$STATE_FILE.tmp" "$STATE_FILE"
+chmod 600 "$STATE_FILE"
+sync_run_metadata "ready"
+
+curl -fsS --connect-timeout 2 --max-time 5 \
+  -H "Authorization: Bearer ${MODEL_API_KEY}" \
+  "http://127.0.0.1:${LOCAL_PORT}/metrics" > "$RUN_DIR/metrics-ready.prom" 2>/dev/null || true
+
 printf '\nREADY\n'
 printf '  Profile:   %s (sm_%s)\n' "$PROFILE" "$CUDA_ARCH"
 printf '  Image:     %s\n' "$SELECTED_IMAGE"
@@ -434,5 +526,6 @@ printf '  Cost:      $%.4f/h\n' "$dph"
 printf '  Context:   %s\n' "$CTX_SIZE"
 printf '  API:       %s\n' "$base_url"
 printf '  Instance:  %s\n' "$instance_id"
+printf '  Run log:   %s\n' "$RUN_DIR"
 printf '\nRun: source .qwen-vast/env\n'
 printf 'Stop billing: ./qwen-down --yes\n'

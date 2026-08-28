@@ -2,7 +2,13 @@
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-STATE_FILE="$ROOT_DIR/.qwen-vast/state.json"
+STATE_DIR="$ROOT_DIR/.qwen-vast"
+STATE_FILE="$STATE_DIR/state.json"
+KNOWN_HOSTS="$STATE_DIR/known_hosts"
+TUNNEL_LOG="$STATE_DIR/tunnel.log"
+
+# shellcheck disable=SC1091
+source "$ROOT_DIR/.qwen-lib.sh"
 
 if [[ -f "$ROOT_DIR/.env" ]]; then
   set -a
@@ -11,8 +17,9 @@ if [[ -f "$ROOT_DIR/.env" ]]; then
   set +a
 fi
 
-command -v vastai >/dev/null 2>&1 || { echo >&2 "ERROR: vastai CLI not installed"; exit 2; }
-command -v jq >/dev/null 2>&1 || { echo >&2 "ERROR: jq not installed"; exit 2; }
+for cmd in vastai jq curl python3 ssh; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo >&2 "ERROR: missing dependency: $cmd"; exit 2; }
+done
 
 if [[ ! -f "$STATE_FILE" ]]; then
   echo "No local qwen38 Vast state found."
@@ -20,9 +27,12 @@ if [[ ! -f "$STATE_FILE" ]]; then
 fi
 
 instance_id="$(jq -r '.instance_id' "$STATE_FILE")"
-local_port="$(jq -r '.local_port // 18080' "$STATE_FILE")"
-api_key="$(jq -r '.api_key // empty' "$STATE_FILE")"
-tunnel_pid="$(jq -r '.tunnel_pid // empty' "$STATE_FILE")"
+profile="$(jq -r '.profile // "unknown"' "$STATE_FILE")"
+ctx="$(jq -r '.ctx_size // 0' "$STATE_FILE")"
+image="$(jq -r '.image // "unknown"' "$STATE_FILE")"
+run_dir="$(jq -r '.run_dir // empty' "$STATE_FILE")"
+dph="$(jq -r '.dph // 0' "$STATE_FILE")"
+started_epoch="$(jq -r '.started_epoch // empty' "$STATE_FILE")"
 
 instance_json="$(vastai show instance "$instance_id" --raw 2>/dev/null || true)"
 if [[ -z "$instance_json" ]]; then
@@ -30,10 +40,45 @@ if [[ -z "$instance_json" ]]; then
   exit 1
 fi
 
-jq '{id,actual_status,intended_status,gpu_name,dph_total,geolocation,status_msg}' <<<"$instance_json"
+jq '{id,actual_status,intended_status,gpu_name,dph_total,geolocation,status_msg,ssh_host,ssh_port}' <<<"$instance_json"
+printf 'Profile: %s | Context: %s | Image: %s\n' "$profile" "$ctx" "$image"
+[[ -n "$run_dir" ]] && printf 'Run dir: %s\n' "$run_dir"
+
+if [[ "$started_epoch" =~ ^[0-9]+$ ]]; then
+  now="$(date +%s)"
+  elapsed="$(( now - started_epoch ))"
+  cost="$(python3 - "$elapsed" "$dph" <<'PY'
+import sys
+print(f"{float(sys.argv[1]) / 3600 * float(sys.argv[2]):.4f}")
+PY
+)"
+  printf 'Elapsed: %ss | estimated compute so far: $%s\n' "$elapsed" "$cost"
+fi
+
+status="$(jq -r '.actual_status // .status // "unknown"' <<<"$instance_json")"
+if endpoint="$(qwen_refresh_ssh_state 2>/dev/null)" && [[ -n "$endpoint" ]]; then
+  IFS=$'\t' read -r ssh_user ssh_host ssh_port ssh_url <<<"$endpoint"
+  printf 'SSH: %s@%s:%s\n' "$ssh_user" "$ssh_host" "$ssh_port"
+else
+  echo "SSH: endpoint not published by Vast yet"
+fi
+
+if [[ "$status" == "running" ]]; then
+  # Status is intentionally self-healing: if qwen-up was interrupted after
+  # provisioning or an old tunnel died, recreate it from current Vast data.
+  qwen_ensure_tunnel 0 || true
+fi
+
+# Reload because qwen_ensure_tunnel may have updated the state.
+local_port="$(jq -r '.local_port // 18080' "$STATE_FILE")"
+api_key="$(jq -r '.api_key // empty' "$STATE_FILE")"
+tunnel_pid="$(jq -r '.tunnel_pid // empty' "$STATE_FILE")"
+ssh_url="$(jq -r '.ssh_url // empty' "$STATE_FILE")"
 
 if [[ -n "$tunnel_pid" ]] && kill -0 "$tunnel_pid" >/dev/null 2>&1; then
   echo "SSH tunnel: running (pid $tunnel_pid, localhost:$local_port)"
+elif qwen_api_healthy; then
+  echo "SSH tunnel: external/manual endpoint active (localhost:$local_port)"
 else
   echo "SSH tunnel: not running"
 fi
@@ -41,6 +86,38 @@ fi
 if [[ -n "$api_key" ]] && curl -fsS --connect-timeout 2 --max-time 4 \
   -H "Authorization: Bearer $api_key" "http://127.0.0.1:${local_port}/health" >/dev/null 2>&1; then
   echo "llama-server: healthy"
+  metrics="$(curl -fsS --connect-timeout 2 --max-time 4 -H "Authorization: Bearer $api_key" "http://127.0.0.1:${local_port}/metrics" 2>/dev/null || true)"
+  if [[ -n "$metrics" ]]; then
+    printf '%s\n' "$metrics" | python3 -c '
+import json, sys
+text=sys.stdin.read().strip()
+if text.startswith("\""):
+    try:
+        x=json.loads(text)
+        if isinstance(x,str): text=x
+    except Exception: pass
+wanted={"llamacpp:prompt_tokens_total","llamacpp:tokens_predicted_total","llamacpp:spec_decode_num_draft_tokens_total","llamacpp:spec_decode_num_accepted_tokens_total","llamacpp:requests_processing","llamacpp:requests_deferred"}
+for line in text.splitlines():
+    if not line or line.startswith("#"): continue
+    name=line.split()[0].split("{",1)[0]
+    if name in wanted:
+        print("  "+line)
+' || true
+  fi
 else
-  echo "llama-server: not reachable through local tunnel"
+  if [[ -n "$tunnel_pid" ]] && kill -0 "$tunnel_pid" >/dev/null 2>&1; then
+    echo "llama-server: tunnel is up, but server is not healthy yet (model may still be loading)"
+  else
+    echo "llama-server: not reachable through localhost:$local_port"
+  fi
+fi
+
+if [[ -n "$ssh_url" && -n "$run_dir" ]]; then
+  endpoint="$(qwen_refresh_ssh_state 2>/dev/null || true)"
+  if [[ -n "$endpoint" ]]; then
+    IFS=$'\t' read -r ssh_user ssh_host ssh_port _ <<<"$endpoint"
+    mapfile -d '' -t ssh_opts < <(qwen_ssh_opts "$ssh_port")
+    snapshot="$(ssh "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" 'nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu --format=csv,noheader 2>/dev/null' 2>/dev/null || true)"
+    [[ -n "$snapshot" ]] && printf 'GPU now: %s\n' "$snapshot"
+  fi
 fi

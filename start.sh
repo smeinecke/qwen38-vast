@@ -61,6 +61,7 @@ server_args=(
   --host "$BIND_HOST"
   --port "$PORT"
   --api-key "$LLAMA_API_KEY"
+  --metrics
 )
 
 if [[ "$USE_FASTMTP" == "1" ]]; then
@@ -81,4 +82,8 @@ fi
 unset HF_TOKEN HUGGING_FACE_HUB_TOKEN || true
 
 echo "[serve] profile=$QWEN_PROFILE model=$MODEL revision=$HF_REVISION ctx=$CTX_SIZE fastmtp=$USE_FASTMTP bind=$BIND_HOST:$PORT"
+echo "[runtime] llama-server version:"
+/usr/local/bin/llama-server --version 2>&1 || true
+echo "[runtime] GPU snapshot:"
+nvidia-smi --query-gpu=timestamp,index,name,driver_version,memory.total,power.limit --format=csv,noheader 2>&1 || nvidia-smi 2>&1 || true
 exec /usr/local/bin/llama-server "${server_args[@]}"
