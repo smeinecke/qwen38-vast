@@ -24,6 +24,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Validate cumulative repository features
+        run: bash ./scripts/validate-repo
+
       - name: Validate config and shell scripts
         run: |
           jq -e '.schema_version == 1 and (.images|length > 0) and (.profiles|length > 0)' profiles.json >/dev/null

@@ -200,6 +200,31 @@ Testing 64k, 128k and 256k on an A6000 does **not** require another Docker build
 Edit `profiles.json` to tune GPU ordering, add another context profile or tighten a region/GPU query.
 `qwen-up` no longer contains hard-coded profile cases.
 
+### Free-traffic market policy
+
+All rental and monitor searches also apply the central `market_policy` from
+`profiles.json`. By default both `inet_down_cost` and `inet_up_cost` must be zero.
+Vast reports these fields in USD/GB. This is intentionally separate from the GPU
+profiles because downloading a ~20 GB container/model can otherwise cost more than
+the short GPU rental itself. `qwen-up` prints the selected offer's transfer prices
+before renting and also validates the raw offer response. Set
+`QWEN_ALLOW_PAID_TRAFFIC=1` only as an explicit emergency override.
+
+### Cumulative feature validation
+
+`./scripts/validate-repo` checks the features that previously lived on separate
+intermediate branches: compiler cache seeding, persistent self-hosted BuildKit,
+self-managed SSH/tunnel recovery, non-interactive Vast destroy, slot/KV cache,
+256k profiles, hardware-safe monitoring and the free-traffic policy. Both Docker
+workflows run this check before building, so a later patch cannot silently drop
+one of these pieces.
+
+Run it locally with:
+
+```bash
+bash ./scripts/validate-repo
+```
+
 ## GitHub Actions builds
 
 ### Normal GitHub-hosted workflow
@@ -501,7 +526,7 @@ GPU_QUERY_OVERRIDE='num_gpus=1 gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_dow
 
 ## Live Vast price monitor
 
-`qwen-monitor` compares the **all-in hourly price of the currently running
+`qwen-monitor` compares the **hourly Vast rental price of the currently running
 instance** (`dph_total`) with currently rentable Vast offers. A candidate must
 use the **same context size** and its concrete GPU must have an equal-or-higher
 rank in `profiles.json -> monitor_hardware.gpu_ranks`. Search uses the same
@@ -659,3 +684,11 @@ For the manual self-hosted workflow, Buildx additionally uses a persistent named
 `qwen38-local-builder` (`keep-state: true`, `cleanup: false`). On the 56-core
 runner this makes the local BuildKit state the fastest first-level cache; the GHA
 ccache archive remains a recovery/portability layer.
+
+### Runtime failure behavior (v9.6.1)
+
+The slim runtime explicitly installs `libgomp1`, which provides `libgomp.so.1` required by the compiled llama-server. The image build validates that dependency, `start.sh` validates the binary before downloading model files, and `qwen-up` performs a remote preflight as soon as SSH is available.
+
+The container PID 1 now supervises `sshd -D` and `start.sh` as separate child processes. If `start.sh` or `llama-server` exits, the container stays alive, writes the exit code to `/run/qwen38/start.exitcode`, and leaves SSH running. If `sshd` itself exits unexpectedly, PID 1 restarts only sshd after `SSH_RESTART_DELAY_SECONDS` (default `2`) rather than restarting the whole container. A Vast `TERM`/`INT` is forwarded cleanly to both children.
+
+`qwen-up` notices the model exit marker, prints the server log, and performs normal failure cleanup. Set `KEEP_ON_FAILURE=1` when intentionally debugging a failed instance and you want `qwen-up` to leave it running and SSH-accessible. SSH daemon diagnostics are available in `/var/log/qwen38/sshd.log`.

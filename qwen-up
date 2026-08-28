@@ -146,6 +146,15 @@ fi
 CTX_SIZE="${CTX_SIZE_OVERRIDE:-$PROFILE_CTX_SIZE}"
 GPU_QUERY="${GPU_QUERY_OVERRIDE:-$PROFILE_GPU_QUERY}"
 MAX_DPH="${MAX_DPH:-0.80}"
+REQUIRE_FREE_TRAFFIC="$(jq -r '.market_policy.require_free_traffic // true' "$PROFILES_FILE")"
+MAX_INET_DOWN_COST="$(jq -r '.market_policy.max_inet_down_cost // 0' "$PROFILES_FILE")"
+MAX_INET_UP_COST="$(jq -r '.market_policy.max_inet_up_cost // 0' "$PROFILES_FILE")"
+ALLOW_PAID_TRAFFIC="${QWEN_ALLOW_PAID_TRAFFIC:-0}"
+if [[ "$REQUIRE_FREE_TRAFFIC" == "true" && "$ALLOW_PAID_TRAFFIC" != "1" ]]; then
+  # Vast exposes inet_{down,up}_cost as USD/GB. Keep this policy centralized
+  # rather than duplicating it across every GPU profile.
+  GPU_QUERY+=" inet_down_cost<=${MAX_INET_DOWN_COST} inet_up_cost<=${MAX_INET_UP_COST}"
+fi
 if qwen_cache_enabled; then
   # A slot snapshot is first written to local Vast disk before it is uploaded.
   # 100 GB avoids failing a long-context save for lack of scratch space.
@@ -303,8 +312,16 @@ cleanup_paid_instance() {
   fi
   if [[ -n "$instance_id" && "$KEEP_ON_FAILURE" != "1" ]]; then
     echo >&2 "[cleanup] $reason; destroying Vast instance $instance_id to stop billing..."
-    vastai destroy instance "$instance_id" --raw >/dev/null 2>&1 || true
-    rm -f "$STATE_FILE" "$ENV_FILE"
+    set +e
+    qwen_destroy_instance "$instance_id"
+    cleanup_destroy_rc=$?
+    set -e
+    if (( cleanup_destroy_rc == 0 )); then
+      rm -f "$STATE_FILE" "$ENV_FILE"
+    else
+      echo >&2 "[cleanup] WARNING: Vast destroy failed/timed out (outcome=${QWEN_DESTROY_OUTCOME}, rc=$cleanup_destroy_rc). Keeping state for manual retry."
+      [[ -n "$QWEN_DESTROY_OUTPUT" ]] && printf '%s\n' "$QWEN_DESTROY_OUTPUT" >&2
+    fi
   elif [[ -n "$instance_id" ]]; then
     echo >&2 "[cleanup] $reason; KEEP_ON_FAILURE=1, leaving instance $instance_id running."
   fi
@@ -328,10 +345,19 @@ offers="$(jq -c '
   else [] end
 ' <<<"$offers_raw")"
 
-offer="$(jq -c --argjson max "$MAX_DPH" '
+offer="$(jq -c --argjson max "$MAX_DPH" \
+  --arg require_free "$REQUIRE_FREE_TRAFFIC" \
+  --argjson allow_paid "$ALLOW_PAID_TRAFFIC" \
+  --argjson max_down "$MAX_INET_DOWN_COST" \
+  --argjson max_up "$MAX_INET_UP_COST" '
   [ .[]
     | ._effective_dph = (.dph_total // .dph_base // 999999)
     | select(._effective_dph <= $max)
+    | select(
+        if ($require_free == "true" and $allow_paid != 1) then
+          ((.inet_down_cost // 999999) <= $max_down and (.inet_up_cost // 999999) <= $max_up)
+        else true end
+      )
   ]
   | sort_by(._effective_dph)
   | .[0] // empty
@@ -339,6 +365,9 @@ offer="$(jq -c --argjson max "$MAX_DPH" '
 
 if [[ -z "$offer" || "$offer" == "null" ]]; then
   echo >&2 "ERROR: no matching offer at or below \$$MAX_DPH/h."
+  if [[ "$REQUIRE_FREE_TRAFFIC" == "true" && "$ALLOW_PAID_TRAFFIC" != "1" ]]; then
+    echo >&2 "Traffic policy requires inet_down_cost=0 and inet_up_cost=0 (free transfer)."
+  fi
   echo >&2 "Raise MAX_DPH or set GPU_QUERY_OVERRIDE for this test."
   exit 4
 fi
@@ -347,6 +376,8 @@ offer_id="$(jq -r '.id // .ask_contract_id // empty' <<<"$offer")"
 gpu_name="$(jq -r '.gpu_name // "unknown"' <<<"$offer")"
 dph="$(jq -r '._effective_dph' <<<"$offer")"
 inet_down="$(jq -r '.inet_down // "?"' <<<"$offer")"
+inet_down_cost="$(jq -r '.inet_down_cost // "?"' <<<"$offer")"
+inet_up_cost="$(jq -r '.inet_up_cost // "?"' <<<"$offer")"
 disk_bw="$(jq -r '.disk_bw // "?"' <<<"$offer")"
 reliability="$(jq -r '.reliability2 // .reliability // "?"' <<<"$offer")"
 location="$(jq -r '.geolocation // "?"' <<<"$offer")"
@@ -356,8 +387,8 @@ if [[ -z "$offer_id" ]]; then
   exit 4
 fi
 
-printf '[rent] %s | $%.4f/h | down=%s Mbps | disk=%s MB/s | reliability=%s | %s | offer=%s\n' \
-  "$gpu_name" "$dph" "$inet_down" "$disk_bw" "$reliability" "$location" "$offer_id"
+printf '[rent] %s | $%.4f/h | down=%s Mbps | traffic down/up=$%s/$%s per GB | disk=%s MB/s | reliability=%s | %s | offer=%s\n' \
+  "$gpu_name" "$dph" "$inet_down" "$inet_down_cost" "$inet_up_cost" "$disk_bw" "$reliability" "$location" "$offer_id"
 
 # v7 uses Vast's normal entrypoint/args launch mode. Port 22 is a normal
 # Docker mapping and sshd is part of our image; Vast no longer injects a child
@@ -429,6 +460,8 @@ jq -n \
   --argjson run_started_epoch "$RUN_STARTED_EPOCH" \
   --arg location "$location" \
   --arg inet_down "$inet_down" \
+  --arg inet_down_cost "$inet_down_cost" \
+  --arg inet_up_cost "$inet_up_cost" \
   --arg disk_bw "$disk_bw" \
   --arg reliability "$reliability" \
   --argjson fastmtp "$USE_FASTMTP" \
@@ -442,7 +475,7 @@ jq -n \
   --arg slot_cache_root "$QWEN_SLOT_CACHE_ROOT" \
   --arg slot_cache_session "$QWEN_SLOT_CACHE_SESSION" \
   --argjson slot_cache_max_gb "$QWEN_SLOT_CACHE_MAX_GB" \
-  '{schema_version:1,instance_id:$instance_id,offer_id:$offer_id,gpu:$gpu,dph:$dph,local_port:$local_port,model:$model,hf_revision:$hf_revision,ctx_size:$ctx,api_key:$api_key,image:$image,label:$label,profile:$profile,monitor_group:$monitor_group,gpu_query:$gpu_query,disk_gb:$disk_gb,cuda_arch:$cuda_arch,run_id:$run_id,run_dir:$run_dir,started_at:$started_at,started_epoch:$started_epoch,run_started_at:$run_started_at,run_started_epoch:$run_started_epoch,location:$location,inet_down:$inet_down,disk_bw:$disk_bw,reliability:$reliability,use_fastmtp:$fastmtp,reasoning_effort:$reasoning_effort,cache_type_k:$cache_type_k,cache_type_v:$cache_type_v,slot_cache_enabled:$slot_cache_enabled,slot_cache_host:$slot_cache_host,slot_cache_port:$slot_cache_port,slot_cache_user:$slot_cache_user,slot_cache_root:$slot_cache_root,slot_cache_session:$slot_cache_session,slot_cache_max_gb:$slot_cache_max_gb}' \
+  '{schema_version:1,instance_id:$instance_id,offer_id:$offer_id,gpu:$gpu,dph:$dph,local_port:$local_port,model:$model,hf_revision:$hf_revision,ctx_size:$ctx,api_key:$api_key,image:$image,label:$label,profile:$profile,monitor_group:$monitor_group,gpu_query:$gpu_query,disk_gb:$disk_gb,cuda_arch:$cuda_arch,run_id:$run_id,run_dir:$run_dir,started_at:$started_at,started_epoch:$started_epoch,run_started_at:$run_started_at,run_started_epoch:$run_started_epoch,location:$location,inet_down:$inet_down,inet_down_cost:$inet_down_cost,inet_up_cost:$inet_up_cost,disk_bw:$disk_bw,reliability:$reliability,use_fastmtp:$fastmtp,reasoning_effort:$reasoning_effort,cache_type_k:$cache_type_k,cache_type_v:$cache_type_v,slot_cache_enabled:$slot_cache_enabled,slot_cache_host:$slot_cache_host,slot_cache_port:$slot_cache_port,slot_cache_user:$slot_cache_user,slot_cache_root:$slot_cache_root,slot_cache_session:$slot_cache_session,slot_cache_max_gb:$slot_cache_max_gb}' \
   > "$STATE_FILE"
 chmod 600 "$STATE_FILE"
 sync_run_metadata "provisioning"
@@ -511,6 +544,29 @@ while ! ssh "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" true >/dev/null 2>&1; do
   sleep 5
 done
 echo "[ssh] connection ready"
+
+# Fail fast on broken runtime images. The container starts sshd first and keeps
+# it alive even if the model process fails, so this reports the real loader
+# error instead of degrading into repeated tunnel reconnect messages.
+runtime_preflight_rc=0
+runtime_preflight="$(ssh "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" '
+  set +e
+  /usr/local/bin/llama-server --version >/tmp/qwen-llama-version.out 2>/tmp/qwen-llama-version.err
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    cat /tmp/qwen-llama-version.err
+    echo "--- ldd ---"
+    ldd /usr/local/bin/llama-server 2>&1 | grep -E "not found|libgomp" || true
+  fi
+  exit "$rc"
+' 2>&1)" || runtime_preflight_rc=$?
+if (( runtime_preflight_rc != 0 )); then
+  echo >&2 "[runtime] ERROR: remote llama-server preflight failed:"
+  printf '%s\n' "$runtime_preflight" >&2
+  cleanup_paid_instance "llama-server runtime dependency failure"
+  exit 7
+fi
+unset runtime_preflight runtime_preflight_rc
 
 # Stage the persistent slot snapshot while the model is still downloading/loading.
 # This overlaps the Vienna -> Vast transfer with the Hugging Face cold start.
@@ -609,6 +665,17 @@ ENV
       sleep 5
       continue
     fi
+  fi
+
+  # entrypoint.sh keeps sshd alive when start.sh exits. Detect that marker
+  # immediately instead of waiting for START_TIMEOUT while reconnecting a
+  # perfectly healthy SSH daemon to a dead model server.
+  start_exit_rc="$(ssh "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" 'cat /run/qwen38/start.exitcode 2>/dev/null || true' 2>/dev/null || true)"
+  if [[ "$start_exit_rc" =~ ^[0-9]+$ ]]; then
+    echo >&2 "[model] ERROR: remote start.sh exited with rc=$start_exit_rc"
+    ssh "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" 'tail -n 60 /var/log/qwen38/server.log 2>/dev/null || true' 2>/dev/null | sed 's/^/[remote] /' >&2 || true
+    cleanup_paid_instance "remote model server exited (rc=$start_exit_rc)"
+    exit 8
   fi
 
   if (( now - start_epoch > START_TIMEOUT )); then

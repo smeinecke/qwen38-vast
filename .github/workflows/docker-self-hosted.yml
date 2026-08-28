@@ -34,6 +34,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Validate cumulative repository features
+        run: bash ./scripts/validate-repo
+
       - name: Validate repository
         run: |
           echo "Runner CPUs: $(nproc)"

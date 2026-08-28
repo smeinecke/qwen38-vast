@@ -263,5 +263,11 @@
         "rank": 210
       }
     ]
+  },
+  "market_policy": {
+    "require_free_traffic": true,
+    "max_inet_down_cost": 0,
+    "max_inet_up_cost": 0,
+    "description": "Reject offers that charge for internet ingress or egress. Vast inet_*_cost values are USD/GB."
   }
 }

@@ -303,22 +303,23 @@ fi
 
 destroy_outcome="none"
 if [[ -n "$instance_id" ]]; then
-  echo "Destroying Vast instance $instance_id..."
+  echo "Destroying Vast instance $instance_id (non-interactive, timeout=${QWEN_DESTROY_TIMEOUT_SECONDS:-45}s)..."
   set +e
-  destroy_output="$(vastai destroy instance "$instance_id" --raw 2>&1)"
+  qwen_destroy_instance "$instance_id"
   destroy_rc=$?
   set -e
+  destroy_output="$QWEN_DESTROY_OUTPUT"
+  destroy_outcome="$QWEN_DESTROY_OUTCOME"
   [[ -n "$destroy_output" ]] && printf '%s\n' "$destroy_output"
 
-  # Vast CLI versions may return exit code 0 even when the JSON payload reports
-  # a 404. For qwen-down, 404 is success: the desired state is "instance absent".
-  if grep -Eq '"status_code"[[:space:]]*:[[:space:]]*404|Instance [0-9]+ not found' <<<"$destroy_output"; then
-    destroy_outcome="already_absent"
-  elif (( destroy_rc != 0 )) || grep -Eq '"error"[[:space:]]*:[[:space:]]*true' <<<"$destroy_output"; then
-    echo >&2 "ERROR: destroy failed. State was kept so you can retry."
+  # 404 is success for shutdown: the required postcondition is that the rental
+  # no longer exists. A real timeout/error keeps local state for a safe retry.
+  if [[ "$destroy_outcome" == "timeout" ]]; then
+    echo >&2 "ERROR: Vast destroy exceeded ${QWEN_DESTROY_TIMEOUT_SECONDS:-45}s. State was kept so you can retry; verify the instance in Vast before assuming billing stopped."
     exit 3
-  else
-    destroy_outcome="destroyed"
+  elif (( destroy_rc != 0 )); then
+    echo >&2 "ERROR: Vast destroy failed (rc=$destroy_rc). State was kept so you can retry."
+    exit 3
   fi
 fi
 

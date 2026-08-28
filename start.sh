@@ -29,6 +29,19 @@ fi
 mkdir -p "$MODEL_DIR" "$SLOT_SAVE_PATH"
 chmod 700 "$SLOT_SAVE_PATH"
 
+# Validate the executable before downloading tens of GB. A missing runtime
+# library otherwise causes a crash only after model transfer and looks like an
+# intermittent SSH/tunnel problem from the client side.
+echo "[runtime] validating llama-server dependencies..."
+if ! /usr/local/bin/llama-server --version >/tmp/llama-version.txt 2>/tmp/llama-version.err; then
+  cat /tmp/llama-version.err >&2 || true
+  echo >&2 "[runtime] linked libraries:"
+  ldd /usr/local/bin/llama-server >&2 || true
+  echo >&2 "ERROR: llama-server runtime preflight failed; refusing model download."
+  exit 70
+fi
+cat /tmp/llama-version.txt
+
 download_file() {
   local filename="$1"
   echo "[download] ${HF_REPO}/${filename}"
@@ -95,8 +108,6 @@ fi
 unset HF_TOKEN HUGGING_FACE_HUB_TOKEN || true
 
 echo "[serve] profile=$QWEN_PROFILE model=$MODEL revision=$HF_REVISION ctx=$CTX_SIZE fastmtp=$USE_FASTMTP bind=$BIND_HOST:$PORT slot_save_path=$SLOT_SAVE_PATH"
-echo "[runtime] llama-server version:"
-/usr/local/bin/llama-server --version 2>&1 || true
 echo "[runtime] GPU snapshot:"
 nvidia-smi --query-gpu=timestamp,index,name,driver_version,memory.total,power.limit --format=csv,noheader 2>&1 || nvidia-smi 2>&1 || true
 exec /usr/local/bin/llama-server "${server_args[@]}"

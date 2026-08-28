@@ -1,6 +1,39 @@
 # Changelog
 
-# v9.4 - race-free, self-healing SSH tunnels
+## v9.6.1 — supervised SSH daemon
+
+- Run `sshd` with `-D` as an explicit child of the container PID 1 supervisor instead of daemonizing it away from supervision.
+- Restart `sshd` in-place if it exits unexpectedly; a transient SSH-daemon failure no longer requires or triggers a whole-container restart.
+- Keep `start.sh`/`llama-server` one-shot and independent: inference failure records `/run/qwen38/start.exitcode` while SSH continues serving.
+- Forward container `TERM`/`INT` cleanly to both inference and SSH children.
+- Add `SSH_RESTART_DELAY_SECONDS` (default `2`) for bounded sshd restart backoff and extend the repo regression validator to require the supervised-SSH design.
+
+## v9.6 — runtime dependency + SSH survivability
+
+- Add `libgomp1` to the slim CUDA runtime image; `llama-server` requires `libgomp.so.1`.
+- Validate the final binary linkage during Docker build so a broken runtime image cannot be published silently.
+- Validate `llama-server --version` before any GGUF download and again remotely from `qwen-up` immediately after SSH is ready.
+- Decouple SSH lifetime from `start.sh`: if the model process exits, the container remains alive and SSH stays reachable for diagnostics instead of entering a Vast restart loop.
+- Persist `/run/qwen38/start.exitcode`; `qwen-up` detects it and prints the remote server log immediately instead of spending the full startup timeout reconnecting tunnels.
+- Extend `scripts/validate-repo` to guard all of the above against future branch reconciliation regressions.
+
+## v9.5 - reconciled cumulative fixes
+
+- Restored the non-interactive, timeout-bounded `qwen_destroy_instance` path in `qwen-up` failure cleanup; later tunnel work had accidentally reintroduced a direct interactive `vastai destroy` call.
+- Added the free-traffic Vast market policy on top of the user working tree: both rental and monitor searches reject non-zero upload/download traffic cost by default.
+- Added `scripts/validate-repo` and wired it into both Docker workflows to catch loss of cumulative features (slot cache, 256k profiles, hardware ranking, traffic policy, tunnel helper, destroy helper and compiler cache).
+- Release ZIP is sanitized: local `.env`, `.qwen-cache/`, `.qwen-runs/` and `.qwen-vast/` state are not included.
+
+## v9.4 - free-traffic offer policy
+
+- Rejects Vast offers with non-zero `inet_down_cost` or `inet_up_cost` by default.
+- Applies the same traffic policy to `qwen-up` and `qwen-monitor`.
+- Centralizes traffic limits in `profiles.json -> market_policy`; no duplicated profile query edits.
+- Validates raw search results as a second guard and prints selected traffic prices before rental.
+- Adds `QWEN_ALLOW_PAID_TRAFFIC=1` as an explicit emergency override.
+- Persists selected upload/download traffic prices in local instance state.
+
+## v9.3.1 - race-free, self-healing SSH tunnels
 
 - Centralize tunnel creation in `.qwen-lib.sh`; `qwen-up` no longer launches a second independent `ssh -L`.
 - Serialize tunnel creation across `qwen-up`, `qwen-status`, `qwen-bench`, and `qwen-down` with an atomic local lock.
@@ -8,7 +41,7 @@
 - Add `LOCAL_PORT_AUTO=1` (default): if the preferred localhost port is occupied by an unrelated process, automatically select the next free port and persist it in state.
 - Treat a tunnel disconnect during model loading as recoverable: refresh Vast SSH endpoint and reconnect until `START_TIMEOUT` rather than immediately destroying the instance.
 
-# v9.3 - 256k profiles and hardware-safe market monitoring
+## v9.3 - 256k profiles and hardware-safe market monitoring
 
 - Added explicit 262,144-token (`256k`) runtime profiles for RTX A6000/A40, 48 GB Ada-class GPUs, and a conservative RTX PRO 6000 96 GB Blackwell profile; all reuse the existing three CUDA images.
 - Added editable `monitor_hardware.gpu_ranks` metadata to `profiles.json`. The numbers are ordering values, not claimed benchmark scores.
@@ -17,7 +50,7 @@
 - Custom `CTX_SIZE_OVERRIDE` values with no named profile fall back to the current profile, and the generated switch command preserves the exact current context.
 - Monitor output now shows both current/candidate hardware ranks for auditability.
 
-# v9.2 — non-interactive Vast destroy fix
+## v9.2 — non-interactive Vast destroy fix
 
 - Fixed `qwen-down` hanging indefinitely at `Destroying Vast instance ...`: Vast CLI requires `-y` to skip its own irreversible-action confirmation. Because qwen-down captured CLI output, that second prompt was invisible.
 - Fixed the same missing `-y` in `qwen-up` failure cleanup.
