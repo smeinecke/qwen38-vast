@@ -1,22 +1,32 @@
-name: Build and publish CUDA images
+name: Manual CUDA build on local runner
 
 on:
-  push:
-    branches: [main]
-    tags: ['v*']
   workflow_dispatch:
+    inputs:
+      target:
+        description: Image target from profiles.json
+        required: true
+        default: a6000
+        type: choice
+        options:
+          - a6000
+          - ada
+          - blackwell
+          - all
 
 permissions:
   contents: read
   packages: write
 
+# Never start this workflow automatically. It is intended for the 56-core local
+# runner and is only entered through workflow_dispatch.
 concurrency:
-  group: docker-${{ github.ref }}
-  cancel-in-progress: true
+  group: docker-self-hosted-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  validate:
-    runs-on: ubuntu-24.04
+  prepare:
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 10
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
@@ -24,32 +34,49 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Validate config and shell scripts
+      - name: Validate repository
         run: |
+          echo "Runner CPUs: $(nproc)"
+          docker version
           jq -e '.schema_version == 1 and (.images|length > 0) and (.profiles|length > 0)' profiles.json >/dev/null
           bash -n start.sh entrypoint.sh qwen-init-ssh.sh .qwen-lib.sh \
             qwen-up qwen-down qwen-status qwen-logs qwen-bench qwen-results \
             scripts/prepare-authorized-keys
 
-      - name: Build matrix from profiles.json
+      - name: Select build target(s)
         id: matrix
+        env:
+          TARGET: ${{ inputs.target }}
         run: |
-          matrix="$(jq -c '{include:[.images[] | {profile:.name,cuda_arch:.cuda_arch,image_tag:.image_tag,description:.description}]}' profiles.json)"
+          if [[ "$TARGET" == "all" ]]; then
+            matrix="$(jq -c '{include:[.images[] | {profile:.name,cuda_arch:.cuda_arch,image_tag:.image_tag,description:.description}]}' profiles.json)"
+          else
+            matrix="$(jq -c --arg target "$TARGET" '{include:[.images[] | select(.name == $target) | {profile:.name,cuda_arch:.cuda_arch,image_tag:.image_tag,description:.description}]}' profiles.json)"
+          fi
+          [[ "$(jq '.include | length' <<<"$matrix")" -gt 0 ]] || { echo >&2 "Unknown target: $TARGET"; exit 2; }
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "$matrix" | jq .
 
   build:
-    needs: validate
-    runs-on: ubuntu-24.04
+    needs: prepare
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 330
     strategy:
       fail-fast: false
+      # With one registered local runner, 'all' naturally queues these jobs one
+      # after another. A selected single target gets all 56 cores via nproc.
       max-parallel: 3
-      matrix: ${{ fromJSON(needs.validate.outputs.matrix) }}
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Show local build capacity
+        run: |
+          echo "Building ${{ matrix.profile }} / sm_${{ matrix.cuda_arch }}"
+          echo "CPUs available to Docker: $(nproc)"
+          free -h || true
 
       - name: Prepare baked SSH public key
         env:
@@ -67,8 +94,9 @@ jobs:
         uses: actions/cache@v5
         with:
           path: .buildkit-cache-mount
-          key: qwen38-ccache-v3-${{ runner.os }}-sm${{ matrix.cuda_arch }}-${{ hashFiles('Dockerfile') }}
+          key: qwen38-local-ccache-v3-${{ runner.os }}-sm${{ matrix.cuda_arch }}-${{ hashFiles('Dockerfile') }}
           restore-keys: |
+            qwen38-local-ccache-v3-${{ runner.os }}-sm${{ matrix.cuda_arch }}-
             qwen38-ccache-v3-${{ runner.os }}-sm${{ matrix.cuda_arch }}-
 
       - name: Inject compiler cache into BuildKit
@@ -92,15 +120,16 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=raw,value=${{ matrix.image_tag }},enable={{is_default_branch}}
+            type=raw,value=${{ matrix.image_tag }}
             type=sha,prefix=${{ matrix.image_tag }}-sha-
             type=ref,event=tag,prefix=${{ matrix.image_tag }}-
           labels: |
             org.opencontainers.image.description=Qwen3.8 llama.cpp CUDA runtime - ${{ matrix.description }}
             io.qwen38.profile=${{ matrix.profile }}
             io.qwen38.cuda-arch=${{ matrix.cuda_arch }}
+            io.qwen38.builder=self-hosted
 
-      - name: Build and push ${{ matrix.profile }}
+      - name: Build and push with local 56-core runner
         uses: docker/build-push-action@v7
         with:
           context: .

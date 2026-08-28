@@ -1,11 +1,12 @@
 # syntax=docker/dockerfile:1.7
 
-# Vast recommends deriving custom images from its pre-built base images. Hosts
-# commonly cache these layers, and the image is already compatible with Vast's
-# SSH launch mode, avoiding a slow first-boot package installation on many hosts.
-ARG VAST_BASE=vastai/base-image:cuda-12.8.1-cudnn-devel-ubuntu24.04-py312
+# Compile against CUDA 12.8 in a full devel image, but ship a much smaller CUDA
+# runtime image. The previous runtime inherited the ~multi-GB devel toolchain,
+# which was unnecessary on disposable inference hosts.
+ARG BUILDER_BASE=vastai/base-image:cuda-12.8.1-cudnn-devel-ubuntu24.04-py312
+ARG RUNTIME_BASE=nvidia/cuda:12.8.1-runtime-ubuntu24.04
 
-FROM ${VAST_BASE} AS builder
+FROM ${BUILDER_BASE} AS builder
 
 ARG LLAMA_CPP_COMMIT=4df29be4f4c3673f428170fda944a5b19f743bb8
 ARG FASTMTP_PATCH_URL=https://huggingface.co/HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF/resolve/993a5971fda8f30dd1b7eb2654792ba4415c7460/HauhauCS-FastMTP-llama.cpp.patch
@@ -63,7 +64,7 @@ RUN --mount=type=cache,id=qwen38-ccache,target=/root/.cache/ccache,sharing=locke
     && cmake --build build --config Release --target llama-server -j"$(nproc)" \
     && ccache --show-stats
 
-FROM ${VAST_BASE} AS runtime
+FROM ${RUNTIME_BASE} AS runtime
 
 ARG HF_HUB_VERSION=1.28.0
 ARG CUDA_ARCHITECTURES=86
@@ -72,16 +73,59 @@ ARG QWEN_BUILD_PROFILE=custom
 LABEL io.qwen38.profile="${QWEN_BUILD_PROFILE}" \
       io.qwen38.cuda-arch="${CUDA_ARCHITECTURES}"
 
-# The Vast base image already contains Python, uv, SSH tooling and the CUDA
-# runtime/development libraries. Add only the small Python dependency needed to
-# fetch GGUFs at instance start.
-RUN /venv/main/bin/pip install --no-cache-dir "huggingface_hub[hf-xet]==${HF_HUB_VERSION}"
+# Pre-install and upgrade everything needed by the disposable runtime. In v6 we
+# asked Vast for SSH launch mode; Vast then built a child /ssh image at instance
+# start and ran apt-get itself. v7 uses normal entrypoint mode and self-manages
+# sshd, so all package work happens once here in CI instead of on paid GPU time.
+RUN export DEBIAN_FRONTEND=noninteractive \
+    && apt-get update \
+    && apt-get -y upgrade \
+    && apt-get install -y --no-install-recommends \
+         ca-certificates \
+         openssh-server \
+         openssh-client \
+         tmux \
+         git \
+         rsync \
+         wget \
+         curl \
+         less \
+         locales \
+         sudo \
+         python3 \
+         python3-venv \
+    && python3 -m venv /venv/main \
+    && /venv/main/bin/pip install --no-cache-dir --upgrade pip \
+    && /venv/main/bin/pip install --no-cache-dir "huggingface_hub[hf-xet]==${HF_HUB_VERSION}" \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -f /etc/ssh/ssh_host_*
 
 COPY --from=builder /src/llama.cpp/build/bin/llama-server /usr/local/bin/llama-server
-COPY start.sh /usr/local/bin/start.sh
+COPY start.sh entrypoint.sh qwen-init-ssh.sh /usr/local/bin/
+COPY ssh/ /etc/qwen38/ssh/
 
-RUN chmod 0755 /usr/local/bin/start.sh \
-    && mkdir -p /models
+# Fail CI rather than publishing an entrypoint-mode image that nobody can SSH
+# into. Workflows create ssh/authorized_keys.generated before docker build.
+RUN chmod 0755 /usr/local/bin/start.sh /usr/local/bin/entrypoint.sh /usr/local/bin/qwen-init-ssh.sh \
+    && mkdir -p /models /run/sshd /root/.ssh /etc/ssh/sshd_config.d \
+    && chmod 0700 /root/.ssh \
+    && if ! grep -hE '^[[:space:]]*(ssh-|ecdsa-|sk-)[^[:space:]]+[[:space:]]+[^[:space:]]+' /etc/qwen38/ssh/authorized_keys* >/dev/null 2>&1; then \
+         echo >&2 'ERROR: image build contains no SSH public key; run scripts/prepare-authorized-keys first'; exit 2; \
+       fi \
+    && printf '%s\n' \
+         'PermitRootLogin prohibit-password' \
+         'PubkeyAuthentication yes' \
+         'PasswordAuthentication no' \
+         'KbdInteractiveAuthentication no' \
+         'ChallengeResponseAuthentication no' \
+         'StrictModes yes' \
+         'AllowTcpForwarding yes' \
+         'GatewayPorts no' \
+         'X11Forwarding no' \
+         'ClientAliveInterval 15' \
+         'ClientAliveCountMax 3' \
+         'LogLevel VERBOSE' \
+       > /etc/ssh/sshd_config.d/99-qwen38.conf
 
 ENV PATH="/venv/main/bin:${PATH}" \
     HF_HOME=/models/.cache/huggingface \
@@ -91,7 +135,6 @@ ENV PATH="/venv/main/bin:${PATH}" \
 
 WORKDIR /models
 
-# Vast's SSH launch mode overrides the image ENTRYPOINT and runs start.sh from
-# the on-start command. Keeping this entrypoint is still useful for local Docker
-# testing and for a future Vast args-mode deployment.
-ENTRYPOINT ["/usr/local/bin/start.sh"]
+# qwen-up requests `-p 22:22` explicitly. Vast maps that container port to a
+# random external host port; the scripts discover it from show-instance JSON.
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

@@ -1,3 +1,18 @@
+# Changelog
+
+## v7 - self-managed SSH, external profiles and manual 56-core builds
+
+- Switched Vast creation from injected SSH launch mode to normal args/entrypoint mode with a regular `-p 22:22` mapping. The image now starts its own `sshd`, so Vast no longer builds a runtime `.../ssh` child image or mutates `authorized_keys`.
+- Added `qwen-init-ssh.sh` with deterministic `0700`/`0600` ownership/modes and fresh per-instance host keys.
+- CI bakes the repository owner's GitHub public SSH keys into the image by default; repository-variable and committed-key overrides are supported.
+- Moved `apt-get upgrade` plus SSH/runtime utility installation into the Docker image build, off paid GPU startup time.
+- Changed the final stage from the full Vast CUDA/cuDNN devel base to `nvidia/cuda:12.8.1-runtime-ubuntu24.04`; the builder remains on the devel image. This substantially reduces the image pulled by each disposable host.
+- Added `profiles.json`; runtime profiles and image architecture metadata no longer live inside `qwen-up`. Added `a6000-128k`, which reuses the same SM86 image as the 64k A6000 profile.
+- Both Docker workflows derive their build matrix from `profiles.json`.
+- Added `.github/workflows/docker-self-hosted.yml`, a manual-only workflow for the local 56-core self-hosted runner with selectable A6000/Ada/Blackwell/all targets.
+- Updated Docker Actions to Node-24-capable major versions and `buildkit-cache-dance` v3.4.0.
+- SSH endpoint discovery now understands normal Vast port mappings (`public_ipaddr` + `ports["22/tcp"].HostPort`) while retaining compatibility with legacy Vast SSH-mode instances.
+
 ## v6.1 - idempotent shutdown and locale-safe accounting
 
 - Treat Vast `404 / instance not found` as successful shutdown (`already_absent`).

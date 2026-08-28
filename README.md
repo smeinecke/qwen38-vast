@@ -1,177 +1,266 @@
 # Qwen3.8 27B FastMTP on Vast.ai
 
-Reproducible, disposable deployment for:
+Disposable Vast.ai deployment for:
 
 - `HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF`
 - llama.cpp + HauhauCS FastMTP
-- one architecture-matched NVIDIA GPU (A6000, Ada, or Blackwell)
-- profile-driven 64k/128k context defaults
-- Vast.ai billed only while the disposable instance exists/runs
-- a local SSH tunnel instead of exposing the inference API directly to the internet
-- persistent local run/benchmark telemetry under `.qwen-runs/`
+- architecture-specific CUDA images for Ampere, Ada and Blackwell
+- editable runtime profiles in `profiles.json`
+- self-managed SSH with a public key baked into the image
+- local SSH tunnel for the OpenAI-compatible API
+- persistent benchmark/telemetry history in `.qwen-runs/`
 
-> **v5 migration:** rebuild/push the GHCR images because `start.sh` now enables llama.cpp `/metrics`. Update your local scripts as well; run history is stored outside transient `.qwen-vast/` state.
->
-> **v4 migration:** update your local `.env` from `.env.example`. Use `GHCR_IMAGE_BASE=ghcr.io/OWNER/REPO` instead of `:latest`; `qwen-up` now selects the architecture tag and context profile. Legacy `CTX_SIZE`/`GPU_QUERY` values are intentionally ignored in favor of explicit `*_OVERRIDE` variables.
+## v7 architecture change
 
-The Docker image contains **no model weights and no credentials**. GitHub Actions builds the CUDA/llama.cpp runtime and publishes it to GHCR. The runtime now derives from Vast.ai's own CUDA base image so SSH-mode hosts can reuse commonly cached/compatible layers instead of spending minutes installing SSH tooling into a generic CUDA image. `qwen-up` rents a suitable Vast host, starts the image, downloads the GGUF from Hugging Face, creates an SSH tunnel, and waits for `/health`. `qwen-down` destroys the Vast instance.
+v7 deliberately **does not use Vast's SSH launch mode anymore**. Vast SSH mode
+replaces the image entrypoint and injects/builds additional SSH setup layers at
+instance start. That caused two real problems in testing: extra paid cold-start
+work and non-deterministic `/root/.ssh/authorized_keys` permissions.
 
-## GitHub Actions builds and stable image tags
+The image now contains `openssh-server`, all utility packages and your public key
+already. Vast runs the image in normal `args`/entrypoint mode and only maps
+container port 22 to a random public port. `qwen-up` discovers that mapping from
+the instance JSON and creates the same local API tunnel as before.
 
-GitHub Actions builds three architecture-specific images in parallel on normal
-GitHub-hosted runners. Each job compiles exactly one CUDA architecture, so one
-slow target cannot consume the build time for all GPUs and no image carries
-unused CUDA cubins.
+The runtime image also runs `apt-get upgrade` during the CI image build. No
+package upgrade/install should be required on the paid Vast GPU instance.
 
-| Profile | CUDA target | Stable GHCR tag | Runtime default |
-|---|---:|---|---:|
-| `a6000` | SM 86 | `:a6000` | 65,536 context |
-| `ada-128k` | SM 89 | `:ada-128k` | 131,072 context |
-| `blackwell-128k` | SM 120 | `:blackwell-128k` | 131,072 context |
+## Images vs runtime profiles
 
-Every build also publishes architecture-specific immutable SHA tags such as
-`:a6000-sha-...`. Release tags become e.g. `:a6000-v5.0.0`. Normal deployment
-uses the stable profile names, so `.env` never needs to contain a digest/hash.
+`profiles.json` is the single editable configuration file for architectures,
+context defaults and Vast search queries.
 
-The build matrix uses `ubuntu-24.04`, `fail-fast: false`, `max-parallel: 3` and a
-330-minute per-job timeout. Ninja already parallelizes compilation across every
-CPU core inside each runner; splitting one CMake build across additional fresh
-runners would require distributing/interchanging a build tree and is not worth
-the complexity. The useful parallelism boundary is therefore one runner per CUDA
-architecture.
+There are three compiled CUDA images:
 
-Each architecture has its own BuildKit and ccache scope. This avoids mixing
-SM86/SM89/SM120 CUDA object files while retaining incremental build acceleration.
+| Image name | CUDA | Stable GHCR tag | GPUs |
+|---|---:|---|---|
+| `a6000` | SM86 | `:a6000` | RTX A6000 |
+| `ada` | SM89 | `:ada-128k` | RTX 6000 Ada, L40S, RTX 5880 Ada |
+| `blackwell` | SM120 | `:blackwell-128k` | RTX 5090, RTX PRO 6000 Blackwell |
 
-## Defaults
+Runtime profiles can reuse one compiled image. The included profiles are:
 
-- Model: `Q4_K_P` (17.9 GB)
-- `a6000`: 64k context, throughput-first
-- `ada-128k`: 128k context
-- `blackwell-128k`: 128k context, throughput-first Blackwell target
-- FastMTP depth/runtime: configured by `start.sh`
-- Maximum all-in Vast price: `$0.80/h`
-- Local OpenAI-compatible endpoint: `http://127.0.0.1:18080/v1`
+| Runtime profile | Image | Context |
+|---|---|---:|
+| `a6000` | `:a6000` | 65,536 |
+| `a6000-128k` | `:a6000` | 131,072 |
+| `ada-128k` | `:ada-128k` | 131,072 |
+| `blackwell-128k` | `:blackwell-128k` | 131,072 |
 
-Qwen3.8-27B has native 262,144-token context and a hybrid attention layout. The
-profiles intentionally use smaller defaults because long occupied context reduces
-decode throughput substantially during interactive coding sessions.
+So testing 64k vs 128k on an A6000 does **not** require another Docker build:
 
-## 1. Create the public GitHub repository
+```bash
+./qwen-up a6000
+./qwen-up a6000-128k
+```
 
-Create an empty public repository, copy these files into it, and push to `main`.
-The workflow publishes:
+Edit `profiles.json` to add e.g. 32k/96k profiles or tighten a region/GPU query.
+`qwen-up` no longer contains hard-coded profile cases.
+
+## GitHub Actions builds
+
+### Normal GitHub-hosted workflow
+
+`.github/workflows/docker.yml` builds the architectures from the `images` array
+in `profiles.json`. Each architecture is a separate matrix job and can run in
+parallel.
+
+The workflow publishes stable tags plus SHA/release tags, for example:
 
 ```text
 ghcr.io/YOUR_USER/YOUR_REPO:a6000
+ghcr.io/YOUR_USER/YOUR_REPO:a6000-sha-abc1234
 ghcr.io/YOUR_USER/YOUR_REPO:ada-128k
 ghcr.io/YOUR_USER/YOUR_REPO:blackwell-128k
 ```
 
-After the first successful build, open the generated GHCR package settings and
-change package visibility to **Public**.
+### Manual 56-core self-hosted workflow
 
-## 2. Hugging Face access
+`.github/workflows/docker-self-hosted.yml` is **workflow_dispatch only**. It
+never runs on a push automatically. In the Actions UI select:
 
-The HauhauCS repository is currently publicly downloadable, so **no Hugging Face token is required** for the default deployment. `hf download` runs anonymously when `HF_TOKEN` is empty.
+```text
+Manual CUDA build on local runner
+```
 
-You may still set a fine-grained/read-only token in local `.env` for authenticated downloads/rate limits or as insurance if the upstream repository's access policy changes later. Never commit it. If present, `start.sh` unsets the token before `exec`-ing `llama-server`.
+and choose one of:
 
-## 3. Install local dependencies
+```text
+a6000
+ada
+blackwell
+all
+```
+
+For a single selected architecture the Docker build sees all CPUs exposed by
+your local runner and llama.cpp builds with `-j$(nproc)`. With one registered
+self-hosted runner, choosing `all` queues the three matrix jobs serially; choose a
+single target when you want the full 56 cores focused on one rebuild.
+
+The workflows use the current Node-24 Docker Actions. Keep the self-hosted GitHub
+Actions runner updated (Node-24 actions require a recent Actions runner).
+
+## SSH public key baked into the image
+
+Before each CI Docker build `scripts/prepare-authorized-keys` creates
+`ssh/authorized_keys.generated`.
+
+By default it downloads the public SSH keys of the GitHub repository owner from:
+
+```text
+https://github.com/<repository-owner>.keys
+```
+
+For a personal repository that requires no additional configuration. The full
+key is not printed into CI logs; only key fingerprints are shown.
+
+For an organization repository or a different key, set one of these GitHub
+**repository variables**:
+
+```text
+QWEN_SSH_GITHUB_USER = your-github-user
+```
+
+or:
+
+```text
+QWEN_SSH_PUBLIC_KEY = ssh-ed25519 AAAA... user@host
+```
+
+You can also commit one or more public keys to `ssh/authorized_keys`. Public keys
+are not credentials/secrets, but remember that every private key matching a key
+baked into the image receives root SSH access to instances created from it.
+
+At container startup `qwen-init-ssh.sh` merges the baked keys, forces:
+
+```text
+/root/.ssh                 0700 root:root
+/root/.ssh/authorized_keys 0600 root:root
+```
+
+generates fresh per-instance SSH host keys and starts `sshd`. This avoids the
+Vast `authorized_keys` ownership/mode failure seen with injected SSH mode.
+
+As an emergency runtime override you may also put a quoted public key in local
+`.env`:
+
+```dotenv
+SSH_PUBLIC_KEY='ssh-ed25519 AAAA... user@host'
+```
+
+`qwen-up` base64-encodes and injects that public key into the disposable
+container. Normally this is unnecessary because the CI image already contains
+the key.
+
+## 1. Local dependencies
 
 Linux/macOS/WSL:
 
 ```bash
 python3 -m pip install --upgrade vastai
-sudo apt-get install -y jq curl openssh-client openssl   # Debian/Ubuntu/WSL
+sudo apt-get install -y jq curl openssh-client openssl
 ```
 
-Authenticate Vast either with:
+Authenticate Vast with either:
 
 ```bash
 vastai set api-key YOUR_VAST_API_KEY
 ```
 
-or set `VAST_API_KEY` in `.env`.
+or `VAST_API_KEY` in `.env`.
 
-Also add an SSH public key to your Vast account. `qwen-up` uses Vast's SSH launch mode and an SSH local-forward for the API.
+A Vast account SSH key is no longer required for this deployment path; SSH is
+provided by the container itself.
 
-## 4. Configure
+## 2. Configure
 
 ```bash
 cp .env.example .env
 chmod 600 .env
 ```
 
-Edit at least:
+At minimum set:
 
 ```dotenv
 GHCR_IMAGE_BASE=ghcr.io/YOUR_USER/YOUR_REPO
 ```
 
-`HF_TOKEN` is optional. The image tag is selected by the `qwen-up` profile.
-Context and GPU search defaults are profile-owned; use explicit `*_OVERRIDE`
-variables only for one-off experiments.
+`HF_TOKEN` is optional because the current model repository is public.
 
-## 5. Start
+## 3. Start
 
 ```bash
 ./qwen-up a6000
+./qwen-up a6000-128k
 ./qwen-up ada-128k
 ./qwen-up blackwell-128k
 ```
 
-Calling `./qwen-up` without an argument uses `QWEN_PROFILE` from `.env` (default
-`a6000`). Aliases such as `ampere`, `ada`, `blackwell`, `5090`, `sm86`, `sm89`
-and `sm120` are accepted.
+Calling `./qwen-up` without an argument uses `QWEN_PROFILE` from `.env`, falling
+back to `default_profile` from `profiles.json`.
+
+One-off context test:
+
+```bash
+CTX_SIZE_OVERRIDE=98304 ./qwen-up a6000
+```
 
 The script:
 
-1. selects a GPU query, GHCR tag and context from the requested profile;
-2. rejects anything above `MAX_DPH`;
-3. rents the cheapest remaining offer;
-4. starts your GHCR image in Vast SSH mode;
-5. downloads the target GGUF + ~903 MB FastMTP sidecar with `hf_xet`;
-6. starts patched `llama-server` on `127.0.0.1:8080` inside the instance;
-7. creates an SSH tunnel to local port `18080`;
-8. waits until `/health` responds;
-9. writes client environment variables to `.qwen-vast/env`;
-10. creates `.qwen-runs/<timestamp>-<profile>-<pid>/` and records startup metadata, selected offer, GPU snapshot and local `qwen-up` output.
+1. resolves the runtime profile from `profiles.json`;
+2. selects the corresponding architecture image/tag;
+3. finds the cheapest matching Vast offer below `MAX_DPH`;
+4. creates the instance in normal entrypoint/args mode with `-p 22:22`;
+5. waits for Vast's public port-22 mapping;
+6. connects to the image's own `sshd`;
+7. creates a local `localhost:18080 -> instance:127.0.0.1:8080` tunnel;
+8. waits while `hf_xet` downloads the GGUF/FastMTP sidecar and llama.cpp loads;
+9. waits for `/health`;
+10. stores local state and telemetry.
 
-Load them:
+Load the generated client environment:
 
 ```bash
 source .qwen-vast/env
 ```
 
-Then test:
+Then:
 
 ```bash
 curl "$OPENAI_BASE_URL/models" \
   -H "Authorization: Bearer $OPENAI_API_KEY"
 ```
 
-Example OpenAI-compatible chat call:
+The inference API itself is still bound only to `127.0.0.1` inside the Vast
+container. Only SSH port 22 is public.
 
-```bash
-curl "$OPENAI_BASE_URL/chat/completions" \
-  -H "Authorization: Bearer $OPENAI_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf",
-    "messages": [{"role":"user","content":"Review this function for race conditions."}],
-    "max_tokens": 1024
-  }'
-```
-
-## 6. Logs, telemetry and benchmarks
+## 4. Logs and status
 
 ```bash
 ./qwen-status
 ./qwen-logs
 ```
 
-Every launch gets a persistent local session directory:
+`qwen-status` discovers either:
+
+- v7 custom port mapping: `.public_ipaddr` + `.ports["22/tcp"].HostPort`, or
+- legacy v6 Vast SSH fields: `.ssh_host` + `.ssh_port`.
+
+It recreates a missing local tunnel automatically.
+
+`qwen-logs` tails:
+
+```text
+/var/log/qwen38/server.log
+```
+
+and saves a local live copy under the current `.qwen-runs/<session>/` directory.
+The container entrypoint also mirrors the same log to Vast's normal container
+stdout so the web UI remains useful.
+
+## 5. Telemetry and benchmarks
+
+Every run receives a local directory such as:
 
 ```text
 .qwen-runs/
@@ -183,27 +272,13 @@ Every launch gets a persistent local session directory:
     └── benchmarks/
 ```
 
-`.qwen-runs/` is gitignored and is **not** removed by `qwen-down`.
-
-`qwen-logs` still tails `/var/log/qwen38/server.log` through SSH, but it also
-appends the live stream to `server-live.log` in the current session. Use
-`./qwen-logs --no-save` if you only want terminal output.
-
-`qwen-status` is also self-healing: it refreshes `ssh_host`/`ssh_port` from Vast on every call and recreates the local SSH tunnel if the original `qwen-up` process did not get far enough to persist it or if the tunnel died later. `qwen-logs`, `qwen-bench`, and `qwen-down` use the same refreshed endpoint logic, so an already-paid instance does not need to be recreated just because local SSH state is incomplete.
-
-`qwen-status` now shows profile/context/image, elapsed runtime, estimated compute
-cost, current GPU utilization/VRAM/power, health, and selected llama.cpp metric
-counters when available.
-
-### Reproducible request benchmark
-
-Run a small built-in coding benchmark:
+Run the built-in coding benchmark:
 
 ```bash
 ./qwen-bench
 ```
 
-Or benchmark a real code-analysis prompt/context:
+Or a real prompt/context:
 
 ```bash
 ./qwen-bench \
@@ -212,34 +287,11 @@ Or benchmark a real code-analysis prompt/context:
   --max-tokens 1024
 ```
 
-The request is streamed so the client can measure **TTFB/TTFT**, while the final
-llama.cpp OpenAI-compatible response supplies its server-side `timings` fields.
-For current llama.cpp versions those include prompt/decode throughput and, when
-speculative decoding is active, `draft_n` plus `draft_n_accepted`. The script
-also scrapes `/metrics` before/after as a fallback and records a 1-second
-`nvidia-smi` time series while the request runs.
+The benchmark records prompt/decode throughput, TTFT, latency, MTP draft and
+acceptance counts, GPU utilization, peak VRAM, power and estimated request cost.
+The prompt is not copied by default; add `--save-prompt` if desired.
 
-Each benchmark produces:
-
-```text
-benchmarks/<timestamp>-<label>/
-├── metrics.json
-├── metrics-before.prom
-├── metrics-after.prom
-├── gpu.csv
-├── server-tail.log
-├── response.txt
-├── reasoning.txt
-└── response-final-chunk.json
-```
-
-`metrics.json` contains the useful comparison fields directly: prompt tokens,
-prompt t/s, generated tokens, decode t/s, TTFT, total latency, MTP draft
-acceptance, peak VRAM, average/peak power and estimated compute cost for the
-request. The input prompt itself is **not copied by default**; only its SHA-256
-and size are stored. Add `--save-prompt` when you explicitly want a copy.
-
-Compare every recorded benchmark:
+Compare runs:
 
 ```bash
 ./qwen-results
@@ -247,143 +299,109 @@ Compare every recorded benchmark:
 ./qwen-results --json > qwen-benchmarks.json
 ```
 
-This is the intended workflow for comparing e.g. A6000 32k/64k against 5090
-64k/128k without relying on subjective response speed.
-
-## 7. Stop billing and archive the remote log
+## 6. Stop billing
 
 ```bash
 ./qwen-down --yes
 ```
 
-Before destroying the instance, `qwen-down` now best-effort archives the full
-remote `/var/log/qwen38/server.log`, final `/metrics`, Vast instance metadata and
-a final `nvidia-smi` snapshot into the current `.qwen-runs/<session>/` folder.
-It then calculates session duration and estimated GPU compute cost in
-`metadata.json`.
+Before destroy, the script best-effort archives remote server logs, final
+`/metrics`, Vast metadata and a final GPU snapshot. `404 / instance not found` is
+treated as a successful already-absent end state.
 
-If you deliberately do not want the archive step:
-
-```bash
-./qwen-down --yes --no-archive
-```
-
-The command still calls `vastai destroy instance`, not `stop`. Destroying is
-intentional for this disposable workflow: it removes the container/disk instead
-of leaving storage charges behind.
-
-If `qwen-up` fails or is interrupted before readiness, it destroys the paid instance automatically unless you explicitly set:
+If startup fails, the paid instance is destroyed automatically unless:
 
 ```dotenv
 KEEP_ON_FAILURE=1
 ```
 
-Use that only for debugging.
+is explicitly set.
 
-## Cost controls
+## Cost/search controls
 
-`MAX_DPH` is a hard local guard before rental. Example:
+`MAX_DPH` is a hard local guard. Example:
 
 ```dotenv
 MAX_DPH=0.55
 ```
 
-If no matching host is available below the cap, `qwen-up` exits without renting anything.
+The normal GPU queries are in `profiles.json`, not in shell code. For a one-off
+query use `GPU_QUERY_OVERRIDE`.
 
-Profile-specific GPU queries are built into `qwen-up`. For a one-off custom
-Vast query, set `GPU_QUERY_OVERRIDE`. Examples:
-
-Fast Ada-only:
+Example Europe-only override:
 
 ```dotenv
-GPU_QUERY_OVERRIDE='num_gpus=1 gpu_name=RTX_6000Ada gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1'
+GPU_QUERY_OVERRIDE='num_gpus=1 gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=800 disk_bw>=300 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1 geolocation in [DE,NL,FR,SE,FI]'
 ```
 
-Cheapest 48 GB option:
+## Cold-start changes in v7
 
-```dotenv
-GPU_QUERY_OVERRIDE='num_gpus=1 gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1'
-```
+The model weights are intentionally **not** baked into the image. The Q4 model +
+FastMTP sidecar still have to be fetched onto each disposable Vast disk.
+`HF_XET_HIGH_PERFORMANCE=1` is enabled and the default queries require reasonably
+fast download/disk performance.
 
-Europe example:
+What v7 removes is Vast's additional SSH compatibility build. In the problematic
+v6 logs Vast first pulled the GHCR image, then generated an extra `.../ssh`
+child image, ran `apt-get update/install`, rewrote SSH configuration, and only
+then started the instance. v7 runs the already-prepared image as-is.
 
-```dotenv
-GPU_QUERY_OVERRIDE='num_gpus=1 gpu_name in ["RTX_6000Ada","L40S","RTX_5880Ada","RTX_A6000"] gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1 geolocation in [DE,NL,FR,SE,FI]'
-```
-
-### SSH says the instance is running but `qwen-up` is still waiting
-
-Vast publishes the direct SSH endpoint as `ssh_host` and `ssh_port` in the instance object. The scripts now use those fields first and only use `vastai ssh-url` as a fallback. Run:
-
-```bash
-./qwen-status
-```
-
-If the instance is already reachable, this refreshes `.qwen-vast/state.json` and starts/restarts the local `localhost:18080` tunnel. `./qwen-logs` can then connect directly even while the model is still downloading.
-
-If you are upgrading from v5 while an **old v5 `qwen-up` process is still hung in its SSH polling loop**, do not press `Ctrl+C` if you want to keep the paid instance: v5 treats `SIGINT` as startup failure and destroys it. Stop that old process without running its cleanup (for example suspend the shell job with `Ctrl+Z`, then `kill -9 %1`), update the scripts, and run `./qwen-status` to adopt the existing instance. This special recovery step is only needed for a currently-running old script.
-
-## Why the SSH tunnel?
-
-The inference port is deliberately bound to `127.0.0.1` inside the Vast container. Your local client reaches it through SSH port forwarding. This means source code and prompts are encrypted in transit and you do not need to expose a random public HTTP port.
-
-The local generated API key is still enabled as defense in depth.
+The builder still uses Vast's CUDA devel image, but the final inference image now
+uses the much smaller NVIDIA CUDA 12.8 runtime base. This avoids shipping the
+compiler/toolkit/cuDNN development stack to every disposable Vast host. We still
+do **not** squash the final image into one giant layer: squashing destroys layer
+reuse and makes retries/cache hits worse.
 
 ## Docker build details
 
-The runtime derives from:
+Builder base:
 
 ```text
 vastai/base-image:cuda-12.8.1-cudnn-devel-ubuntu24.04-py312
 ```
 
-Vast recommends extending its pre-built base images for custom images. They are designed for Vast instance setup and their large base layers are commonly cached on hosts, which reduces cold-start overhead compared with a generic CUDA runtime image. The same base is used by both Docker build stages so GitHub Actions does not need two unrelated multi-gigabyte CUDA base-image families.
+Runtime base:
 
-The image pins llama.cpp to the commit specified by the HauhauCS FastMTP model card:
+```text
+nvidia/cuda:12.8.1-runtime-ubuntu24.04
+```
+
+llama.cpp commit:
 
 ```text
 4df29be4f4c3673f428170fda944a5b19f743bb8
 ```
 
-At image-build time it downloads the small FastMTP runtime patch from the model repository and verifies the release-manifest SHA-256 before applying it:
+FastMTP patch SHA-256:
 
 ```text
 981285400b59dc45cf99936b6ff66d4b3aa0f1b532f85fa51418cb407e51d615
 ```
 
-The model download is also pinned to the release commit `993a5971fda8f30dd1b7eb2654792ba4415c7460` by default (`HF_REVISION`), so a later change on the model repo's `main` branch does not silently change your deployment.
+Model revision:
 
-The model weights are intentionally not baked into the image. This keeps your custom GHCR layers small and lets you switch Q4/Q5 without rebuilding.
+```text
+993a5971fda8f30dd1b7eb2654792ba4415c7460
+```
 
-`start.sh` enables llama.cpp's Prometheus-compatible `--metrics` endpoint. The
-benchmark scripts primarily trust the per-request `timings` object (including
-speculative draft counters) and use cumulative `/metrics` counters as a fallback;
-this avoids depending on instantaneous throughput gauges.
-
-## Fast download path
-
-The runtime pins `huggingface_hub` with `hf_xet` and sets `HF_XET_HIGH_PERFORMANCE=1`. The default search asks for at least 32 GB system RAM, 500 Mbps download, and 200 MB/s local disk read bandwidth.
-
-The disk filter matters for cold starts: Vast's SSH compatibility/bootstrap steps and model loading can be painfully slow on low-end SATA hosts even when internet bandwidth is good. Raise `disk_bw` to 300–500 if you prefer faster starts over the absolute cheapest hourly offer.
-
-If a host's model download is still poor, increase `inet_down` in `GPU_QUERY` rather than adding persistent Vast storage first. The Q4 target plus FastMTP sidecar is under 20 GB, so a disposable download is usually economical.
+The image contains no model weights or private credentials. It does contain the
+configured **public** SSH key(s).
 
 ## Updating llama.cpp / FastMTP
 
-Do **not** blindly change the pinned llama.cpp commit while continuing to use the same FastMTP patch. Update both together from the model author's current instructions, then rebuild the GHCR image.
+Do not change the pinned llama.cpp commit while blindly keeping the same FastMTP
+patch. Update both together from the model author's instructions, then rebuild.
 
-The normal embedded-MTP path can be used for troubleshooting without the FastMTP sidecar:
+Embedded-MTP fallback:
 
 ```dotenv
 USE_FASTMTP=0
 ```
 
-## Sources / upstream
+## Upstream
 
-- Model and FastMTP instructions: https://huggingface.co/HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF
+- Model: https://huggingface.co/HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF
 - llama.cpp: https://github.com/ggml-org/llama.cpp
-- Vast CLI docs: https://docs.vast.ai/cli/hello-world
-- Vast connection modes: https://docs.vast.ai/guides/instances/connect/overview
-- Hugging Face Xet downloads: https://huggingface.co/docs/huggingface_hub/guides/download
-
-Upstream model/patch licensing remains governed by the upstream repository. This deployment repository does not redistribute model weights.
+- Vast Docker/launch modes: https://docs.vast.ai/guides/instances/docker-environment
+- Vast networking/ports: https://docs.vast.ai/guides/instances/connect/networking
+- Hugging Face downloads: https://huggingface.co/docs/huggingface_hub/guides/download

@@ -40,7 +40,7 @@ if [[ -z "$instance_json" ]]; then
   exit 1
 fi
 
-jq '{id,actual_status,intended_status,gpu_name,dph_total,geolocation,status_msg,ssh_host,ssh_port}' <<<"$instance_json"
+jq '{id,actual_status,intended_status,gpu_name,dph_total,geolocation,status_msg,public_ipaddr,ssh_host,ssh_port,ssh_port_mapping:(.ports["22/tcp"][0].HostPort // null)}' <<<"$instance_json"
 printf 'Profile: %s | Context: %s | Image: %s\n' "$profile" "$ctx" "$image"
 [[ -n "$run_dir" ]] && printf 'Run dir: %s\n' "$run_dir"
 
@@ -60,7 +60,7 @@ if endpoint="$(qwen_refresh_ssh_state 2>/dev/null)" && [[ -n "$endpoint" ]]; the
   IFS=$'\t' read -r ssh_user ssh_host ssh_port ssh_url <<<"$endpoint"
   printf 'SSH: %s@%s:%s\n' "$ssh_user" "$ssh_host" "$ssh_port"
 else
-  echo "SSH: endpoint not published by Vast yet"
+  echo "SSH: port 22 mapping/endpoint not published by Vast yet"
 fi
 
 if [[ "$status" == "running" ]]; then

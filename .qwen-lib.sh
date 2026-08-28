@@ -50,9 +50,21 @@ raise SystemExit(1)
 qwen_endpoint_from_instance_json() {
   local instance_json="$1"
   local host port user
+
+  # Compatibility with old Vast SSH-mode instances created by v6 and earlier.
   host="$(jq -r '.ssh_host // empty' <<<"$instance_json" 2>/dev/null || true)"
   port="$(jq -r '.ssh_port // empty' <<<"$instance_json" 2>/dev/null || true)"
   user="$(jq -r '.ssh_user // "root"' <<<"$instance_json" 2>/dev/null || echo root)"
+  if [[ -n "$host" && "$host" != "null" && "$port" =~ ^[0-9]+$ && "$port" -gt 0 ]]; then
+    printf '%s\t%s\t%s\tssh://%s@%s:%s\n' "$user" "$host" "$port" "$user" "$host" "$port"
+    return 0
+  fi
+
+  # v7 self-manages sshd in normal entrypoint/args mode. Vast therefore does not
+  # publish ssh_host/ssh_port; instead port 22 is a normal Docker port mapping.
+  host="$(jq -r '.public_ipaddr // .public_ip // empty' <<<"$instance_json" 2>/dev/null || true)"
+  port="$(jq -r '.ports["22/tcp"][0].HostPort // empty' <<<"$instance_json" 2>/dev/null || true)"
+  user="root"
   if [[ -n "$host" && "$host" != "null" && "$port" =~ ^[0-9]+$ && "$port" -gt 0 ]]; then
     printf '%s\t%s\t%s\tssh://%s@%s:%s\n' "$user" "$host" "$port" "$user" "$host" "$port"
     return 0

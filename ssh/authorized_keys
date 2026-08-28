@@ -1,0 +1,6 @@
+# Optional committed keys. One OpenSSH public key per line.
+#
+# Normally GitHub Actions populates ssh/authorized_keys.generated automatically
+# from the repository owner's https://github.com/<user>.keys endpoint. If this
+# repository belongs to an organization or you prefer an explicit key, add it
+# here or set the QWEN_SSH_PUBLIC_KEY repository variable.

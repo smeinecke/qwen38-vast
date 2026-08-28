@@ -1,5 +1,7 @@
-.env
-.qwen-vast/
-.qwen-runs/
+
 *.log
 .DS_Store
+.env
+.qwen-runs/
+.qwen-vast/
+ssh/authorized_keys.generated
