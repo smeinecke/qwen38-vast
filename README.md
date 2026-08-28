@@ -150,18 +150,30 @@ There are three compiled CUDA images:
 
 | Image name | CUDA | Stable GHCR tag | GPUs |
 |---|---:|---|---|
-| `a6000` | SM86 | `:a6000` | RTX A6000 |
-| `ada` | SM89 | `:ada-128k` | RTX 6000 Ada, L40S, RTX 5880 Ada |
+| `a6000` | SM86 | `:a6000` | RTX A6000, A40 |
+| `ada` | SM89 | `:ada-128k` | RTX 4090, RTX 6000 Ada, L40/L40S, RTX 5880 Ada |
 | `blackwell` | SM120 | `:blackwell-128k` | RTX 5090, RTX PRO 6000 Blackwell |
 
 Runtime profiles can reuse one compiled image. The included profiles are:
 
-| Runtime profile | Image | Context |
-|---|---|---:|
-| `a6000` | `:a6000` | 65,536 |
-| `a6000-128k` | `:a6000` | 131,072 |
-| `ada-128k` | `:ada-128k` | 131,072 |
-| `blackwell-128k` | `:blackwell-128k` | 131,072 |
+| Runtime profile | Image | Context | Search intent |
+|---|---|---:|---|
+| `4090-32k` | `:ada-128k` | 32,768 | cheapest fast 24 GB Ada option |
+| `a6000` | `:a6000` | 65,536 | exact RTX A6000 |
+| `ampere-value` | `:a6000` | 65,536 | cheapest RTX A6000 or A40 |
+| `a6000-128k` | `:a6000` | 131,072 | exact RTX A6000 |
+| `ampere-value-128k` | `:a6000` | 131,072 | cheapest RTX A6000 or A40 |
+| `ada-64k` | `:ada-128k` | 65,536 | 48 GB Ada-class (6000 Ada/L40/L40S/5880 Ada) |
+| `ada-128k` | `:ada-128k` | 131,072 | 48 GB Ada-class (6000 Ada/L40/L40S/5880 Ada) |
+| `5090-64k` | `:blackwell-128k` | 65,536 | exact RTX 5090 |
+| `5090-128k` | `:blackwell-128k` | 131,072 | exact RTX 5090 |
+| `blackwell-128k` | `:blackwell-128k` | 131,072 | RTX 5090 or RTX PRO 6000 |
+
+Profiles also carry a `monitor_group`. The market monitor only compares profiles
+with the **same group and exact context size**, so a running 128k session is never
+silently compared against a cheaper 32k instance. Broad value profiles are marked
+`monitor_search=true`; overlapping exact-GPU profiles can set it to `false` to avoid
+duplicate Vast API searches.
 
 So testing 64k vs 128k on an A6000 does **not** require another Docker build:
 
@@ -314,8 +326,9 @@ Then prepare the external cache once:
 
 ```bash
 ./qwen-up a6000
-./qwen-up a6000-128k
+./qwen-up ampere-value-128k
 ./qwen-up ada-128k
+./qwen-up 5090-128k
 ./qwen-up blackwell-128k
 ```
 
@@ -459,6 +472,65 @@ Example Europe-only override:
 GPU_QUERY_OVERRIDE='num_gpus=1 gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=800 disk_bw>=300 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1 geolocation in [DE,NL,FR,SE,FI]'
 ```
 
+## Live Vast price monitor
+
+`qwen-monitor` compares the **all-in hourly price of the currently running
+instance** (`dph_total`) with currently rentable Vast offers. By default it
+searches every profile in the same `monitor_group` and with the exact same
+context size. Search uses the same configured disk size, so the comparison is
+not just the bare GPU price.
+
+One-shot check:
+
+```bash
+./qwen-monitor once
+```
+
+Foreground watch:
+
+```bash
+./qwen-monitor watch --threshold 10 --interval 180
+```
+
+Background daemon:
+
+```bash
+./qwen-monitor start
+./qwen-monitor status
+./qwen-monitor logs
+./qwen-monitor stop
+```
+
+Defaults in `.env`:
+
+```dotenv
+QWEN_MONITOR_THRESHOLD_PCT=10
+QWEN_MONITOR_INTERVAL=180
+QWEN_MONITOR_MAX_RESULTS=5
+QWEN_MONITOR_AUTO_START=0
+```
+
+When a qualifying offer appears, the monitor prints the profile, GPU, all-in
+`$/h`, percentage saving, location, download speed, disk speed, reliability and
+Vast offer ID. It also stores the best alert in
+`.qwen-vast/monitor-alert.json`; `qwen-status` surfaces that alert. If a desktop
+notification service is available, `notify-send` is used best-effort.
+
+For a compatible profile switch, preserve the external slot cache normally:
+
+```bash
+uv run ./qwen-down --yes
+uv run ./qwen-up 5090-128k --session my-project
+```
+
+`qwen-down` automatically stops a background monitor before saving the slot and
+destroying the instance. Set `QWEN_MONITOR_AUTO_START=1` if every successful
+`qwen-up` should start the monitor automatically.
+
+If the running context was changed with `CTX_SIZE_OVERRIDE`, the monitor falls
+back to **same-profile only** rather than assuming another profile can safely
+host the custom context size.
+
 ## Cold-start changes in v7
 
 The model weights are intentionally **not** baked into the image. The Q4 model +
@@ -530,3 +602,28 @@ USE_FASTMTP=0
 - Vast Docker/launch modes: https://docs.vast.ai/guides/instances/docker-environment
 - Vast networking/ports: https://docs.vast.ai/guides/instances/connect/networking
 - Hugging Face downloads: https://huggingface.co/docs/huggingface_hub/guides/download
+
+## Compiler cache diagnostics (v9.1)
+
+There are intentionally **two independent build caches**:
+
+1. BuildKit GHA layer cache (`cache-from/cache-to type=gha`) can restore the entire
+   llama.cpp compile `RUN` without invoking the compiler at all.
+2. `ccache` is persisted from the BuildKit cache mount via
+   `buildkit-cache-dance` + `actions/cache`. It becomes useful when the compile
+   layer is invalidated but most translation units are unchanged.
+
+A message such as `Cache not found for input keys` only means the exact
+`actions/cache` key was not found. A following `Cache hit for restore-key` is a
+valid fallback hit. What matters for ccache is the restored archive size: an old
+~300-byte archive was effectively empty. v9.1 deliberately executes the compile
+layer once for a new compiler-cache generation so that cache is seeded.
+
+On the first v9.1 build expect a real compile and a sizeable cache save. On the
+next build with unchanged build inputs expect an exact v4 cache hit; BuildKit may
+also report the compile layer itself as `CACHED`, which is even faster.
+
+For the manual self-hosted workflow, Buildx additionally uses a persistent named
+`qwen38-local-builder` (`keep-state: true`, `cleanup: false`). On the 56-core
+runner this makes the local BuildKit state the fastest first-level cache; the GHA
+ccache archive remains a recovery/portability layer.

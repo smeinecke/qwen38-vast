@@ -124,6 +124,7 @@ PROFILE="$(jq -r '.name' <<<"$PROFILE_JSON")"
 IMAGE_NAME="$(jq -r '.image' <<<"$PROFILE_JSON")"
 PROFILE_CTX_SIZE="$(jq -r '.ctx_size' <<<"$PROFILE_JSON")"
 PROFILE_GPU_QUERY="$(jq -r '.gpu_query' <<<"$PROFILE_JSON")"
+MONITOR_GROUP="$(jq -r '.monitor_group // empty' <<<"$PROFILE_JSON")"
 IMAGE_JSON="$(jq -c --arg image "$IMAGE_NAME" '[.images[] | select(.name == $image)][0] // empty' "$PROFILES_FILE")"
 if [[ -z "$IMAGE_JSON" || "$IMAGE_JSON" == "null" ]]; then
   echo >&2 "ERROR: profile '$PROFILE' references unknown image '$IMAGE_NAME'"
@@ -212,6 +213,13 @@ if [[ -f "$STATE_FILE" ]]; then
   rm -f "$STATE_FILE" "$ENV_FILE" "$TUNNEL_LOG" "$KNOWN_HOSTS"
 fi
 
+# Clear stale market-monitor state only after confirming we are not replacing a
+# live instance. A previous daemon may have died without removing its pid file.
+if [[ -x "$ROOT_DIR/qwen-monitor" ]]; then
+  "$ROOT_DIR/qwen-monitor" stop --quiet >/dev/null 2>&1 || true
+fi
+rm -f "$STATE_DIR/monitor-alert.json" "$STATE_DIR/monitor.last.json"
+
 if python3 - "$LOCAL_PORT" <<'PY'
 import socket, sys
 port = int(sys.argv[1])
@@ -253,6 +261,9 @@ jq -n \
   --arg status "searching" \
   --arg started_at "$RUN_STARTED_AT" \
   --arg profile "$PROFILE" \
+  --arg monitor_group "$MONITOR_GROUP" \
+  --arg gpu_query "$GPU_QUERY" \
+  --argjson disk_gb "$DISK_GB" \
   --arg cuda_arch "$CUDA_ARCH" \
   --arg image "$SELECTED_IMAGE" \
   --argjson ctx_size "$CTX_SIZE" \
@@ -265,7 +276,7 @@ jq -n \
   --arg slot_cache_host "$QWEN_SLOT_CACHE_HOST" \
   --arg slot_cache_user "$QWEN_SLOT_CACHE_USER" \
   --arg slot_cache_session "$QWEN_SLOT_CACHE_SESSION" \
-  '{schema_version:1,run_id:$run_id,status:$status,started_at:$started_at,profile:$profile,cuda_arch:$cuda_arch,image:$image,ctx_size:$ctx_size,model:$model,hf_revision:$hf_revision,use_fastmtp:$fastmtp,cache_type_k:$cache_type_k,cache_type_v:$cache_type_v,slot_cache_enabled:$slot_cache_enabled,slot_cache_host:$slot_cache_host,slot_cache_user:$slot_cache_user,slot_cache_session:$slot_cache_session}' \
+  '{schema_version:1,run_id:$run_id,status:$status,started_at:$started_at,profile:$profile,monitor_group:$monitor_group,gpu_query:$gpu_query,disk_gb:$disk_gb,cuda_arch:$cuda_arch,image:$image,ctx_size:$ctx_size,model:$model,hf_revision:$hf_revision,use_fastmtp:$fastmtp,cache_type_k:$cache_type_k,cache_type_v:$cache_type_v,slot_cache_enabled:$slot_cache_enabled,slot_cache_host:$slot_cache_host,slot_cache_user:$slot_cache_user,slot_cache_session:$slot_cache_session}' \
   > "$RUN_DIR/metadata.json"
 chmod 600 "$RUN_DIR/metadata.json"
 
@@ -409,6 +420,9 @@ jq -n \
   --arg image "$SELECTED_IMAGE" \
   --arg label "$LABEL" \
   --arg profile "$PROFILE" \
+  --arg monitor_group "$MONITOR_GROUP" \
+  --arg gpu_query "$GPU_QUERY" \
+  --argjson disk_gb "$DISK_GB" \
   --arg cuda_arch "$CUDA_ARCH" \
   --arg run_id "$RUN_ID" \
   --arg run_dir "$RUN_DIR" \
@@ -431,7 +445,7 @@ jq -n \
   --arg slot_cache_root "$QWEN_SLOT_CACHE_ROOT" \
   --arg slot_cache_session "$QWEN_SLOT_CACHE_SESSION" \
   --argjson slot_cache_max_gb "$QWEN_SLOT_CACHE_MAX_GB" \
-  '{schema_version:1,instance_id:$instance_id,offer_id:$offer_id,gpu:$gpu,dph:$dph,local_port:$local_port,model:$model,hf_revision:$hf_revision,ctx_size:$ctx,api_key:$api_key,image:$image,label:$label,profile:$profile,cuda_arch:$cuda_arch,run_id:$run_id,run_dir:$run_dir,started_at:$started_at,started_epoch:$started_epoch,run_started_at:$run_started_at,run_started_epoch:$run_started_epoch,location:$location,inet_down:$inet_down,disk_bw:$disk_bw,reliability:$reliability,use_fastmtp:$fastmtp,reasoning_effort:$reasoning_effort,cache_type_k:$cache_type_k,cache_type_v:$cache_type_v,slot_cache_enabled:$slot_cache_enabled,slot_cache_host:$slot_cache_host,slot_cache_port:$slot_cache_port,slot_cache_user:$slot_cache_user,slot_cache_root:$slot_cache_root,slot_cache_session:$slot_cache_session,slot_cache_max_gb:$slot_cache_max_gb}' \
+  '{schema_version:1,instance_id:$instance_id,offer_id:$offer_id,gpu:$gpu,dph:$dph,local_port:$local_port,model:$model,hf_revision:$hf_revision,ctx_size:$ctx,api_key:$api_key,image:$image,label:$label,profile:$profile,monitor_group:$monitor_group,gpu_query:$gpu_query,disk_gb:$disk_gb,cuda_arch:$cuda_arch,run_id:$run_id,run_dir:$run_dir,started_at:$started_at,started_epoch:$started_epoch,run_started_at:$run_started_at,run_started_epoch:$run_started_epoch,location:$location,inet_down:$inet_down,disk_bw:$disk_bw,reliability:$reliability,use_fastmtp:$fastmtp,reasoning_effort:$reasoning_effort,cache_type_k:$cache_type_k,cache_type_v:$cache_type_v,slot_cache_enabled:$slot_cache_enabled,slot_cache_host:$slot_cache_host,slot_cache_port:$slot_cache_port,slot_cache_user:$slot_cache_user,slot_cache_root:$slot_cache_root,slot_cache_session:$slot_cache_session,slot_cache_max_gb:$slot_cache_max_gb}' \
   > "$STATE_FILE"
 chmod 600 "$STATE_FILE"
 sync_run_metadata "provisioning"
@@ -674,3 +688,7 @@ if qwen_cache_enabled; then
 fi
 printf '\nRun: source .qwen-vast/env\n'
 printf 'Stop billing: ./qwen-down --yes\n'
+if [[ "${QWEN_MONITOR_AUTO_START:-0}" == "1" ]]; then
+  echo "[monitor] auto-start enabled"
+  "$ROOT_DIR/qwen-monitor" start     --threshold "${QWEN_MONITOR_THRESHOLD_PCT:-10}"     --interval "${QWEN_MONITOR_INTERVAL:-60}" >/dev/null 2>&1 ||     echo >&2 "[monitor] WARNING: could not start background price monitor"
+fi

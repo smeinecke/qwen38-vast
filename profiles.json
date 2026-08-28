@@ -6,13 +6,13 @@
       "name": "a6000",
       "cuda_arch": "86",
       "image_tag": "a6000",
-      "description": "RTX A6000 / Ampere SM86"
+      "description": "RTX A6000 / A40 / Ampere SM86"
     },
     {
       "name": "ada",
       "cuda_arch": "89",
       "image_tag": "ada-128k",
-      "description": "RTX 6000 Ada / L40S / SM89"
+      "description": "RTX 4090 / RTX 6000 Ada / L40/L40S / Ada SM89"
     },
     {
       "name": "blackwell",
@@ -24,31 +24,121 @@
   "profiles": [
     {
       "name": "a6000",
-      "aliases": ["a6000-64k", "ampere", "sm86"],
+      "aliases": [
+        "a6000-64k",
+        "ampere",
+        "sm86"
+      ],
       "image": "a6000",
       "ctx_size": 65536,
-      "gpu_query": "num_gpus=1 gpu_name=RTX_A6000 gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1"
+      "monitor_group": "q4-64k",
+      "gpu_query": "num_gpus=1 gpu_name=RTX_A6000 gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1",
+      "monitor_search": false
+    },
+    {
+      "name": "ampere-value",
+      "aliases": [
+        "ampere-value-64k",
+        "a40",
+        "a40-64k"
+      ],
+      "image": "a6000",
+      "ctx_size": 65536,
+      "monitor_group": "q4-64k",
+      "gpu_query": "num_gpus=1 gpu_name in [\"RTX_A6000\",\"A40\"] gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1",
+      "monitor_search": true
     },
     {
       "name": "a6000-128k",
-      "aliases": ["ampere-128k", "sm86-128k"],
+      "aliases": [
+        "ampere-128k",
+        "sm86-128k"
+      ],
       "image": "a6000",
       "ctx_size": 131072,
-      "gpu_query": "num_gpus=1 gpu_name=RTX_A6000 gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1"
+      "monitor_group": "q4-128k",
+      "gpu_query": "num_gpus=1 gpu_name=RTX_A6000 gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1",
+      "monitor_search": false
+    },
+    {
+      "name": "ampere-value-128k",
+      "aliases": [
+        "a40-128k"
+      ],
+      "image": "a6000",
+      "ctx_size": 131072,
+      "monitor_group": "q4-128k",
+      "gpu_query": "num_gpus=1 gpu_name in [\"RTX_A6000\",\"A40\"] gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1",
+      "monitor_search": true
+    },
+    {
+      "name": "4090-32k",
+      "aliases": [
+        "4090",
+        "ada-24g"
+      ],
+      "image": "ada",
+      "ctx_size": 32768,
+      "monitor_group": "q4-32k",
+      "gpu_query": "num_gpus=1 gpu_name=RTX_4090 gpu_ram>=24 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1",
+      "monitor_search": true
+    },
+    {
+      "name": "ada-64k",
+      "aliases": [
+        "sm89-64k"
+      ],
+      "image": "ada",
+      "ctx_size": 65536,
+      "monitor_group": "q4-64k",
+      "gpu_query": "num_gpus=1 gpu_name in [\"RTX_6000Ada\",\"L40S\",\"L40\",\"RTX_5880Ada\"] gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1",
+      "monitor_search": true
     },
     {
       "name": "ada-128k",
-      "aliases": ["ada", "sm89"],
+      "aliases": [
+        "ada",
+        "sm89"
+      ],
       "image": "ada",
       "ctx_size": 131072,
-      "gpu_query": "num_gpus=1 gpu_name in [\"RTX_6000Ada\",\"L40S\",\"RTX_5880Ada\"] gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1"
+      "monitor_group": "q4-128k",
+      "gpu_query": "num_gpus=1 gpu_name in [\"RTX_6000Ada\",\"L40S\",\"L40\",\"RTX_5880Ada\"] gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1",
+      "monitor_search": true
+    },
+    {
+      "name": "5090-64k",
+      "aliases": [
+        "blackwell-64k"
+      ],
+      "image": "blackwell",
+      "ctx_size": 65536,
+      "monitor_group": "q4-64k",
+      "gpu_query": "num_gpus=1 gpu_name=RTX_5090 gpu_ram>=32 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1",
+      "monitor_search": true
+    },
+    {
+      "name": "5090-128k",
+      "aliases": [
+        "5090"
+      ],
+      "image": "blackwell",
+      "ctx_size": 131072,
+      "monitor_group": "q4-128k",
+      "gpu_query": "num_gpus=1 gpu_name=RTX_5090 gpu_ram>=32 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1",
+      "monitor_search": false
     },
     {
       "name": "blackwell-128k",
-      "aliases": ["blackwell", "5090", "sm120"],
+      "aliases": [
+        "blackwell",
+        "sm120"
+      ],
       "image": "blackwell",
       "ctx_size": 131072,
-      "gpu_query": "num_gpus=1 gpu_name in [\"RTX_5090\",\"RTX_PRO_6000\"] gpu_ram>=32 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1"
+      "monitor_group": "q4-128k",
+      "gpu_query": "num_gpus=1 gpu_name in [\"RTX_5090\",\"RTX_PRO_6000\"] gpu_ram>=32 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1",
+      "monitor_search": true
     }
   ]
 }

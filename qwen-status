@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+export LC_NUMERIC=C
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 STATE_DIR="$ROOT_DIR/.qwen-vast"
@@ -51,6 +52,27 @@ if [[ "$cache_enabled" == "1" ]]; then
   printf 'Slot cache: session=%s | signature=%s | restore=%s | save=%s\n' "$cache_session" "$cache_sig" "$cache_restore" "$cache_saved"
 fi
 [[ -n "$run_dir" ]] && printf 'Run dir: %s\n' "$run_dir"
+monitor_pid_file="$STATE_DIR/monitor.pid"
+monitor_alert_file="$STATE_DIR/monitor-alert.json"
+if [[ -f "$monitor_pid_file" ]]; then
+  monitor_pid="$(cat "$monitor_pid_file" 2>/dev/null || true)"
+  if [[ "$monitor_pid" =~ ^[0-9]+$ ]] && kill -0 "$monitor_pid" >/dev/null 2>&1; then
+    printf 'Price monitor: running (pid %s)
+' "$monitor_pid"
+  else
+    echo 'Price monitor: stale pid file (not running)'
+  fi
+else
+  echo 'Price monitor: stopped'
+fi
+if [[ -f "$monitor_alert_file" ]]; then
+  alert="$(jq -r '''[.best_offer._monitor_profile, (.best_offer.gpu_name // "?"), (.best_offer._effective_dph|tostring), (.best_offer._saving_pct|tostring)] | @tsv''' "$monitor_alert_file" 2>/dev/null || true)"
+  if [[ -n "$alert" ]]; then
+    IFS=$'\t' read -r ap ag ad as <<<"$alert"
+    printf 'Last price alert: %s / %s at $%.4f/h (%.1f%% cheaper)
+' "$ap" "$ag" "$ad" "$as"
+  fi
+fi
 
 if [[ "$started_epoch" =~ ^[0-9]+$ ]]; then
   now="$(date +%s)"

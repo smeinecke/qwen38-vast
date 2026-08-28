@@ -1,5 +1,24 @@
 # Changelog
 
+## v9.1 - compiler-cache seeding fix
+
+- Fixed the persistent compiler cache remaining an empty ~300-byte archive when BuildKit restored the entire llama.cpp compile RUN from its separate GHA layer cache.
+- Added `CCACHE_SEED`, tied to the Dockerfile compiler-cache key, so a new cache generation executes the compile layer once and actually populates the BuildKit ccache mount.
+- Bumped compiler-cache schema to v4 while retaining v3 restore fallbacks.
+- Enabled `save-always` for both the GitHub cache and buildkit-cache-dance so useful partial CUDA compilation survives failed or timed-out builds.
+- Added pre-build cache diagnostics (exact hit, disk size, file count) to both hosted and self-hosted workflows.
+- The manual self-hosted workflow now keeps a fixed `qwen38-local-builder` BuildKit instance/state on the persistent 56-core runner, so local layer and cache-mount state survives workflow runs even without a GHA cache restore.
+- The existing BuildKit `type=gha` layer cache remains enabled; it is complementary to ccache rather than a replacement.
+
+## v9 - Vast market profiles and live price monitor
+
+- Added value-oriented Vast profiles without adding new CUDA builds: A40 reuses SM86, RTX 4090/L40/L40S reuse SM89, and RTX 5090 reuses SM120.
+- Added exact/value profiles for 32k, 64k and 128k operation plus `monitor_group` metadata so only context-equivalent profiles are compared.
+- Added `qwen-monitor` with one-shot, foreground watch and background-daemon modes. It compares the running instance's live `dph_total` with current rentable offers and defaults to alerting at >=10% savings.
+- Market comparisons use the same Vast storage size and preserve the normal profile reliability/network/disk constraints. Alerts include profile, GPU, price, saving, location, network/disk speed, reliability and offer ID.
+- `qwen-status` shows monitor state and the latest qualifying alert; `qwen-down` stops a background monitor before cache save/destroy. Optional `QWEN_MONITOR_AUTO_START=1` starts it after a successful `qwen-up`.
+- `qwen-up` now persists `disk_gb`, resolved `gpu_query` and `monitor_group` in run state/telemetry so market comparisons remain auditable.
+
 ## v8 - automatic cross-instance slot/KV persistence
 
 - Added `.qwen-cache-lib.sh` and `qwen-cache-setup` for a dedicated restricted SSH key and an external rsync-backed llama.cpp slot cache. Setup now verifies remote `rsync` before any GPU is rented.

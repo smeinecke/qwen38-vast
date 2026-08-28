@@ -1,0 +1,329 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+export LC_NUMERIC=C
+
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+STATE_DIR="$ROOT_DIR/.qwen-vast"
+STATE_FILE="$STATE_DIR/state.json"
+PROFILES_FILE="${QWEN_PROFILES_FILE:-$ROOT_DIR/profiles.json}"
+PID_FILE="$STATE_DIR/monitor.pid"
+LOG_FILE="$STATE_DIR/monitor.log"
+LAST_FILE="$STATE_DIR/monitor.last.json"
+ALERT_FILE="$STATE_DIR/monitor-alert.json"
+
+if [[ -f "$ROOT_DIR/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$ROOT_DIR/.env"
+  set +a
+fi
+PROFILES_FILE="${QWEN_PROFILES_FILE:-$ROOT_DIR/profiles.json}"
+
+THRESHOLD="${QWEN_MONITOR_THRESHOLD_PCT:-10}"
+INTERVAL="${QWEN_MONITOR_INTERVAL:-180}"
+MAX_RESULTS="${QWEN_MONITOR_MAX_RESULTS:-5}"
+SAME_PROFILE=0
+QUIET=0
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  ./qwen-monitor once [options]     check now (default)
+  ./qwen-monitor watch [options]    check repeatedly in foreground
+  ./qwen-monitor start [options]    start background monitor
+  ./qwen-monitor stop [--quiet]     stop background monitor
+  ./qwen-monitor status             show monitor state / last alert
+  ./qwen-monitor logs               tail background monitor log
+
+Options:
+  --threshold PCT      minimum saving before alert (default: 10)
+  --interval SECONDS   polling interval for watch/start (default: 180)
+  --max-results N      number of qualifying offers to print (default: 5)
+  --same-profile       only search the running profile, not compatible profiles
+
+Compatible profiles are profiles.json entries with the same monitor_group AND
+exactly the same context size as the running instance. Therefore a 128k run may
+compare A6000/A40, Ada 48GB and Blackwell 32GB/96GB profiles, but never a 32k
+profile. If CTX_SIZE_OVERRIDE changed the running context away from the profile
+default, qwen-monitor automatically falls back to same-profile monitoring.
+USAGE
+}
+
+COMMAND="${1:-once}"
+if [[ $# -gt 0 ]]; then shift; fi
+while (( $# > 0 )); do
+  case "$1" in
+    --threshold) THRESHOLD="${2:?--threshold requires a value}"; shift 2 ;;
+    --interval) INTERVAL="${2:?--interval requires a value}"; shift 2 ;;
+    --max-results) MAX_RESULTS="${2:?--max-results requires a value}"; shift 2 ;;
+    --same-profile) SAME_PROFILE=1; shift ;;
+    --quiet) QUIET=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo >&2 "ERROR: unknown option: $1"; usage >&2; exit 2 ;;
+  esac
+done
+
+for n in "$THRESHOLD" "$INTERVAL" "$MAX_RESULTS"; do
+  python3 - "$n" <<'PY' >/dev/null || { echo >&2 "ERROR: invalid numeric option: $n"; exit 2; }
+import sys
+x=float(sys.argv[1]); assert x >= 0
+PY
+done
+
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR" 2>/dev/null || true
+
+need() { command -v "$1" >/dev/null 2>&1 || { echo >&2 "ERROR: missing dependency: $1"; exit 2; }; }
+for x in vastai jq python3; do need "$x"; done
+
+pid_running() {
+  [[ -f "$PID_FILE" ]] || return 1
+  local p
+  p="$(cat "$PID_FILE" 2>/dev/null || true)"
+  [[ "$p" =~ ^[0-9]+$ ]] && kill -0 "$p" >/dev/null 2>&1
+}
+
+normalize_offers() {
+  jq -c '
+    if type == "array" then .
+    elif (.offers? | type) == "array" then .offers
+    elif .offers? then [.offers]
+    elif (.bundles? | type) == "array" then .bundles
+    else [] end
+  '
+}
+
+load_current() {
+  [[ -f "$STATE_FILE" ]] || { echo >&2 "ERROR: no running qwen state. Start with ./qwen-up first."; return 3; }
+  [[ -f "$PROFILES_FILE" ]] || { echo >&2 "ERROR: profiles file not found: $PROFILES_FILE"; return 2; }
+
+  instance_id="$(jq -r '.instance_id // empty' "$STATE_FILE")"
+  current_profile="$(jq -r '.profile // empty' "$STATE_FILE")"
+  current_ctx="$(jq -r '.ctx_size // 0' "$STATE_FILE")"
+  state_dph="$(jq -r '.dph // 0' "$STATE_FILE")"
+  current_gpu="$(jq -r '.gpu // "unknown"' "$STATE_FILE")"
+  current_session="$(jq -r '.slot_cache_session // "default"' "$STATE_FILE")"
+  disk_gb="$(jq -r '.disk_gb // empty' "$STATE_FILE")"
+  disk_gb="${disk_gb:-${DISK_GB:-100}}"
+
+  [[ -n "$instance_id" ]] || { echo >&2 "ERROR: state has no instance_id"; return 3; }
+  instance_json="$(vastai show instance "$instance_id" --raw 2>/dev/null || true)"
+  if [[ -z "$instance_json" ]] || jq -e '.error == true' >/dev/null 2>&1 <<<"$instance_json"; then
+    echo >&2 "ERROR: Vast instance $instance_id is no longer available."
+    return 3
+  fi
+  current_dph="$(jq -r '.dph_total // empty' <<<"$instance_json")"
+  current_dph="${current_dph:-$state_dph}"
+  current_gpu="$(jq -r '.gpu_name // empty' <<<"$instance_json")"
+  current_gpu="${current_gpu:-$(jq -r '.gpu // "unknown"' "$STATE_FILE")}"
+  current_location="$(jq -r '.geolocation // "?"' <<<"$instance_json")"
+
+  current_profile_json="$(jq -c --arg p "$current_profile" '[.profiles[] | select(.name == $p)][0] // empty' "$PROFILES_FILE")"
+  [[ -n "$current_profile_json" && "$current_profile_json" != null ]] || {
+    echo >&2 "ERROR: running profile '$current_profile' is not present in profiles.json"
+    return 3
+  }
+  profile_ctx="$(jq -r '.ctx_size' <<<"$current_profile_json")"
+  monitor_group="$(jq -r '.monitor_group // empty' <<<"$current_profile_json")"
+
+  target_dph="$(python3 - "$current_dph" "$THRESHOLD" <<'PY'
+import sys
+cur=float(sys.argv[1]); pct=float(sys.argv[2]); print(f"{cur*(1-pct/100):.12f}")
+PY
+)"
+}
+
+candidate_profiles_json() {
+  if (( SAME_PROFILE == 1 )) || [[ -z "$monitor_group" ]] || [[ "$current_ctx" != "$profile_ctx" ]]; then
+    if [[ "$current_ctx" != "$profile_ctx" && $QUIET -eq 0 ]]; then
+      echo >&2 "[monitor] CTX override detected ($current_ctx != profile default $profile_ctx); restricting to same profile."
+    fi
+    jq -c --arg p "$current_profile" '[.profiles[] | select(.name == $p)]' "$PROFILES_FILE"
+  else
+    jq -c --arg g "$monitor_group" --argjson ctx "$current_ctx" \
+      '[.profiles[] | select((.monitor_group // "") == $g and .ctx_size == $ctx and (if has("monitor_search") then .monitor_search else true end) != false)]' "$PROFILES_FILE"
+  fi
+}
+
+search_once_json() {
+  local pjson pname query raw normalized tmp combined
+  combined="$(mktemp)"
+  printf '[]\n' > "$combined"
+  trap 'rm -f "$combined"' RETURN
+
+  while IFS= read -r pjson; do
+    [[ -n "$pjson" ]] || continue
+    pname="$(jq -r '.name' <<<"$pjson")"
+    query="$(jq -r '.gpu_query' <<<"$pjson")"
+    raw="$(vastai search offers "$query" --order dph_total --limit 25 --storage "$disk_gb" --raw 2>/dev/null || true)"
+    [[ -n "$raw" ]] || continue
+    normalized="$(normalize_offers <<<"$raw" 2>/dev/null || printf '[]')"
+    tmp="$(mktemp)"
+    jq --arg profile "$pname" '[.[] | . + {_monitor_profile:$profile, _effective_dph:(.dph_total // .dph_base // 999999)}]' <<<"$normalized" > "$tmp"
+    jq -s '.[0] + .[1]' "$combined" "$tmp" > "$combined.next"
+    mv "$combined.next" "$combined"
+    rm -f "$tmp"
+  done < <(candidate_profiles_json | jq -c '.[]')
+
+  jq -c --argjson threshold "$THRESHOLD" --argjson current "$current_dph" --argjson target "$target_dph" --argjson limit "$MAX_RESULTS" '
+    def oid: (.id // .ask_contract_id // -1);
+    [ .[]
+      | select(._effective_dph < $current)
+      | . + {_saving_pct:(($current - ._effective_dph) / $current * 100)}
+    ]
+    | sort_by(oid)
+    | unique_by(oid)
+    | sort_by(._effective_dph)
+    | [ .[] | select(._effective_dph <= $target) ][:($limit|floor)]
+    | {current_dph:$current, threshold_pct:$threshold, target_dph:$target, offers:.}
+  ' "$combined"
+}
+
+print_result() {
+  local result="$1" count best best_profile best_gpu best_dph best_save
+  count="$(jq '.offers | length' <<<"$result")"
+  printf '[monitor] current: %s | profile=%s | ctx=%s | $%.4f/h | %s\n' \
+    "$current_gpu" "$current_profile" "$current_ctx" "$current_dph" "$current_location"
+  printf '[monitor] alert threshold: %.1f%% cheaper => <= $%.4f/h\n' "$THRESHOLD" "$target_dph"
+
+  profiles_line="$(candidate_profiles_json | jq -r '[.[].name] | join(", ")')"
+  printf '[monitor] compatible search profiles: %s\n' "$profiles_line"
+  if (( count == 0 )); then
+    echo "[monitor] no qualifying cheaper offer available right now."
+    return 0
+  fi
+
+  printf '\n%-20s %-18s %9s %9s %-14s %9s %9s %8s %s\n' \
+    'PROFILE' 'GPU' '$/H' 'SAVE' 'LOCATION' 'DOWN' 'DISK' 'REL' 'OFFER'
+  jq -r '.offers[] | [
+      ._monitor_profile,
+      (.gpu_name // "?"),
+      (._effective_dph|tostring),
+      (._saving_pct|tostring),
+      (.geolocation // "?"),
+      (.inet_down // 0|tostring),
+      (.disk_bw // 0|tostring),
+      (.reliability2 // .reliability // 0|tostring),
+      (.id // .ask_contract_id // "?")|tostring
+    ] | @tsv' <<<"$result" | while IFS=$'\t' read -r p g price save loc down disk rel id; do
+      printf '%-20s %-18s $%8.4f %8.1f%% %-14s %7.0fM %7.0fM %8.4f %s\n' \
+        "$p" "$g" "$price" "$save" "$loc" "$down" "$disk" "$rel" "$id"
+    done
+
+  best="$(jq -c '.offers[0]' <<<"$result")"
+  best_profile="$(jq -r '._monitor_profile' <<<"$best")"
+  best_gpu="$(jq -r '.gpu_name // "?"' <<<"$best")"
+  best_dph="$(jq -r '._effective_dph' <<<"$best")"
+  best_save="$(jq -r '._saving_pct' <<<"$best")"
+  printf '\n[monitor] BEST: %s / %s at $%.4f/h (%.1f%% cheaper)\n' "$best_profile" "$best_gpu" "$best_dph" "$best_save"
+  printf '[monitor] safe switch (slot cache is preserved by qwen-down/up):\n'
+  printf '  uv run ./qwen-down --yes\n'
+  printf '  uv run ./qwen-up %q --session %q\n' "$best_profile" "$current_session"
+}
+
+write_alert_if_changed() {
+  local result="$1" count best fingerprint previous=""
+  count="$(jq '.offers | length' <<<"$result")"
+  if (( count == 0 )); then
+    return 0
+  fi
+  best="$(jq -c '.offers[0]' <<<"$result")"
+  fingerprint="$(jq -r '[(.id // .ask_contract_id // "?"), ._monitor_profile, (._effective_dph|tostring)] | join(":")' <<<"$best")"
+  [[ -f "$LAST_FILE" ]] && previous="$(jq -r '.fingerprint // empty' "$LAST_FILE" 2>/dev/null || true)"
+  if [[ "$fingerprint" == "$previous" ]]; then return 0; fi
+
+  jq -n --arg fingerprint "$fingerprint" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson result "$result" \
+    '{fingerprint:$fingerprint,checked_at:$at,result:$result}' > "$LAST_FILE"
+  jq -n --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg current_profile "$current_profile" --arg current_gpu "$current_gpu" \
+    --argjson current_dph "$current_dph" --argjson ctx "$current_ctx" --arg session "$current_session" --argjson best "$best" \
+    '{created_at:$at,current_profile:$current_profile,current_gpu:$current_gpu,current_dph:$current_dph,ctx_size:$ctx,session:$session,best_offer:$best}' > "$ALERT_FILE"
+
+  local bp bg bd bs
+  bp="$(jq -r '._monitor_profile' <<<"$best")"; bg="$(jq -r '.gpu_name // "?"' <<<"$best")"
+  bd="$(jq -r '._effective_dph' <<<"$best")"; bs="$(jq -r '._saving_pct' <<<"$best")"
+  printf '\a[ALERT] %s / %s: $%.4f/h, %.1f%% cheaper than current $%.4f/h\n' "$bp" "$bg" "$bd" "$bs" "$current_dph"
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send "Qwen Vast: cheaper GPU available" "$bg / $bp: \$$bd/h (${bs}% cheaper)" >/dev/null 2>&1 || true
+  fi
+}
+
+run_once() {
+  local result
+  load_current || return $?
+  result="$(search_once_json)" || return $?
+  print_result "$result"
+  write_alert_if_changed "$result"
+}
+
+run_watch() {
+  echo "[monitor] watching Vast every ${INTERVAL}s; threshold=${THRESHOLD}% (Ctrl+C to stop)"
+  while true; do
+    printf '\n[%s]\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    set +e
+    run_once
+    rc=$?
+    set -e
+    if (( rc == 3 )); then
+      echo "[monitor] running instance/state disappeared; stopping monitor."
+      rm -f "$PID_FILE"
+      return 0
+    fi
+    sleep "$INTERVAL"
+  done
+}
+
+case "$COMMAND" in
+  once)
+    run_once
+    ;;
+  watch|run)
+    run_watch
+    ;;
+  start)
+    if pid_running; then
+      echo "qwen-monitor already running (pid $(cat "$PID_FILE"))."
+      exit 0
+    fi
+    rm -f "$PID_FILE"
+    start_args=(run --threshold "$THRESHOLD" --interval "$INTERVAL" --max-results "$MAX_RESULTS")
+    (( SAME_PROFILE == 1 )) && start_args+=(--same-profile)
+    nohup "$0" "${start_args[@]}" >> "$LOG_FILE" 2>&1 < /dev/null &
+    pid=$!
+    echo "$pid" > "$PID_FILE"
+    sleep 0.2
+    if kill -0 "$pid" >/dev/null 2>&1; then
+      echo "qwen-monitor started (pid $pid, interval=${INTERVAL}s, threshold=${THRESHOLD}%)."
+      echo "Log: $LOG_FILE"
+    else
+      echo >&2 "ERROR: monitor failed to start. See $LOG_FILE"
+      rm -f "$PID_FILE"
+      exit 1
+    fi
+    ;;
+  stop)
+    if pid_running; then
+      pid="$(cat "$PID_FILE")"
+      kill "$pid" >/dev/null 2>&1 || true
+      for _ in 1 2 3 4 5; do kill -0 "$pid" >/dev/null 2>&1 || break; sleep 0.2; done
+      kill -9 "$pid" >/dev/null 2>&1 || true
+      rm -f "$PID_FILE"
+      (( QUIET == 1 )) || echo "qwen-monitor stopped."
+    else
+      rm -f "$PID_FILE"
+      (( QUIET == 1 )) || echo "qwen-monitor is not running."
+    fi
+    ;;
+  status)
+    if pid_running; then echo "qwen-monitor: running (pid $(cat "$PID_FILE"))"; else echo "qwen-monitor: stopped"; fi
+    [[ -f "$ALERT_FILE" ]] && { echo "Last qualifying alert:"; jq . "$ALERT_FILE"; }
+    ;;
+  logs|log)
+    touch "$LOG_FILE"
+    tail -n 100 -f "$LOG_FILE"
+    ;;
+  *)
+    echo >&2 "ERROR: unknown command '$COMMAND'"
+    usage >&2
+    exit 2
+    ;;
+esac

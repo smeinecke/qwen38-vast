@@ -15,11 +15,16 @@ ARG FASTMTP_PATCH_SHA256=981285400b59dc45cf99936b6ff66d4b3aa0f1b532f85fa51418cb4
 # The GitHub Actions matrix builds one native CUDA target per image. Keeping a
 # single SM target per image cuts cold compile time and avoids shipping unused
 # cubins. Local builds may still pass a semicolon-separated list explicitly.
-#   86  = Ampere GA102 (RTX A6000)
-#   89  = Ada Lovelace (RTX 6000 Ada, RTX 5880 Ada, L40S)
+#   86  = Ampere GA102 (RTX A6000, A40)
+#   89  = Ada Lovelace (RTX 4090, RTX 6000 Ada, RTX 5880 Ada, L40/L40S)
 #   120 = Blackwell GeForce/RTX PRO (RTX 5090, RTX PRO 6000 Blackwell)
 ARG CUDA_ARCHITECTURES=86
 ARG QWEN_BUILD_PROFILE=custom
+# Passed by CI from the compiler-cache key. Referencing this value in the
+# compile RUN deliberately invalidates only that layer when the compiler-cache
+# generation changes. This guarantees one real compile to populate an empty
+# BuildKit cache mount instead of forever restoring an old compiled layer.
+ARG CCACHE_SEED=manual
 
 # ccache is intentionally installed only in the builder. The final runtime image
 # stays unchanged. The compiler cache itself is a BuildKit cache mount, so it is
@@ -49,8 +54,13 @@ RUN curl -fL --retry 5 --retry-all-errors --connect-timeout 15 \
 
 # GGML_NATIVE=OFF is important: GitHub-hosted builders have no NVIDIA GPU.
 # CUDA 12.8 lets llama.cpp include Ampere/Ada/Blackwell CUDA targets.
+# CCACHE_SEED is intentionally consumed here. Without it, BuildKit may restore
+# this entire RUN from the GHA layer cache before ccache ever gets a chance to
+# populate its persistent cache mount (which is exactly what happened in v9).
 RUN --mount=type=cache,id=qwen38-ccache,target=/root/.cache/ccache,sharing=locked \
-    cmake -S . -B build -G Ninja \
+    printf 'ccache seed: %s\n' "${CCACHE_SEED}" \
+    && ccache --zero-stats \
+    && cmake -S . -B build -G Ninja \
       -DGGML_CUDA=ON \
       -DGGML_NATIVE=OFF \
       -DBUILD_SHARED_LIBS=OFF \

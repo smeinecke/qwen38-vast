@@ -110,6 +110,12 @@ if (( YES == 0 )); then
   [[ "$answer" =~ ^[Yy]$ ]] || { echo "Cancelled."; exit 0; }
 fi
 
+# A background market monitor is tied to the running instance price. Stop it
+# before saving/destroying so it cannot keep polling stale state.
+if [[ -x "$ROOT_DIR/qwen-monitor" ]]; then
+  "$ROOT_DIR/qwen-monitor" stop --quiet >/dev/null 2>&1 || true
+fi
+
 # Older state files may predate telemetry. Create a recovery directory instead of
 # throwing away everything we can still collect at shutdown.
 if [[ -z "$run_dir" && -n "$instance_id" ]]; then
