@@ -43,6 +43,7 @@ if [[ -z "$endpoint" ]]; then
   exit 2
 fi
 IFS=$'\t' read -r ssh_user ssh_host ssh_port ssh_url <<<"$endpoint"
+qwen_ssh_sanitize_known_hosts "$ssh_host" "$ssh_port"
 mapfile -d '' -t ssh_opts < <(qwen_ssh_opts "$ssh_port")
 
 echo "[ssh] ${ssh_user}@${ssh_host}:${ssh_port}"

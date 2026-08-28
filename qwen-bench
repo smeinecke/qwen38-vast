@@ -163,6 +163,7 @@ print(u.username or "root", u.hostname or "", u.port or 22)
 PY
   )
   if [[ -n "$ssh_host" ]]; then
+    qwen_ssh_sanitize_known_hosts "$ssh_host" "$ssh_port"
     {
       echo 'timestamp,index,name,utilization_gpu_pct,memory_used_mib,memory_total_mib,power_w,temperature_c'
       ssh \

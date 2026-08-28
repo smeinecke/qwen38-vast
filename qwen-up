@@ -529,6 +529,7 @@ while :; do
 done
 
 mapfile -d '' -t ssh_opts < <(qwen_ssh_opts "$ssh_port")
+qwen_ssh_sanitize_known_hosts "$ssh_host" "$ssh_port"
 echo "[ssh] endpoint discovered: ${ssh_user}@${ssh_host}:${ssh_port}; waiting for SSH daemon..."
 last_ssh_log=0
 while ! ssh "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" true >/dev/null 2>&1; do
@@ -576,8 +577,9 @@ cache_prefetch_status="$RUN_DIR/cache-prefetch.status"
 cache_prefetch_log="$RUN_DIR/cache-prefetch.log"
 if qwen_cache_enabled; then
   if qwen_cache_copy_key_to_vast "$ssh_user" "$ssh_host" "$ssh_port"; then
-    build_json="$(ssh "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" 'cat /etc/qwen38-build.json 2>/dev/null || true' 2>/dev/null || true)"
-    llama_commit="$(jq -r '.llama_cpp_commit // "unknown"' <<<"${build_json:-{}}" 2>/dev/null || echo unknown)"
+    build_json="$(ssh "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" 'cat /etc/qwen38-build.json 2>/dev/null || true' 2>/dev/null | head -n 1 || true)"
+    llama_commit="$(jq -r '.llama_cpp_commit // "unknown"' <<<"${build_json:-{}}" 2>/dev/null | head -n 1)"
+    [[ "$llama_commit" == "unknown" || "$llama_commit" =~ ^[a-f0-9]+$ ]] || llama_commit="unknown"
     cache_signature="$(qwen_cache_signature "$llama_commit" "$MODEL" "$HF_REVISION" "$CTX_SIZE" "$USE_FASTMTP" "${CACHE_TYPE_K:-default}" "${CACHE_TYPE_V:-default}")"
     cache_remote_dir="$(qwen_cache_remote_dir "$cache_signature")"
     jq --arg signature "$cache_signature" --arg remote_dir "$cache_remote_dir" --arg llama_commit "$llama_commit" \

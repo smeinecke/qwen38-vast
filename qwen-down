@@ -78,6 +78,12 @@ hf_revision="${hf_revision:-${HF_REVISION:-993a5971fda8f30dd1b7eb2654792ba4415c7
 use_fastmtp="$(jq -r '.use_fastmtp // 1' "$STATE_FILE")"
 llama_commit="$(jq -r '.llama_cpp_commit // empty' "$STATE_FILE")"
 cache_signature="$(jq -r '.slot_cache_signature // empty' "$STATE_FILE")"
+# If the state was written by a qwen-up with the corrupted llama_commit bug,
+# reset both so qwen-down re-fetches and re-computes the correct signature.
+if [[ -n "$llama_commit" && ! "$llama_commit" =~ ^[a-f0-9]+$ ]]; then
+  llama_commit=""
+  cache_signature=""
+fi
 cache_type_k="$(jq -r '.cache_type_k // "default"' "$STATE_FILE")"
 cache_type_v="$(jq -r '.cache_type_v // "default"' "$STATE_FILE")"
 
@@ -148,8 +154,9 @@ save_slot_cache() {
   fi
 
   if [[ -z "$llama_commit" ]]; then
-    build_json="$(ssh "${cache_vast_ssh_opts[@]}" "${cache_vast_user}@${cache_vast_host}" 'cat /etc/qwen38-build.json 2>/dev/null || true' 2>/dev/null || true)"
-    llama_commit="$(jq -r '.llama_cpp_commit // "unknown"' <<<"${build_json:-{}}" 2>/dev/null || echo unknown)"
+    build_json="$(ssh "${cache_vast_ssh_opts[@]}" "${cache_vast_user}@${cache_vast_host}" 'cat /etc/qwen38-build.json 2>/dev/null || true' 2>/dev/null | head -n 1 || true)"
+    llama_commit="$(jq -r '.llama_cpp_commit // "unknown"' <<<"${build_json:-{}}" 2>/dev/null | head -n 1)"
+    [[ "$llama_commit" == "unknown" || "$llama_commit" =~ ^[a-f0-9]+$ ]] || llama_commit="unknown"
   fi
   if [[ -z "$cache_signature" ]]; then
     cache_signature="$(qwen_cache_signature "$llama_commit" "$model" "$hf_revision" "$ctx_size" "$use_fastmtp" "$cache_type_k" "$cache_type_v")"
@@ -212,10 +219,17 @@ PYMETA
     -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o ServerAliveCountMax=3
     -o StrictHostKeyChecking=accept-new -o "UserKnownHostsFile=$KNOWN_HOSTS" -P "$cache_vast_port"
   )
-  scp "${scp_opts[@]}" "$metadata_tmp" "${cache_vast_user}@${cache_vast_host}:${QWEN_SLOT_CACHE_LOCAL_DIR}/current.json.tmp" >/dev/null
+  if ! scp -q "${scp_opts[@]}" "$metadata_tmp" "${cache_vast_user}@${cache_vast_host}:${QWEN_SLOT_CACHE_LOCAL_DIR}/current.json.tmp"; then
+    echo >&2 "[slot-cache] could not copy slot metadata to Vast host"
+    rm -f "$metadata_tmp"
+    return 26
+  fi
   rm -f "$metadata_tmp"
-  ssh "${cache_vast_ssh_opts[@]}" "${cache_vast_user}@${cache_vast_host}" \
-    "mv '${QWEN_SLOT_CACHE_LOCAL_DIR}/current.json.tmp' '${QWEN_SLOT_CACHE_LOCAL_DIR}/current.json' && chmod 600 '${QWEN_SLOT_CACHE_LOCAL_DIR}/current.json'"
+  if ! ssh "${cache_vast_ssh_opts[@]}" "${cache_vast_user}@${cache_vast_host}" \
+      "mv '${QWEN_SLOT_CACHE_LOCAL_DIR}/current.json.tmp' '${QWEN_SLOT_CACHE_LOCAL_DIR}/current.json' && chmod 600 '${QWEN_SLOT_CACHE_LOCAL_DIR}/current.json'"; then
+    echo >&2 "[slot-cache] could not stage slot metadata on Vast host"
+    return 27
+  fi
 
   if qwen_cache_upload_from_vast "$cache_vast_user" "$cache_vast_host" "$cache_vast_port" "$cache_signature" | tee "$run_dir/cache-upload.log"; then
     jq --arg signature "$cache_signature" --arg remote_dir "$cache_remote_dir" --argjson n_saved "$n_saved" --argjson n_written "$n_written" \
@@ -257,6 +271,7 @@ print(u.username or "root", u.hostname or "", u.port or 22)
 PY
     )
     if [[ -n "$ssh_host" ]]; then
+      qwen_ssh_sanitize_known_hosts "$ssh_host" "$ssh_port"
       ssh_opts=(
         -o BatchMode=yes
         -o ConnectTimeout=8

@@ -121,9 +121,17 @@ qwen_cache_copy_key_to_vast() {
   scp_opts=("${common_opts[@]}" -P "$vast_port")
   ssh_opts=("${common_opts[@]}" -p "$vast_port")
 
-  scp "${scp_opts[@]}" "$QWEN_SLOT_CACHE_KEY" "${vast_user}@${vast_host}:${remote_key}.tmp" >/dev/null
+  qwen_ssh_sanitize_known_hosts "$vast_host" "$vast_port"
+
+  scp -q "${scp_opts[@]}" "$QWEN_SLOT_CACHE_KEY" "${vast_user}@${vast_host}:${remote_key}.tmp" || {
+    echo >&2 "[slot-cache] could not copy cache key to ${vast_host}:${vast_port}"
+    return 1
+  }
   ssh "${ssh_opts[@]}" "${vast_user}@${vast_host}" \
-    "install -d -m 700 /root/.ssh && install -m 600 '${remote_key}.tmp' '$remote_key' && rm -f '${remote_key}.tmp'" >/dev/null
+    "install -d -m 700 /root/.ssh && install -m 600 '${remote_key}.tmp' '$remote_key' && rm -f '${remote_key}.tmp'" || {
+    echo >&2 "[slot-cache] could not install cache key on ${vast_host}:${vast_port}"
+    return 1
+  }
 }
 
 # Download current.bin from the persistent cache server to the Vast slot-save
@@ -224,9 +232,16 @@ for attempt in 1 2 3; do
   echo >&2 "[slot-cache] upload attempt $attempt failed; retrying in 3s..."
   sleep 3
 done
-rsync -a --partial \
-  -e "ssh -i $key -p $cache_port -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$known" \
-  "$slot_dir/current.json" "${cache_user}@${cache_host}:${remote_json}"
+for attempt in 1 2 3; do
+  if rsync -a --partial \
+    -e "ssh -i $key -p $cache_port -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$known" \
+    "$slot_dir/current.json" "${cache_user}@${cache_host}:${remote_json}"; then
+    break
+  fi
+  (( attempt == 3 )) && { echo >&2 "[slot-cache] metadata upload failed after 3 attempts"; exit 16; }
+  echo >&2 "[slot-cache] metadata upload attempt $attempt failed; retrying in 3s..."
+  sleep 3
+done
 
 "${ssh_base[@]}" "${cache_user}@${cache_host}" \
   "chmod 600 '$remote_bin' '$remote_json' && mv -f '$remote_bin' '$remote_dir/current.bin' && mv -f '$remote_json' '$remote_dir/current.json'"

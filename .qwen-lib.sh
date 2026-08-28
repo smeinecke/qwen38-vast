@@ -124,6 +124,17 @@ qwen_ssh_opts() {
     -p "$port"
 }
 
+# Disposable Vast containers can change host keys (e.g. restart/migration). Remove
+# any stale entries for this host:port so StrictHostKeyChecking=accept-new can
+# write the current key instead of failing on a mismatch. This only affects the
+# per-project known_hosts file, not the user's global one.
+qwen_ssh_sanitize_known_hosts() {
+  local host="$1" port="${2:-22}"
+  [[ -f "$KNOWN_HOSTS" ]] || return 0
+  ssh-keygen -R "[${host}]:${port}" -f "$KNOWN_HOSTS" >/dev/null 2>&1 || true
+  ssh-keygen -R "${host}" -f "$KNOWN_HOSTS" >/dev/null 2>&1 || true
+}
+
 qwen_api_healthy() {
   local local_port api_key
   [[ -f "$STATE_FILE" ]] || return 1
@@ -250,6 +261,7 @@ _qwen_ensure_tunnel_locked() {
   fi
 
   mapfile -d '' -t opts < <(qwen_ssh_opts "$ssh_port")
+  qwen_ssh_sanitize_known_hosts "$ssh_host" "$ssh_port"
   mkdir -p "$(dirname "$KNOWN_HOSTS")"
   local tunnel_log="${TUNNEL_LOG:-$(dirname "$STATE_FILE")/tunnel.log}"
   : > "$tunnel_log"
