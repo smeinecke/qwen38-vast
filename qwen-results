@@ -61,6 +61,8 @@ for path in files:
         "output_tok": usage.get("completion_tokens") or 0,
         "decode_tps": perf.get("decode_tps"),
         "ttft_s": perf.get("ttft_s"),
+        "cache_hit": perf.get("cache_hit_rate"),
+        "cache_n": perf.get("cache_n") or 0,
         "mtp_accept": perf.get("draft_accept_rate"),
         "peak_vram_mib": gpu.get("peak_memory_mib"),
         "avg_power_w": gpu.get("avg_power_w"),
@@ -75,7 +77,7 @@ if fmt == "json":
 
 fields = [
     "run", "bench", "label", "profile", "gpu", "ctx", "prompt_tok",
-    "prompt_tps", "output_tok", "decode_tps", "ttft_s", "mtp_accept",
+    "prompt_tps", "output_tok", "decode_tps", "ttft_s", "cache_hit", "cache_n", "mtp_accept",
     "peak_vram_mib", "avg_power_w", "request_cost_usd", "ok", "path",
 ]
 if fmt == "csv":
@@ -112,7 +114,7 @@ def short_gpu(v):
             s = s[len(prefix):]
     return s
 
-headers = ["run", "label", "profile", "gpu", "ctx", "pp t/s", "tg t/s", "TTFT", "MTP", "VRAM", "power", "req $"]
+headers = ["run", "label", "profile", "gpu", "ctx", "pp t/s", "tg t/s", "TTFT", "cache", "MTP", "VRAM", "power", "req $"]
 rendered = []
 for r in rows:
     rendered.append([
@@ -124,6 +126,7 @@ for r in rows:
         f(r["prompt_tps"], 1),
         f(r["decode_tps"], 1),
         f(r["ttft_s"], 2),
+        "-" if r["cache_hit"] is None else f"{100*float(r['cache_hit']):.1f}%",
         "-" if r["mtp_accept"] is None else f"{100*float(r['mtp_accept']):.1f}%",
         "-" if r["peak_vram_mib"] is None else f"{float(r['peak_vram_mib'])/1024:.1f}G",
         "-" if r["avg_power_w"] is None else f"{float(r['avg_power_w']):.0f}W",

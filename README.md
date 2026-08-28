@@ -9,6 +9,122 @@ Disposable Vast.ai deployment for:
 - self-managed SSH with a public key baked into the image
 - local SSH tunnel for the OpenAI-compatible API
 - persistent benchmark/telemetry history in `.qwen-runs/`
+- automatic cross-instance llama.cpp slot/KV snapshots on the external cache server
+
+## v8 persistent slot/KV cache
+
+v8 automatically persists the single llama.cpp slot between disposable Vast
+instances. The configured cache server is currently:
+
+```text
+94.16.105.121
+```
+
+The remote server does **not** run llama.cpp. It only needs SSH and `rsync` and
+stores `current.bin` plus a small JSON metadata file. The default cache root is
+`~/qwen-slot-cache` for the configured cache user, so no root access is needed.
+
+A dedicated SSH key is generated locally and is **not** baked into the image or
+committed. One-time setup:
+
+```bash
+cp .env.example .env
+# If the existing remote user is not qwen-cache, edit QWEN_SLOT_CACHE_USER.
+./qwen-cache-setup
+```
+
+If the cache account has another name:
+
+```bash
+./qwen-cache-setup youruser@94.16.105.121
+```
+
+The setup command uses your existing SSH access once, adds a dedicated
+`restrict`ed Ed25519 key, verifies that `rsync` exists on the cache server,
+creates the remote cache directory and verifies the new key. Afterwards the
+whole lifecycle is automatic. If `rsync` is missing, install it once on the
+cache server (Ubuntu/Debian: `sudo apt install rsync`).
+
+For independent coding contexts, choose a logical session name when starting:
+
+```bash
+./qwen-up a6000-128k --session my-project
+```
+
+The session name is persisted in the Vast run state, so `qwen-down` automatically
+uploads back into the same namespace. No download/upload command is needed.
+
+### Automatic startup
+
+`qwen-up`:
+
+1. checks that the dedicated cache key exists before renting;
+2. copies that limited cache key to the new ephemeral Vast host;
+3. computes a compatibility signature from llama.cpp commit, model, HF revision,
+   context size, FastMTP setting and KV precision;
+4. starts downloading a matching `current.bin` from the cache server **in
+   parallel with model loading**;
+5. after `/health` is ready, calls llama.cpp
+   `POST /slots/0?action=restore` automatically;
+6. records `n_restored`, bytes read and restore state in `.qwen-runs/`.
+
+No cache file for the exact signature simply means a normal cold context.
+A6000-128k and Ada/Blackwell-128k can share a snapshot when all signature inputs
+match; a 64k and 128k context intentionally do not share one.
+
+### Automatic shutdown
+
+`qwen-down` now does this before destroying the paid host:
+
+```text
+slot 0 -> llama.cpp save -> Vast NVMe current.bin -> rsync -> 94.16.105.121
+        -> atomic current.bin replacement -> retention -> destroy Vast instance
+```
+
+Normal use is unchanged; the slot save and upload happen automatically:
+
+```bash
+./qwen-down --yes
+```
+
+Emergency opt-out:
+
+```bash
+./qwen-down --yes --no-cache
+```
+
+By default a cache upload failure is logged but the instance is still destroyed
+so a storage outage cannot accidentally keep GPU billing running. Set:
+
+```dotenv
+QWEN_SLOT_CACHE_REQUIRE_SAVE=1
+```
+
+if losing the latest snapshot is worse than leaving the Vast instance running.
+
+The 100 GB cache server defaults to `QWEN_SLOT_CACHE_MAX_GB=80`. After a
+successful upload, v8 deletes the oldest *other* session/signature snapshots
+until usage is below the budget. The snapshot just uploaded is never pruned.
+
+### Important Qwen3.8 restore verification
+
+Qwen3.8-27B uses the `qwen3_5` hybrid architecture (linear/recurrent attention
+plus periodic full attention). Recent upstream llama.cpp versions have an open
+issue where slot restore on hybrid/recurrent models can report `n_restored`
+successfully but still re-prefill the next request. The pinned FastMTP commit in
+this repo is different, so v8 does not assume either outcome.
+
+`qwen-bench` now records the actual llama.cpp `cache_n` value and displays cache
+hit percentage. After the first save/restart/restore, run the same long-prefix
+request again and trust the cache only if `cache_n` is non-zero/high:
+
+```bash
+./qwen-bench --label restored-context --prompt-file /tmp/same-long-prefix.txt
+./qwen-results
+```
+
+The table now contains a `cache` column. This distinguishes "restore API said
+success" from real avoided prompt processing.
 
 ## v7 architecture change
 
@@ -158,7 +274,7 @@ Linux/macOS/WSL:
 
 ```bash
 python3 -m pip install --upgrade vastai
-sudo apt-get install -y jq curl openssh-client openssl
+sudo apt-get install -y jq curl openssh-client openssl rsync
 ```
 
 Authenticate Vast with either:
@@ -183,6 +299,13 @@ At minimum set:
 
 ```dotenv
 GHCR_IMAGE_BASE=ghcr.io/YOUR_USER/YOUR_REPO
+QWEN_SLOT_CACHE_USER=qwen-cache   # change if your existing server user differs
+```
+
+Then prepare the external cache once:
+
+```bash
+./qwen-cache-setup
 ```
 
 `HF_TOKEN` is optional because the current model repository is public.
@@ -213,10 +336,12 @@ The script:
 4. creates the instance in normal entrypoint/args mode with `-p 22:22`;
 5. waits for Vast's public port-22 mapping;
 6. connects to the image's own `sshd`;
-7. creates a local `localhost:18080 -> instance:127.0.0.1:8080` tunnel;
-8. waits while `hf_xet` downloads the GGUF/FastMTP sidecar and llama.cpp loads;
-9. waits for `/health`;
-10. stores local state and telemetry.
+7. installs the dedicated external-cache key on the disposable host;
+8. prefetches a compatible persistent slot snapshot from `94.16.105.121` while the model loads;
+9. creates a local `localhost:18080 -> instance:127.0.0.1:8080` tunnel;
+10. waits while `hf_xet` downloads the GGUF/FastMTP sidecar and llama.cpp loads;
+11. waits for `/health` and restores slot 0 on a cache hit;
+12. stores local state and telemetry.
 
 Load the generated client environment:
 

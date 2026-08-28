@@ -361,8 +361,16 @@ pred_tps_fallback = None
 if metric_pred_tokens is not None and metric_pred_seconds and metric_pred_seconds > 0:
     pred_tps_fallback = metric_pred_tokens / metric_pred_seconds
 
-prompt_tokens = int(usage.get("prompt_tokens") or timings.get("prompt_n") or metric_prompt_tokens or 0)
+timing_cache_n = int(timings.get("cache_n") or 0)
+timing_prompt_n = int(timings.get("prompt_n") or 0)
+if usage.get("prompt_tokens") is not None:
+    prompt_tokens = int(usage.get("prompt_tokens") or 0)
+elif timing_cache_n or timing_prompt_n:
+    prompt_tokens = timing_cache_n + timing_prompt_n
+else:
+    prompt_tokens = int(metric_prompt_tokens or 0)
 completion_tokens = int(usage.get("completion_tokens") or timings.get("predicted_n") or metric_pred_tokens or 0)
+cache_hit_rate = (timing_cache_n / prompt_tokens) if prompt_tokens > 0 and timing_cache_n >= 0 else None
 prompt_tps = timings.get("prompt_per_second")
 if not isinstance(prompt_tps, (int, float)):
     prompt_tps = prompt_tps_fallback
@@ -416,6 +424,9 @@ result = {
         "draft_n_accepted": draft_accepted,
         "draft_accept_rate": accept_rate,
         "request_compute_cost_usd": request_cost,
+        "cache_n": timing_cache_n,
+        "prompt_evaluated_n": timing_prompt_n,
+        "cache_hit_rate": cache_hit_rate,
     },
     "metrics_delta": {
         "prompt_tokens": metric_prompt_tokens,
@@ -442,6 +453,10 @@ if error:
 
 fmt = lambda v, n=2: "n/a" if v is None else f"{float(v):.{n}f}"
 print(f"  prompt: {prompt_tokens} tok @ {fmt(prompt_tps)} t/s")
+if timing_cache_n:
+    print(f"  cache:  {timing_cache_n} tok reused ({fmt(100.0 * cache_hit_rate, 1)}%)")
+else:
+    print("  cache:  0 tok reused")
 print(f"  decode: {completion_tokens} tok @ {fmt(pred_tps)} t/s")
 print(f"  TTFT:   {fmt(first_token_s, 3)} s | total: {fmt(total_s, 3)} s")
 if draft_n:

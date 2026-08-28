@@ -17,13 +17,17 @@ PORT="${PORT:-8080}"
 REASONING_EFFORT="${REASONING_EFFORT:-xhigh}"
 USE_FASTMTP="${USE_FASTMTP:-1}"
 QWEN_PROFILE="${QWEN_PROFILE:-custom}"
+SLOT_SAVE_PATH="${SLOT_SAVE_PATH:-/var/lib/qwen38/slots}"
+CACHE_TYPE_K="${CACHE_TYPE_K:-}"
+CACHE_TYPE_V="${CACHE_TYPE_V:-}"
 
 if [[ -z "${LLAMA_API_KEY:-}" ]]; then
   echo >&2 "ERROR: LLAMA_API_KEY is required."
   exit 2
 fi
 
-mkdir -p "$MODEL_DIR"
+mkdir -p "$MODEL_DIR" "$SLOT_SAVE_PATH"
+chmod 700 "$SLOT_SAVE_PATH"
 
 download_file() {
   local filename="$1"
@@ -62,7 +66,16 @@ server_args=(
   --port "$PORT"
   --api-key "$LLAMA_API_KEY"
   --metrics
+  --slots
+  --slot-save-path "$SLOT_SAVE_PATH"
 )
+
+if [[ -n "$CACHE_TYPE_K" ]]; then
+  server_args+=(--cache-type-k "$CACHE_TYPE_K")
+fi
+if [[ -n "$CACHE_TYPE_V" ]]; then
+  server_args+=(--cache-type-v "$CACHE_TYPE_V")
+fi
 
 if [[ "$USE_FASTMTP" == "1" ]]; then
   download_file "$DRAFT"
@@ -81,7 +94,7 @@ fi
 # Do not forward the Hugging Face credential into llama-server's environment.
 unset HF_TOKEN HUGGING_FACE_HUB_TOKEN || true
 
-echo "[serve] profile=$QWEN_PROFILE model=$MODEL revision=$HF_REVISION ctx=$CTX_SIZE fastmtp=$USE_FASTMTP bind=$BIND_HOST:$PORT"
+echo "[serve] profile=$QWEN_PROFILE model=$MODEL revision=$HF_REVISION ctx=$CTX_SIZE fastmtp=$USE_FASTMTP bind=$BIND_HOST:$PORT slot_save_path=$SLOT_SAVE_PATH"
 echo "[runtime] llama-server version:"
 /usr/local/bin/llama-server --version 2>&1 || true
 echo "[runtime] GPU snapshot:"

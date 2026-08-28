@@ -42,6 +42,14 @@ fi
 
 jq '{id,actual_status,intended_status,gpu_name,dph_total,geolocation,status_msg,public_ipaddr,ssh_host,ssh_port,ssh_port_mapping:(.ports["22/tcp"][0].HostPort // null)}' <<<"$instance_json"
 printf 'Profile: %s | Context: %s | Image: %s\n' "$profile" "$ctx" "$image"
+cache_enabled="$(jq -r '.slot_cache_enabled // 0 ' "$STATE_FILE" 2>/dev/null || echo 0)"
+if [[ "$cache_enabled" == "1" ]]; then
+  cache_session="$(jq -r '.slot_cache_session // "default"' "$STATE_FILE")"
+  cache_sig="$(jq -r '.slot_cache_signature // "pending"' "$STATE_FILE")"
+  cache_restore="$(jq -r '.slot_cache_restore // "pending"' "$STATE_FILE")"
+  cache_saved="$(jq -r '.slot_cache_save // "not-yet"' "$STATE_FILE")"
+  printf 'Slot cache: session=%s | signature=%s | restore=%s | save=%s\n' "$cache_session" "$cache_sig" "$cache_restore" "$cache_saved"
+fi
 [[ -n "$run_dir" ]] && printf 'Run dir: %s\n' "$run_dir"
 
 if [[ "$started_epoch" =~ ^[0-9]+$ ]]; then

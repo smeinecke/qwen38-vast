@@ -5,3 +5,4 @@
 .qwen-runs/
 .qwen-vast/
 ssh/authorized_keys.generated
+.qwen-cache/

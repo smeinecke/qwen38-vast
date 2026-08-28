@@ -13,3 +13,5 @@ qwen-logs
 qwen-results
 qwen-status
 qwen-up
+.qwen-cache
+.qwen-cache/

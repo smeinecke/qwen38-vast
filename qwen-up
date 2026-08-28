@@ -25,14 +25,19 @@ if [[ -f "$ROOT_DIR/.env" ]]; then
   set +a
 fi
 
+# shellcheck disable=SC1091
+source "$ROOT_DIR/.qwen-cache-lib.sh"
+qwen_cache_load_config
+qwen_cache_validate_config
+
 RUNS_DIR="${QWEN_RUNS_DIR:-$ROOT_DIR/.qwen-runs}"
 PROFILES_FILE="${QWEN_PROFILES_FILE:-$ROOT_DIR/profiles.json}"
 
 usage() {
   cat <<'USAGE'
 Usage:
-  ./qwen-up [PROFILE]
-  ./qwen-up --profile PROFILE
+  ./qwen-up [PROFILE] [--session NAME]
+  ./qwen-up --profile PROFILE [--session NAME]
 
 Profiles are defined in profiles.json. Edit that file to change GPU queries,
 context defaults or profile aliases without touching qwen-up.
@@ -50,6 +55,7 @@ Examples:
   ./qwen-up a6000
   ./qwen-up a6000-128k
   ./qwen-up blackwell-128k
+  ./qwen-up a6000-128k --session my-project
   CTX_SIZE_OVERRIDE=98304 ./qwen-up a6000
 
 Use *_OVERRIDE variables only for intentional one-off tests.
@@ -57,34 +63,46 @@ USAGE
 }
 
 profile_arg=""
-case "${1:-}" in
-  -h|--help)
-    usage
-    exit 0
-    ;;
-  -p|--profile)
-    [[ -n "${2:-}" ]] || { echo >&2 "ERROR: --profile requires a value"; exit 2; }
-    profile_arg="$2"
-    shift 2
-    ;;
-  "")
-    ;;
-  -*)
-    echo >&2 "ERROR: unknown option: $1"
-    usage >&2
-    exit 2
-    ;;
-  *)
-    profile_arg="$1"
-    shift
-    ;;
-esac
+cache_session_arg=""
+while (( $# > 0 )); do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -p|--profile)
+      [[ -n "${2:-}" ]] || { echo >&2 "ERROR: --profile requires a value"; exit 2; }
+      profile_arg="$2"
+      shift 2
+      ;;
+    -s|--session)
+      [[ -n "${2:-}" ]] || { echo >&2 "ERROR: --session requires a value"; exit 2; }
+      cache_session_arg="$2"
+      shift 2
+      ;;
+    -*)
+      echo >&2 "ERROR: unknown option: $1"
+      usage >&2
+      exit 2
+      ;;
+    *)
+      if [[ -n "$profile_arg" ]]; then
+        echo >&2 "ERROR: multiple profiles supplied ('$profile_arg' and '$1')"
+        usage >&2
+        exit 2
+      fi
+      profile_arg="$1"
+      shift
+      ;;
+  esac
+done
 
-if (( $# > 0 )); then
-  echo >&2 "ERROR: unexpected argument: $1"
-  usage >&2
-  exit 2
+if [[ -n "$cache_session_arg" ]]; then
+  QWEN_SLOT_CACHE_SESSION="$cache_session_arg"
 fi
+# Validate again after CLI overrides. The initial validation above catches bad
+# .env values before any paid resources are touched.
+qwen_cache_validate_config
 
 command -v jq >/dev/null 2>&1 || { echo >&2 "ERROR: missing dependency: jq"; exit 2; }
 [[ -f "$PROFILES_FILE" ]] || { echo >&2 "ERROR: profiles file not found: $PROFILES_FILE"; exit 2; }
@@ -127,7 +145,13 @@ fi
 CTX_SIZE="${CTX_SIZE_OVERRIDE:-$PROFILE_CTX_SIZE}"
 GPU_QUERY="${GPU_QUERY_OVERRIDE:-$PROFILE_GPU_QUERY}"
 MAX_DPH="${MAX_DPH:-0.80}"
-DISK_GB="${DISK_GB:-60}"
+if qwen_cache_enabled; then
+  # A slot snapshot is first written to local Vast disk before it is uploaded.
+  # 100 GB avoids failing a long-context save for lack of scratch space.
+  DISK_GB="${DISK_GB:-100}"
+else
+  DISK_GB="${DISK_GB:-60}"
+fi
 LOCAL_PORT="${LOCAL_PORT:-18080}"
 START_TIMEOUT="${START_TIMEOUT:-1200}"
 KEEP_ON_FAILURE="${KEEP_ON_FAILURE:-0}"
@@ -162,7 +186,16 @@ need() {
   }
 }
 
-for cmd in vastai jq curl ssh python3 openssl; do need "$cmd"; done
+for cmd in vastai jq curl ssh scp python3 openssl; do need "$cmd"; done
+
+if qwen_cache_enabled; then
+  qwen_cache_require_key
+  if qwen_cache_local_preflight; then
+    echo "[slot-cache] preflight OK: ${QWEN_SLOT_CACHE_USER}@${QWEN_SLOT_CACHE_HOST}:${QWEN_SLOT_CACHE_PORT}/${QWEN_SLOT_CACHE_ROOT}"
+  else
+    echo >&2 "[slot-cache] WARNING: cache server preflight failed from this workstation; continuing and retrying from the Vast host."
+  fi
+fi
 
 if [[ -f "$STATE_FILE" ]]; then
   old_id="$(jq -r '.instance_id // empty' "$STATE_FILE" 2>/dev/null || true)"
@@ -200,6 +233,7 @@ fi
 MODEL_API_KEY="${MODEL_API_KEY:-sk-local-$(openssl rand -hex 24)}"
 instance_id=""
 tunnel_pid=""
+cache_prefetch_pid=""
 ready=0
 
 RUN_ID="${QWEN_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-${PROFILE}-$$}"
@@ -223,8 +257,15 @@ jq -n \
   --arg image "$SELECTED_IMAGE" \
   --argjson ctx_size "$CTX_SIZE" \
   --arg model "$MODEL" \
+  --arg hf_revision "$HF_REVISION" \
   --argjson fastmtp "$USE_FASTMTP" \
-  '{schema_version:1,run_id:$run_id,status:$status,started_at:$started_at,profile:$profile,cuda_arch:$cuda_arch,image:$image,ctx_size:$ctx_size,model:$model,use_fastmtp:$fastmtp}' \
+  --arg cache_type_k "${CACHE_TYPE_K:-default}" \
+  --arg cache_type_v "${CACHE_TYPE_V:-default}" \
+  --argjson slot_cache_enabled "$QWEN_SLOT_CACHE_ENABLED" \
+  --arg slot_cache_host "$QWEN_SLOT_CACHE_HOST" \
+  --arg slot_cache_user "$QWEN_SLOT_CACHE_USER" \
+  --arg slot_cache_session "$QWEN_SLOT_CACHE_SESSION" \
+  '{schema_version:1,run_id:$run_id,status:$status,started_at:$started_at,profile:$profile,cuda_arch:$cuda_arch,image:$image,ctx_size:$ctx_size,model:$model,hf_revision:$hf_revision,use_fastmtp:$fastmtp,cache_type_k:$cache_type_k,cache_type_v:$cache_type_v,slot_cache_enabled:$slot_cache_enabled,slot_cache_host:$slot_cache_host,slot_cache_user:$slot_cache_user,slot_cache_session:$slot_cache_session}' \
   > "$RUN_DIR/metadata.json"
 chmod 600 "$RUN_DIR/metadata.json"
 
@@ -242,6 +283,7 @@ sync_run_metadata() {
 
 cleanup_paid_instance() {
   local reason="$1"
+  [[ -n "$cache_prefetch_pid" ]] && kill "$cache_prefetch_pid" >/dev/null 2>&1 || true
   [[ -n "$tunnel_pid" ]] && kill "$tunnel_pid" >/dev/null 2>&1 || true
   if [[ -f "$STATE_FILE" ]]; then
     jq --arg reason "$reason" --arg ended_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -312,7 +354,13 @@ printf '[rent] %s | $%.4f/h | down=%s Mbps | disk=%s MB/s | reliability=%s | %s 
 # v7 uses Vast's normal entrypoint/args launch mode. Port 22 is a normal
 # Docker mapping and sshd is part of our image; Vast no longer injects a child
 # /ssh image or rewrites authorized_keys at paid-instance startup.
-docker_env="-p 22:22 -e QWEN_PROFILE=${PROFILE} -e LLAMA_API_KEY=${MODEL_API_KEY} -e MODEL=${MODEL} -e CTX_SIZE=${CTX_SIZE} -e USE_FASTMTP=${USE_FASTMTP} -e REASONING_EFFORT=${REASONING_EFFORT} -e HF_REVISION=${HF_REVISION} -e BIND_HOST=127.0.0.1"
+docker_env="-p 22:22 -e QWEN_PROFILE=${PROFILE} -e LLAMA_API_KEY=${MODEL_API_KEY} -e MODEL=${MODEL} -e CTX_SIZE=${CTX_SIZE} -e USE_FASTMTP=${USE_FASTMTP} -e REASONING_EFFORT=${REASONING_EFFORT} -e HF_REVISION=${HF_REVISION} -e BIND_HOST=127.0.0.1 -e SLOT_SAVE_PATH=${QWEN_SLOT_CACHE_LOCAL_DIR}"
+if [[ -n "${CACHE_TYPE_K:-}" ]]; then
+  docker_env+=" -e CACHE_TYPE_K=${CACHE_TYPE_K}"
+fi
+if [[ -n "${CACHE_TYPE_V:-}" ]]; then
+  docker_env+=" -e CACHE_TYPE_V=${CACHE_TYPE_V}"
+fi
 if [[ -n "${HF_TOKEN:-}" ]]; then
   docker_env+=" -e HF_TOKEN=${HF_TOKEN}"
 fi
@@ -355,6 +403,7 @@ jq -n \
   --argjson dph "$dph" \
   --argjson local_port "$LOCAL_PORT" \
   --arg model "$MODEL" \
+  --arg hf_revision "$HF_REVISION" \
   --argjson ctx "$CTX_SIZE" \
   --arg api_key "$MODEL_API_KEY" \
   --arg image "$SELECTED_IMAGE" \
@@ -373,7 +422,16 @@ jq -n \
   --arg reliability "$reliability" \
   --argjson fastmtp "$USE_FASTMTP" \
   --arg reasoning_effort "$REASONING_EFFORT" \
-  '{schema_version:1,instance_id:$instance_id,offer_id:$offer_id,gpu:$gpu,dph:$dph,local_port:$local_port,model:$model,ctx_size:$ctx,api_key:$api_key,image:$image,label:$label,profile:$profile,cuda_arch:$cuda_arch,run_id:$run_id,run_dir:$run_dir,started_at:$started_at,started_epoch:$started_epoch,run_started_at:$run_started_at,run_started_epoch:$run_started_epoch,location:$location,inet_down:$inet_down,disk_bw:$disk_bw,reliability:$reliability,use_fastmtp:$fastmtp,reasoning_effort:$reasoning_effort}' \
+  --arg cache_type_k "${CACHE_TYPE_K:-default}" \
+  --arg cache_type_v "${CACHE_TYPE_V:-default}" \
+  --argjson slot_cache_enabled "$QWEN_SLOT_CACHE_ENABLED" \
+  --arg slot_cache_host "$QWEN_SLOT_CACHE_HOST" \
+  --argjson slot_cache_port "$QWEN_SLOT_CACHE_PORT" \
+  --arg slot_cache_user "$QWEN_SLOT_CACHE_USER" \
+  --arg slot_cache_root "$QWEN_SLOT_CACHE_ROOT" \
+  --arg slot_cache_session "$QWEN_SLOT_CACHE_SESSION" \
+  --argjson slot_cache_max_gb "$QWEN_SLOT_CACHE_MAX_GB" \
+  '{schema_version:1,instance_id:$instance_id,offer_id:$offer_id,gpu:$gpu,dph:$dph,local_port:$local_port,model:$model,hf_revision:$hf_revision,ctx_size:$ctx,api_key:$api_key,image:$image,label:$label,profile:$profile,cuda_arch:$cuda_arch,run_id:$run_id,run_dir:$run_dir,started_at:$started_at,started_epoch:$started_epoch,run_started_at:$run_started_at,run_started_epoch:$run_started_epoch,location:$location,inet_down:$inet_down,disk_bw:$disk_bw,reliability:$reliability,use_fastmtp:$fastmtp,reasoning_effort:$reasoning_effort,cache_type_k:$cache_type_k,cache_type_v:$cache_type_v,slot_cache_enabled:$slot_cache_enabled,slot_cache_host:$slot_cache_host,slot_cache_port:$slot_cache_port,slot_cache_user:$slot_cache_user,slot_cache_root:$slot_cache_root,slot_cache_session:$slot_cache_session,slot_cache_max_gb:$slot_cache_max_gb}' \
   > "$STATE_FILE"
 chmod 600 "$STATE_FILE"
 sync_run_metadata "provisioning"
@@ -442,6 +500,37 @@ while ! ssh "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" true >/dev/null 2>&1; do
   sleep 5
 done
 echo "[ssh] connection ready"
+
+# Stage the persistent slot snapshot while the model is still downloading/loading.
+# This overlaps the Vienna -> Vast transfer with the Hugging Face cold start.
+cache_signature=""
+cache_remote_dir=""
+cache_prefetch_status="$RUN_DIR/cache-prefetch.status"
+cache_prefetch_log="$RUN_DIR/cache-prefetch.log"
+if qwen_cache_enabled; then
+  if qwen_cache_copy_key_to_vast "$ssh_user" "$ssh_host" "$ssh_port"; then
+    build_json="$(ssh "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" 'cat /etc/qwen38-build.json 2>/dev/null || true' 2>/dev/null || true)"
+    llama_commit="$(jq -r '.llama_cpp_commit // "unknown"' <<<"${build_json:-{}}" 2>/dev/null || echo unknown)"
+    cache_signature="$(qwen_cache_signature "$llama_commit" "$MODEL" "$HF_REVISION" "$CTX_SIZE" "$USE_FASTMTP" "${CACHE_TYPE_K:-default}" "${CACHE_TYPE_V:-default}")"
+    cache_remote_dir="$(qwen_cache_remote_dir "$cache_signature")"
+    jq --arg signature "$cache_signature" --arg remote_dir "$cache_remote_dir" --arg llama_commit "$llama_commit" \
+      '. + {slot_cache_signature:$signature,slot_cache_remote_dir:$remote_dir,llama_cpp_commit:$llama_commit,slot_cache_restore:"prefetching"}' \
+      "$STATE_FILE" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+    chmod 600 "$STATE_FILE"
+    echo "[slot-cache] prefetching session=${QWEN_SLOT_CACHE_SESSION} signature=${cache_signature} from ${QWEN_SLOT_CACHE_HOST} (in parallel with model load)"
+    (
+      set +e
+      qwen_cache_prefetch_to_vast "$ssh_user" "$ssh_host" "$ssh_port" "$cache_signature" >"$cache_prefetch_log" 2>&1
+      rc=$?
+      printf '%s\n' "$rc" > "$cache_prefetch_status"
+      exit 0
+    ) &
+    cache_prefetch_pid=$!
+  else
+    echo >&2 "[slot-cache] WARNING: could not install dedicated cache key on Vast; continuing cold."
+    jq '. + {slot_cache_restore:"key-install-failed"}' "$STATE_FILE" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+  fi
+fi
 
 nohup ssh "${ssh_opts[@]}" \
   -o ExitOnForwardFailure=yes \
@@ -513,6 +602,48 @@ while :; do
   sleep 5
 done
 
+# If a compatible snapshot was prefetched, restore slot 0 now that llama-server
+# is healthy. A miss/failure is non-fatal and simply leaves a cold slot.
+if qwen_cache_enabled && [[ -n "$cache_signature" ]]; then
+  if [[ -n "$cache_prefetch_pid" ]]; then
+    wait "$cache_prefetch_pid" >/dev/null 2>&1 || true
+    cache_prefetch_pid=""
+  fi
+  prefetch_rc="$(cat "$cache_prefetch_status" 2>/dev/null || echo 99)"
+  if [[ "$prefetch_rc" == "0" ]]; then
+    echo "[slot-cache] snapshot downloaded; restoring slot ${QWEN_SLOT_CACHE_SLOT_ID}..."
+    restore_file="$RUN_DIR/cache-restore.json"
+    set +e
+    curl -fsS --connect-timeout 3 --max-time 600 \
+      -X POST \
+      -H "Authorization: Bearer ${MODEL_API_KEY}" \
+      -H 'Content-Type: application/json' \
+      -d '{"filename":"current.bin"}' \
+      "http://127.0.0.1:${LOCAL_PORT}/slots/${QWEN_SLOT_CACHE_SLOT_ID}?action=restore" > "$restore_file"
+    restore_rc=$?
+    set -e
+    if (( restore_rc == 0 )); then
+      n_restored="$(jq -r '.n_restored // 0' "$restore_file" 2>/dev/null || echo 0)"
+      n_read="$(jq -r '.n_read // 0' "$restore_file" 2>/dev/null || echo 0)"
+      echo "[slot-cache] restore API reported n_restored=${n_restored}, bytes=${n_read}"
+      echo "[slot-cache] NOTE: API restore success is not proof of prefix reuse on hybrid Qwen models; qwen-bench now reports cache_n/cache-hit % on the next real request."
+      jq --arg status "restored" --argjson n_restored "${n_restored:-0}" --argjson n_read "${n_read:-0}" \
+        '. + {slot_cache_restore:$status,slot_cache_n_restored:$n_restored,slot_cache_bytes_restored:$n_read}' \
+        "$STATE_FILE" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+    else
+      echo >&2 "[slot-cache] WARNING: slot restore API failed; continuing cold."
+      jq '. + {slot_cache_restore:"restore-api-failed"}' "$STATE_FILE" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+    fi
+  elif [[ "$prefetch_rc" == "10" ]]; then
+    echo "[slot-cache] no compatible persisted snapshot (cold context)."
+    jq '. + {slot_cache_restore:"miss"}' "$STATE_FILE" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+  else
+    echo >&2 "[slot-cache] WARNING: cache prefetch failed (rc=$prefetch_rc); continuing cold. See $cache_prefetch_log"
+    jq --arg rc "$prefetch_rc" '. + {slot_cache_restore:"prefetch-failed",slot_cache_prefetch_rc:$rc}' "$STATE_FILE" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+  fi
+  chmod 600 "$STATE_FILE"
+fi
+
 trap - INT TERM
 
 ready_epoch="$(date +%s)"
@@ -538,5 +669,8 @@ printf '  Context:   %s\n' "$CTX_SIZE"
 printf '  API:       %s\n' "$base_url"
 printf '  Instance:  %s\n' "$instance_id"
 printf '  Run log:   %s\n' "$RUN_DIR"
+if qwen_cache_enabled; then
+  printf '  Slot cache: %s (session=%s, signature=%s)\n' "$(jq -r '.slot_cache_restore // "unknown"' "$STATE_FILE")" "$QWEN_SLOT_CACHE_SESSION" "${cache_signature:-?}"
+fi
 printf '\nRun: source .qwen-vast/env\n'
 printf 'Stop billing: ./qwen-down --yes\n'

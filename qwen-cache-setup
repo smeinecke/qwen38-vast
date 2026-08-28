@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$ROOT_DIR/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$ROOT_DIR/.env"
+  set +a
+fi
+# shellcheck disable=SC1091
+source "$ROOT_DIR/.qwen-cache-lib.sh"
+qwen_cache_load_config
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  ./qwen-cache-setup [user@host]
+
+One-time setup for the persistent llama.cpp slot/KV cache server. It creates a
+DEDICATED Ed25519 key locally, authorizes only that key for the cache account,
+and prepares the remote cache directory. The private key is never committed or
+baked into the Docker image.
+
+Defaults come from .env. Current defaults:
+  host: 94.16.105.121
+  user: qwen-cache
+  root: qwen-slot-cache   (relative to the remote user's home)
+
+If your existing server user is not qwen-cache:
+  ./qwen-cache-setup youruser@94.16.105.121
+then set QWEN_SLOT_CACHE_USER=youruser in .env.
+USAGE
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  "") ;;
+  *@*)
+    QWEN_SLOT_CACHE_USER="${1%@*}"
+    QWEN_SLOT_CACHE_HOST="${1#*@}"
+    ;;
+  *) echo >&2 "ERROR: expected user@host"; usage >&2; exit 2 ;;
+esac
+
+qwen_cache_validate_config
+for cmd in ssh ssh-keygen; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo >&2 "ERROR: missing dependency: $cmd"; exit 2; }
+done
+
+key="$QWEN_SLOT_CACHE_KEY"
+mkdir -p "$(dirname "$key")"
+chmod 700 "$(dirname "$key")"
+if [[ ! -f "$key" ]]; then
+  echo "[setup] generating dedicated cache key: $key"
+  ssh-keygen -q -t ed25519 -N '' -C 'qwen38-vast-slot-cache' -f "$key"
+else
+  echo "[setup] using existing dedicated cache key: $key"
+fi
+chmod 600 "$key"
+chmod 644 "$key.pub"
+
+pub="$(cat "$key.pub")"
+target="${QWEN_SLOT_CACHE_USER}@${QWEN_SLOT_CACHE_HOST}"
+echo "[setup] installing restricted key on $target:$QWEN_SLOT_CACHE_PORT"
+echo "[setup] your normal SSH authentication may prompt once here."
+
+# `restrict` disables forwarding/PTY/X11/agent forwarding for this key while
+# still permitting rsync and the small mkdir/retention commands used by v8.
+ssh -p "$QWEN_SLOT_CACHE_PORT" \
+  -o StrictHostKeyChecking=accept-new \
+  "$target" bash -s -- "$pub" "$QWEN_SLOT_CACHE_ROOT" <<'REMOTE'
+set -Eeuo pipefail
+pub="$1"; root="$2"
+umask 077
+mkdir -p "$HOME/.ssh" "$root"
+chmod 700 "$HOME/.ssh" "$root"
+touch "$HOME/.ssh/authorized_keys"
+chmod 600 "$HOME/.ssh/authorized_keys"
+# If the generated key was previously installed without restrictions, remove
+# that exact line first. The disposable Vast host should only ever receive the
+# restricted cache key.
+tmp="$HOME/.ssh/authorized_keys.tmp.$$"
+grep -Fvx "$pub" "$HOME/.ssh/authorized_keys" > "$tmp" || true
+mv "$tmp" "$HOME/.ssh/authorized_keys"
+chmod 600 "$HOME/.ssh/authorized_keys"
+if ! grep -Fqx "restrict $pub" "$HOME/.ssh/authorized_keys"; then
+  printf 'restrict %s\n' "$pub" >> "$HOME/.ssh/authorized_keys"
+fi
+command -v rsync >/dev/null 2>&1 || {
+  echo >&2 "ERROR: rsync is not installed on the cache server."
+  echo >&2 "Install it once (Debian/Ubuntu: sudo apt install rsync) and rerun setup."
+  exit 12
+}
+REMOTE
+
+mkdir -p "$ROOT_DIR/.qwen-cache"
+chmod 700 "$ROOT_DIR/.qwen-cache"
+echo "[setup] verifying dedicated key + rsync account..."
+ssh -i "$key" -p "$QWEN_SLOT_CACHE_PORT" \
+  -o BatchMode=yes \
+  -o ConnectTimeout=8 \
+  -o StrictHostKeyChecking=accept-new \
+  -o UserKnownHostsFile="$ROOT_DIR/.qwen-cache/known_hosts" \
+  "$target" \
+  "command -v rsync >/dev/null 2>&1 && test -w '$QWEN_SLOT_CACHE_ROOT' && printf 'cache-root=' && pwd && df -h '$QWEN_SLOT_CACHE_ROOT' | tail -n 1"
+
+cat <<EOF2
+
+READY
+  cache server: ${target}:${QWEN_SLOT_CACHE_PORT}
+  remote root:  ${QWEN_SLOT_CACHE_ROOT}
+  private key:  ${key}
+  max cache:    ${QWEN_SLOT_CACHE_MAX_GB} GiB
+
+qwen-up will now automatically prefetch a matching slot snapshot from this
+server, and qwen-down will save/upload slot 0 before destroying the Vast host.
+EOF2

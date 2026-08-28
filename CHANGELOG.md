@@ -1,5 +1,17 @@
 # Changelog
 
+## v8 - automatic cross-instance slot/KV persistence
+
+- Added `.qwen-cache-lib.sh` and `qwen-cache-setup` for a dedicated restricted SSH key and an external rsync-backed llama.cpp slot cache. Setup now verifies remote `rsync` before any GPU is rented.
+- Default cache endpoint is `94.16.105.121`; cache user/root/session remain editable in `.env`. `qwen-up --session NAME` selects an independent persistent context without manual transfers.
+- `qwen-up` automatically prefetches a compatibility-scoped snapshot from the external server in parallel with model loading and restores slot 0 after llama-server becomes healthy.
+- `qwen-down` automatically saves slot 0, uploads `current.bin`/metadata atomically, prunes old snapshots above the configured size budget, and only then destroys the Vast instance.
+- Added `QWEN_SLOT_CACHE_REQUIRE_SAVE` and `--no-cache` shutdown policies.
+- Cache signatures include llama.cpp commit, model/revision, context size, FastMTP and KV precision to avoid restoring incompatible state.
+- `start.sh` enables `--slots` and `--slot-save-path`; runtime build metadata now records the llama.cpp commit.
+- `qwen-bench` records `cache_n`, evaluated prompt tokens and cache-hit percentage; `qwen-results` includes a `cache` column so hybrid-model restore effectiveness can be verified rather than inferred from the restore API response.
+- Increased the example Vast scratch disk to 100 GB because slot snapshots are materialized locally before upload.
+
 ## v7 - self-managed SSH, external profiles and manual 56-core builds
 
 - Switched Vast creation from injected SSH launch mode to normal args/entrypoint mode with a regular `-p 22:22` mapping. The image now starts its own `sshd`, so Vast no longer builds a runtime `.../ssh` child image or mutates `authorized_keys`.
@@ -20,8 +32,6 @@
 - Force locale-independent numeric handling so German decimal locales do not break cost formatting.
 - Recover legacy state files without `run_dir` into `.qwen-runs/<timestamp>-recovered-<instance>/`.
 - Record `destroy_outcome` in final metadata.
-
-# Changelog
 
 ## v6 - resilient Vast SSH discovery and self-healing tunnels
 

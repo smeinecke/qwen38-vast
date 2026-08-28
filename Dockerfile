@@ -67,11 +67,13 @@ RUN --mount=type=cache,id=qwen38-ccache,target=/root/.cache/ccache,sharing=locke
 FROM ${RUNTIME_BASE} AS runtime
 
 ARG HF_HUB_VERSION=1.28.0
+ARG LLAMA_CPP_COMMIT=4df29be4f4c3673f428170fda944a5b19f743bb8
 ARG CUDA_ARCHITECTURES=86
 ARG QWEN_BUILD_PROFILE=custom
 
 LABEL io.qwen38.profile="${QWEN_BUILD_PROFILE}" \
-      io.qwen38.cuda-arch="${CUDA_ARCHITECTURES}"
+      io.qwen38.cuda-arch="${CUDA_ARCHITECTURES}" \
+      io.qwen38.llama-cpp-commit="${LLAMA_CPP_COMMIT}"
 
 # Pre-install and upgrade everything needed by the disposable runtime. In v6 we
 # asked Vast for SSH launch mode; Vast then built a child /ssh image at instance
@@ -112,6 +114,9 @@ RUN chmod 0755 /usr/local/bin/start.sh /usr/local/bin/entrypoint.sh /usr/local/b
     && if ! grep -hE '^[[:space:]]*(ssh-|ecdsa-|sk-)[^[:space:]]+[[:space:]]+[^[:space:]]+' /etc/qwen38/ssh/authorized_keys* >/dev/null 2>&1; then \
          echo >&2 'ERROR: image build contains no SSH public key; run scripts/prepare-authorized-keys first'; exit 2; \
        fi \
+    && printf '{"llama_cpp_commit":"%s","cuda_arch":"%s","build_profile":"%s"}\n' \
+         "$LLAMA_CPP_COMMIT" "$CUDA_ARCHITECTURES" "$QWEN_BUILD_PROFILE" > /etc/qwen38-build.json \
+    && chmod 0444 /etc/qwen38-build.json \
     && printf '%s\n' \
          'PermitRootLogin prohibit-password' \
          'PubkeyAuthentication yes' \
