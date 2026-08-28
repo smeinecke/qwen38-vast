@@ -154,6 +154,7 @@ else
   DISK_GB="${DISK_GB:-60}"
 fi
 LOCAL_PORT="${LOCAL_PORT:-18080}"
+LOCAL_PORT_AUTO="${LOCAL_PORT_AUTO:-1}"
 START_TIMEOUT="${START_TIMEOUT:-1200}"
 KEEP_ON_FAILURE="${KEEP_ON_FAILURE:-0}"
 MODEL="${MODEL:-Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf}"
@@ -220,24 +221,20 @@ if [[ -x "$ROOT_DIR/qwen-monitor" ]]; then
 fi
 rm -f "$STATE_DIR/monitor-alert.json" "$STATE_DIR/monitor.last.json"
 
-if python3 - "$LOCAL_PORT" <<'PY'
-import socket, sys
-port = int(sys.argv[1])
-s = socket.socket()
-try:
-    s.bind(("127.0.0.1", port))
-except OSError:
-    raise SystemExit(1)
-finally:
-    s.close()
-PY
-then
-  :
-else
-  echo >&2 "ERROR: local port $LOCAL_PORT is already in use. Change LOCAL_PORT in .env."
-  exit 2
+if ! qwen_port_is_free "$LOCAL_PORT"; then
+  if [[ "$LOCAL_PORT_AUTO" == "1" ]]; then
+    requested_port="$LOCAL_PORT"
+    LOCAL_PORT="$(qwen_find_free_port "$(( LOCAL_PORT + 1 ))" 100 2>/dev/null || true)"
+    if [[ -z "$LOCAL_PORT" ]]; then
+      echo >&2 "ERROR: localhost:$requested_port is occupied and no free fallback port was found."
+      exit 2
+    fi
+    echo >&2 "[tunnel] localhost:$requested_port is already occupied; using localhost:$LOCAL_PORT instead."
+  else
+    echo >&2 "ERROR: local port $LOCAL_PORT is already in use (LOCAL_PORT_AUTO=0)."
+    exit 2
+  fi
 fi
-
 MODEL_API_KEY="${MODEL_API_KEY:-sk-local-$(openssl rand -hex 24)}"
 instance_id=""
 tunnel_pid=""
@@ -546,27 +543,16 @@ if qwen_cache_enabled; then
   fi
 fi
 
-nohup ssh "${ssh_opts[@]}" \
-  -o ExitOnForwardFailure=yes \
-  -N -L "${LOCAL_PORT}:127.0.0.1:8080" \
-  "${ssh_user}@${ssh_host}" \
-  >"$TUNNEL_LOG" 2>&1 &
-tunnel_pid=$!
-sleep 2
-if ! kill -0 "$tunnel_pid" >/dev/null 2>&1; then
-  cat "$TUNNEL_LOG" >&2 || true
+# Tunnel creation is centralized in .qwen-lib.sh and serialized with a local
+# lock. This prevents qwen-status/qwen-bench from racing qwen-up and creating a
+# second ssh -L listener on the same port while provisioning is still ongoing.
+if ! qwen_ensure_tunnel 0; then
   cleanup_paid_instance "SSH tunnel failed"
   exit 7
 fi
-
-jq \
-  --arg ssh_url "$ssh_url" \
-  --argjson local_port "$LOCAL_PORT" \
-  --argjson tunnel_pid "$tunnel_pid" \
-  '. + {ssh_url:$ssh_url,local_port:$local_port,tunnel_pid:$tunnel_pid}' \
-  "$STATE_FILE" > "$STATE_FILE.tmp"
-mv "$STATE_FILE.tmp" "$STATE_FILE"
-chmod 600 "$STATE_FILE"
+LOCAL_PORT="$(jq -r '.local_port' "$STATE_FILE")"
+tunnel_pid="$(jq -r '.tunnel_pid // empty' "$STATE_FILE")"
+ssh_url="$(jq -r '.ssh_url // empty' "$STATE_FILE")"
 sync_run_metadata "loading-model"
 
 # Best-effort hardware snapshot. Telemetry must never prevent startup.
@@ -588,6 +574,7 @@ chmod 600 "$ENV_FILE"
 echo "[model] SSH tunnel is up; waiting for GGUF download + llama-server..."
 last_log=0
 while :; do
+  now="$(date +%s)"
   if curl -fsS --connect-timeout 2 --max-time 5 \
       -H "Authorization: Bearer ${MODEL_API_KEY}" \
       "http://127.0.0.1:${LOCAL_PORT}/health" >/dev/null 2>&1; then
@@ -595,13 +582,35 @@ while :; do
     break
   fi
 
-  if ! kill -0 "$tunnel_pid" >/dev/null 2>&1; then
-    cat "$TUNNEL_LOG" >&2 || true
-    cleanup_paid_instance "SSH tunnel exited before model became ready"
-    exit 7
+  if [[ -z "$tunnel_pid" ]] || ! kill -0 "$tunnel_pid" >/dev/null 2>&1; then
+    # Vast hosts can transiently restart networking/container state while the
+    # image/model is still coming up. A dropped SSH tunnel is therefore not a
+    # reason to destroy a paid instance immediately. Refresh the endpoint and
+    # keep trying until the overall START_TIMEOUT expires.
+    jq 'del(.tunnel_pid)' "$STATE_FILE" > "$STATE_FILE.tmp" 2>/dev/null && mv "$STATE_FILE.tmp" "$STATE_FILE" || true
+    if qwen_ensure_tunnel 1; then
+      LOCAL_PORT="$(jq -r '.local_port' "$STATE_FILE")"
+      tunnel_pid="$(jq -r '.tunnel_pid // empty' "$STATE_FILE")"
+      echo "[tunnel] SSH tunnel reconnected on localhost:$LOCAL_PORT (pid $tunnel_pid)"
+      base_url="http://127.0.0.1:${LOCAL_PORT}/v1"
+      cat > "$ENV_FILE" <<ENV
+export OPENAI_BASE_URL='${base_url}'
+export OPENAI_API_BASE='${base_url}'
+export OPENAI_API_KEY='${MODEL_API_KEY}'
+export QWEN_MODEL='${MODEL}'
+export QWEN_PROFILE='${PROFILE}'
+export QWEN_VAST_INSTANCE_ID='${instance_id}'
+ENV
+      chmod 600 "$ENV_FILE"
+    else
+      if (( now - last_log >= 30 )); then
+        echo >&2 "[tunnel] SSH connection temporarily unavailable; waiting for Vast host to recover..."
+      fi
+      sleep 5
+      continue
+    fi
   fi
 
-  now="$(date +%s)"
   if (( now - start_epoch > START_TIMEOUT )); then
     echo >&2 "[model] last remote log lines:"
     ssh "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" 'tail -n 20 /var/log/qwen38/server.log 2>/dev/null || true' >&2 || true

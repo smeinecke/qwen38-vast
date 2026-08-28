@@ -1,5 +1,32 @@
 # Changelog
 
+# v9.4 - race-free, self-healing SSH tunnels
+
+- Centralize tunnel creation in `.qwen-lib.sh`; `qwen-up` no longer launches a second independent `ssh -L`.
+- Serialize tunnel creation across `qwen-up`, `qwen-status`, `qwen-bench`, and `qwen-down` with an atomic local lock.
+- Reuse a tunnel created concurrently by another qwen command instead of racing for port 18080.
+- Add `LOCAL_PORT_AUTO=1` (default): if the preferred localhost port is occupied by an unrelated process, automatically select the next free port and persist it in state.
+- Treat a tunnel disconnect during model loading as recoverable: refresh Vast SSH endpoint and reconnect until `START_TIMEOUT` rather than immediately destroying the instance.
+
+# v9.3 - 256k profiles and hardware-safe market monitoring
+
+- Added explicit 262,144-token (`256k`) runtime profiles for RTX A6000/A40, 48 GB Ada-class GPUs, and a conservative RTX PRO 6000 96 GB Blackwell profile; all reuse the existing three CUDA images.
+- Added editable `monitor_hardware.gpu_ranks` metadata to `profiles.json`. The numbers are ordering values, not claimed benchmark scores.
+- `qwen-monitor` now requires the candidate's concrete GPU to be the same hardware class or higher-ranked than the running GPU, so e.g. an A6000 is never replaced by a cheaper A40.
+- Market comparisons require the exact current context size. Unknown GPU models are excluded conservatively.
+- Custom `CTX_SIZE_OVERRIDE` values with no named profile fall back to the current profile, and the generated switch command preserves the exact current context.
+- Monitor output now shows both current/candidate hardware ranks for auditability.
+
+# v9.2 — non-interactive Vast destroy fix
+
+- Fixed `qwen-down` hanging indefinitely at `Destroying Vast instance ...`: Vast CLI requires `-y` to skip its own irreversible-action confirmation. Because qwen-down captured CLI output, that second prompt was invisible.
+- Fixed the same missing `-y` in `qwen-up` failure cleanup.
+- Centralized destroy handling in `qwen_destroy_instance`.
+- Added `QWEN_DESTROY_TIMEOUT_SECONDS` (default 45s) so a genuine Vast CLI/API stall cannot block forever.
+- HTTP/API-style 404 `not found` remains a successful shutdown outcome.
+- On timeout or real error, local state is retained for a safe retry instead of pretending the rental was destroyed.
+
+
 ## v9.1 - compiler-cache seeding fix
 
 - Fixed the persistent compiler cache remaining an empty ~300-byte archive when BuildKit restored the entire llama.cpp compile RUN from its separate GHA layer cache.

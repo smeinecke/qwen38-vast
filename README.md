@@ -163,26 +163,41 @@ Runtime profiles can reuse one compiled image. The included profiles are:
 | `ampere-value` | `:a6000` | 65,536 | cheapest RTX A6000 or A40 |
 | `a6000-128k` | `:a6000` | 131,072 | exact RTX A6000 |
 | `ampere-value-128k` | `:a6000` | 131,072 | cheapest RTX A6000 or A40 |
+| `a6000-256k` | `:a6000` | 262,144 | exact RTX A6000, full native-context test profile |
+| `ampere-value-256k` | `:a6000` | 262,144 | RTX A6000 or A40, full native-context test profile |
 | `ada-64k` | `:ada-128k` | 65,536 | 48 GB Ada-class (6000 Ada/L40/L40S/5880 Ada) |
 | `ada-128k` | `:ada-128k` | 131,072 | 48 GB Ada-class (6000 Ada/L40/L40S/5880 Ada) |
+| `ada-256k` | `:ada-128k` | 262,144 | 48 GB Ada-class, full native-context test profile |
 | `5090-64k` | `:blackwell-128k` | 65,536 | exact RTX 5090 |
 | `5090-128k` | `:blackwell-128k` | 131,072 | exact RTX 5090 |
 | `blackwell-128k` | `:blackwell-128k` | 131,072 | RTX 5090 or RTX PRO 6000 |
+| `blackwell-256k` | `:blackwell-128k` | 262,144 | RTX PRO 6000 96 GB only |
 
-Profiles also carry a `monitor_group`. The market monitor only compares profiles
-with the **same group and exact context size**, so a running 128k session is never
-silently compared against a cheaper 32k instance. Broad value profiles are marked
-`monitor_search=true`; overlapping exact-GPU profiles can set it to `false` to avoid
-duplicate Vast API searches.
+`256k` means the model's full 262,144-token native context. These are runtime
+profiles only; they reuse the existing SM86/SM89/SM120 images and therefore do
+not add CUDA builds. The 48 GB 256k profiles are deliberately explicit test
+profiles: actual headroom still depends on the selected model, KV-cache type and
+FastMTP configuration. The 96 GB RTX PRO 6000 profile is the conservative 256k
+Blackwell choice.
 
-So testing 64k vs 128k on an A6000 does **not** require another Docker build:
+The market monitor uses the exact running context size plus `monitor_hardware` in
+`profiles.json`. `gpu_ranks` is an intentionally editable ordering, not a benchmark
+score. A candidate offer is accepted only when its concrete GPU rank is **equal to
+or higher than the currently running GPU**. This prevents an A6000 run from being
+replaced by a cheaper but slower A40. Unknown GPU models are rejected
+conservatively until added to the rank table. Broad value profiles are marked
+`monitor_search=true`; overlapping exact-GPU profiles can set it to `false` to
+avoid duplicate Vast API searches.
+
+Testing 64k, 128k and 256k on an A6000 does **not** require another Docker build:
 
 ```bash
 ./qwen-up a6000
 ./qwen-up a6000-128k
+./qwen-up a6000-256k
 ```
 
-Edit `profiles.json` to add e.g. 32k/96k profiles or tighten a region/GPU query.
+Edit `profiles.json` to tune GPU ordering, add another context profile or tighten a region/GPU query.
 `qwen-up` no longer contains hard-coded profile cases.
 
 ## GitHub Actions builds
@@ -372,6 +387,18 @@ curl "$OPENAI_BASE_URL/models" \
 The inference API itself is still bound only to `127.0.0.1` inside the Vast
 container. Only SSH port 22 is public.
 
+### Local tunnel port and concurrent commands
+
+`LOCAL_PORT=18080` is only the preferred local port. With the default
+`LOCAL_PORT_AUTO=1`, qwen scripts automatically select the next free localhost
+port if 18080 is occupied and store the actual port in `.qwen-vast/state.json`.
+Tunnel creation is serialized, so running `qwen-status` while `qwen-up` is still
+provisioning can no longer race `qwen-up` for the same `ssh -L` listener.
+
+A transient SSH disconnect while the model is loading is retried until the
+overall `START_TIMEOUT`; it no longer causes immediate instance destruction.
+Set `LOCAL_PORT_AUTO=0` only if a fixed local port is a hard requirement.
+
 ## 4. Logs and status
 
 ```bash
@@ -475,10 +502,14 @@ GPU_QUERY_OVERRIDE='num_gpus=1 gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_dow
 ## Live Vast price monitor
 
 `qwen-monitor` compares the **all-in hourly price of the currently running
-instance** (`dph_total`) with currently rentable Vast offers. By default it
-searches every profile in the same `monitor_group` and with the exact same
-context size. Search uses the same configured disk size, so the comparison is
-not just the bare GPU price.
+instance** (`dph_total`) with currently rentable Vast offers. A candidate must
+use the **same context size** and its concrete GPU must have an equal-or-higher
+rank in `profiles.json -> monitor_hardware.gpu_ranks`. Search uses the same
+configured disk size, so the comparison is not just the bare GPU price.
+
+The default ordering is conservative and editable. For example, A40 ranks below
+RTX A6000, while Ada 48 GB, RTX 5090 and RTX PRO 6000 rank above it. An unknown
+GPU is never treated as an upgrade automatically.
 
 One-shot check:
 
@@ -527,9 +558,10 @@ uv run ./qwen-up 5090-128k --session my-project
 destroying the instance. Set `QWEN_MONITOR_AUTO_START=1` if every successful
 `qwen-up` should start the monitor automatically.
 
-If the running context was changed with `CTX_SIZE_OVERRIDE`, the monitor falls
-back to **same-profile only** rather than assuming another profile can safely
-host the custom context size.
+If `CTX_SIZE_OVERRIDE` uses a context size for which no explicit profile exists,
+the monitor falls back to the running profile. Any suggested restart preserves
+the exact current context with `CTX_SIZE_OVERRIDE`, so a price alert never
+silently changes context length.
 
 ## Cold-start changes in v7
 

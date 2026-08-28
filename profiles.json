@@ -72,6 +72,29 @@
       "monitor_search": true
     },
     {
+      "name": "a6000-256k",
+      "aliases": [
+        "ampere-256k",
+        "sm86-256k"
+      ],
+      "image": "a6000",
+      "ctx_size": 262144,
+      "monitor_group": "q4-256k",
+      "gpu_query": "num_gpus=1 gpu_name=RTX_A6000 gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=100 rented=False rentable=True direct_port_count>=1",
+      "monitor_search": false
+    },
+    {
+      "name": "ampere-value-256k",
+      "aliases": [
+        "a40-256k"
+      ],
+      "image": "a6000",
+      "ctx_size": 262144,
+      "monitor_group": "q4-256k",
+      "gpu_query": "num_gpus=1 gpu_name in [\"RTX_A6000\",\"A40\"] gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=100 rented=False rentable=True direct_port_count>=1",
+      "monitor_search": true
+    },
+    {
       "name": "4090-32k",
       "aliases": [
         "4090",
@@ -107,6 +130,17 @@
       "monitor_search": true
     },
     {
+      "name": "ada-256k",
+      "aliases": [
+        "sm89-256k"
+      ],
+      "image": "ada",
+      "ctx_size": 262144,
+      "monitor_group": "q4-256k",
+      "gpu_query": "num_gpus=1 gpu_name in [\"RTX_6000Ada\",\"L40S\",\"L40\",\"RTX_5880Ada\"] gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=100 rented=False rentable=True direct_port_count>=1",
+      "monitor_search": true
+    },
+    {
       "name": "5090-64k",
       "aliases": [
         "blackwell-64k"
@@ -139,6 +173,95 @@
       "monitor_group": "q4-128k",
       "gpu_query": "num_gpus=1 gpu_name in [\"RTX_5090\",\"RTX_PRO_6000\"] gpu_ram>=32 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1",
       "monitor_search": true
+    },
+    {
+      "name": "blackwell-256k",
+      "aliases": [
+        "pro6000-256k",
+        "sm120-256k"
+      ],
+      "image": "blackwell",
+      "ctx_size": 262144,
+      "monitor_group": "q4-256k",
+      "gpu_query": "num_gpus=1 gpu_name=RTX_PRO_6000 gpu_ram>=90 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=100 rented=False rentable=True direct_port_count>=1",
+      "monitor_search": true
     }
-  ]
+  ],
+  "monitor_hardware": {
+    "policy": "same_or_better",
+    "gpu_ranks": [
+      {
+        "gpu": "A40",
+        "aliases": [
+          "A40"
+        ],
+        "rank": 100
+      },
+      {
+        "gpu": "RTX A6000",
+        "aliases": [
+          "RTX A6000",
+          "RTX_A6000"
+        ],
+        "rank": 110
+      },
+      {
+        "gpu": "L40",
+        "aliases": [
+          "L40"
+        ],
+        "rank": 120
+      },
+      {
+        "gpu": "RTX 5880 Ada",
+        "aliases": [
+          "RTX 5880 Ada",
+          "RTX_5880Ada",
+          "RTX 5880Ada"
+        ],
+        "rank": 125
+      },
+      {
+        "gpu": "RTX 6000 Ada",
+        "aliases": [
+          "RTX 6000 Ada",
+          "RTX_6000Ada",
+          "RTX 6000Ada"
+        ],
+        "rank": 130
+      },
+      {
+        "gpu": "L40S",
+        "aliases": [
+          "L40S"
+        ],
+        "rank": 135
+      },
+      {
+        "gpu": "RTX 4090",
+        "aliases": [
+          "RTX 4090",
+          "RTX_4090"
+        ],
+        "rank": 140
+      },
+      {
+        "gpu": "RTX 5090",
+        "aliases": [
+          "RTX 5090",
+          "RTX_5090"
+        ],
+        "rank": 200
+      },
+      {
+        "gpu": "RTX PRO 6000",
+        "aliases": [
+          "RTX PRO 6000",
+          "RTX_PRO_6000",
+          "RTX PRO 6000 Blackwell"
+        ],
+        "rank": 210
+      }
+    ]
+  }
 }

@@ -41,11 +41,13 @@ Options:
   --max-results N      number of qualifying offers to print (default: 5)
   --same-profile       only search the running profile, not compatible profiles
 
-Compatible profiles are profiles.json entries with the same monitor_group AND
-exactly the same context size as the running instance. Therefore a 128k run may
-compare A6000/A40, Ada 48GB and Blackwell 32GB/96GB profiles, but never a 32k
-profile. If CTX_SIZE_OVERRIDE changed the running context away from the profile
-default, qwen-monitor automatically falls back to same-profile monitoring.
+Candidate profiles must use exactly the same context size as the running instance.
+Offers are then filtered by the concrete GPU model using monitor_hardware.gpu_ranks
+in profiles.json: only the same hardware class or a higher-ranked GPU is eligible.
+For example, an A6000 run will not alert on a cheaper A40. Unknown GPU models are
+excluded conservatively. If CTX_SIZE_OVERRIDE uses a context for which no explicit
+profile exists, qwen-monitor falls back to the running profile and preserves the
+override in its switch command.
 USAGE
 }
 
@@ -126,6 +128,19 @@ load_current() {
   profile_ctx="$(jq -r '.ctx_size' <<<"$current_profile_json")"
   monitor_group="$(jq -r '.monitor_group // empty' <<<"$current_profile_json")"
 
+  current_hardware_rank="$(jq -r --arg gpu "$current_gpu" '
+    def normgpu($s): ($s // "") | ascii_downcase | gsub("[^a-z0-9]"; "");
+    def rank_for($s):
+      [(.monitor_hardware.gpu_ranks // [])[]
+       | select(any((.aliases // [.gpu])[]; normgpu(.) == normgpu($s)))
+       | .rank][0] // empty;
+    rank_for($gpu)
+  ' "$PROFILES_FILE")"
+  if [[ -z "$current_hardware_rank" ]]; then
+    current_hardware_rank=-1
+    (( QUIET == 1 )) || echo >&2 "[monitor] WARNING: current GPU '$current_gpu' has no monitor_hardware rank; only the exact same GPU name will be accepted."
+  fi
+
   target_dph="$(python3 - "$current_dph" "$THRESHOLD" <<'PY'
 import sys
 cur=float(sys.argv[1]); pct=float(sys.argv[2]); print(f"{cur*(1-pct/100):.12f}")
@@ -134,15 +149,23 @@ PY
 }
 
 candidate_profiles_json() {
-  if (( SAME_PROFILE == 1 )) || [[ -z "$monitor_group" ]] || [[ "$current_ctx" != "$profile_ctx" ]]; then
-    if [[ "$current_ctx" != "$profile_ctx" && $QUIET -eq 0 ]]; then
-      echo >&2 "[monitor] CTX override detected ($current_ctx != profile default $profile_ctx); restricting to same profile."
-    fi
+  if (( SAME_PROFILE == 1 )); then
     jq -c --arg p "$current_profile" '[.profiles[] | select(.name == $p)]' "$PROFILES_FILE"
-  else
-    jq -c --arg g "$monitor_group" --argjson ctx "$current_ctx" \
-      '[.profiles[] | select((.monitor_group // "") == $g and .ctx_size == $ctx and (if has("monitor_search") then .monitor_search else true end) != false)]' "$PROFILES_FILE"
+    return
   fi
+
+  local candidates
+  candidates="$(jq -c --argjson ctx "$current_ctx" \
+    '[.profiles[] | select(.ctx_size == $ctx and (if has("monitor_search") then .monitor_search else true end) != false)]' "$PROFILES_FILE")"
+  if [[ "$(jq 'length' <<<"$candidates")" -gt 0 ]]; then
+    printf '%s\n' "$candidates"
+    return
+  fi
+
+  # A custom CTX_SIZE_OVERRIDE may not have a named profile. Search only the
+  # running profile in that case; the suggested switch command preserves CTX.
+  (( QUIET == 1 )) || echo >&2 "[monitor] no explicit profile for ctx=$current_ctx; restricting to running profile and preserving CTX_SIZE_OVERRIDE."
+  jq -c --arg p "$current_profile" '[.profiles[] | select(.name == $p)]' "$PROFILES_FILE"
 }
 
 search_once_json() {
@@ -165,39 +188,58 @@ search_once_json() {
     rm -f "$tmp"
   done < <(candidate_profiles_json | jq -c '.[]')
 
-  jq -c --argjson threshold "$THRESHOLD" --argjson current "$current_dph" --argjson target "$target_dph" --argjson limit "$MAX_RESULTS" '
+  jq -c --slurpfile cfg "$PROFILES_FILE" \
+    --arg current_gpu "$current_gpu" \
+    --argjson current_rank "$current_hardware_rank" \
+    --argjson threshold "$THRESHOLD" --argjson current "$current_dph" \
+    --argjson target "$target_dph" --argjson limit "$MAX_RESULTS" '
     def oid: (.id // .ask_contract_id // -1);
+    def normgpu($s): ($s // "") | ascii_downcase | gsub("[^a-z0-9]"; "");
+    def rank_for($s):
+      [($cfg[0].monitor_hardware.gpu_ranks // [])[]
+       | select(any((.aliases // [.gpu])[]; normgpu(.) == normgpu($s)))
+       | .rank][0] // null;
     [ .[]
+      | . + {_hardware_rank: rank_for(.gpu_name // "")}
       | select(._effective_dph < $current)
+      | select(
+          if $current_rank >= 0 then
+            (._hardware_rank != null and ._hardware_rank >= $current_rank)
+          else
+            normgpu(.gpu_name // "") == normgpu($current_gpu)
+          end
+        )
       | . + {_saving_pct:(($current - ._effective_dph) / $current * 100)}
     ]
     | sort_by(oid)
     | unique_by(oid)
     | sort_by(._effective_dph)
     | [ .[] | select(._effective_dph <= $target) ][:($limit|floor)]
-    | {current_dph:$current, threshold_pct:$threshold, target_dph:$target, offers:.}
+    | {current_dph:$current, threshold_pct:$threshold, target_dph:$target, current_hardware_rank:$current_rank, offers:.}
   ' "$combined"
 }
 
 print_result() {
   local result="$1" count best best_profile best_gpu best_dph best_save
   count="$(jq '.offers | length' <<<"$result")"
-  printf '[monitor] current: %s | profile=%s | ctx=%s | $%.4f/h | %s\n' \
-    "$current_gpu" "$current_profile" "$current_ctx" "$current_dph" "$current_location"
+  printf '[monitor] current: %s | hw-rank=%s | profile=%s | ctx=%s | $%.4f/h | %s\n' \
+    "$current_gpu" "$current_hardware_rank" "$current_profile" "$current_ctx" "$current_dph" "$current_location"
   printf '[monitor] alert threshold: %.1f%% cheaper => <= $%.4f/h\n' "$THRESHOLD" "$target_dph"
 
   profiles_line="$(candidate_profiles_json | jq -r '[.[].name] | join(", ")')"
-  printf '[monitor] compatible search profiles: %s\n' "$profiles_line"
+  printf '[monitor] same-context search profiles: %s\n' "$profiles_line"
+  echo '[monitor] hardware policy: same-or-better only'
   if (( count == 0 )); then
     echo "[monitor] no qualifying cheaper offer available right now."
     return 0
   fi
 
-  printf '\n%-20s %-18s %9s %9s %-14s %9s %9s %8s %s\n' \
-    'PROFILE' 'GPU' '$/H' 'SAVE' 'LOCATION' 'DOWN' 'DISK' 'REL' 'OFFER'
+  printf '\n%-20s %-18s %5s %9s %9s %-14s %9s %9s %8s %s\n' \
+    'PROFILE' 'GPU' 'RANK' '$/H' 'SAVE' 'LOCATION' 'DOWN' 'DISK' 'REL' 'OFFER'
   jq -r '.offers[] | [
       ._monitor_profile,
       (.gpu_name // "?"),
+      (._hardware_rank // -1|tostring),
       (._effective_dph|tostring),
       (._saving_pct|tostring),
       (.geolocation // "?"),
@@ -205,9 +247,9 @@ print_result() {
       (.disk_bw // 0|tostring),
       (.reliability2 // .reliability // 0|tostring),
       (.id // .ask_contract_id // "?")|tostring
-    ] | @tsv' <<<"$result" | while IFS=$'\t' read -r p g price save loc down disk rel id; do
-      printf '%-20s %-18s $%8.4f %8.1f%% %-14s %7.0fM %7.0fM %8.4f %s\n' \
-        "$p" "$g" "$price" "$save" "$loc" "$down" "$disk" "$rel" "$id"
+    ] | @tsv' <<<"$result" | while IFS=$'\t' read -r p g rank price save loc down disk rel id; do
+      printf '%-20s %-18s %5s $%8.4f %8.1f%% %-14s %7.0fM %7.0fM %8.4f %s\n' \
+        "$p" "$g" "$rank" "$price" "$save" "$loc" "$down" "$disk" "$rel" "$id"
     done
 
   best="$(jq -c '.offers[0]' <<<"$result")"
@@ -218,7 +260,12 @@ print_result() {
   printf '\n[monitor] BEST: %s / %s at $%.4f/h (%.1f%% cheaper)\n' "$best_profile" "$best_gpu" "$best_dph" "$best_save"
   printf '[monitor] safe switch (slot cache is preserved by qwen-down/up):\n'
   printf '  uv run ./qwen-down --yes\n'
-  printf '  uv run ./qwen-up %q --session %q\n' "$best_profile" "$current_session"
+  best_profile_ctx="$(jq -r --arg p "$best_profile" '[.profiles[] | select(.name == $p)][0].ctx_size // 0' "$PROFILES_FILE")"
+  if [[ "$best_profile_ctx" == "$current_ctx" ]]; then
+    printf '  uv run ./qwen-up %q --session %q\n' "$best_profile" "$current_session"
+  else
+    printf '  CTX_SIZE_OVERRIDE=%q uv run ./qwen-up %q --session %q\n' "$current_ctx" "$best_profile" "$current_session"
+  fi
 }
 
 write_alert_if_changed() {
