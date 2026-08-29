@@ -14,11 +14,8 @@ Disposable Vast.ai deployment for:
 ## v8 persistent slot/KV cache
 
 v8 automatically persists the single llama.cpp slot between disposable Vast
-instances. The configured cache server is currently:
-
-```text
-94.16.105.121
-```
+instances. The cache server is configured via `QWEN_SLOT_CACHE_HOST` in your
+`.env` file (see `.env.example`).
 
 The remote server does **not** run llama.cpp. It only needs SSH and `rsync` and
 stores `current.bin` plus a small JSON metadata file. The default cache root is
@@ -33,10 +30,10 @@ cp .env.example .env
 ./qwen-cache-setup
 ```
 
-If the cache account has another name:
+If the cache account has another name or host:
 
 ```bash
-./qwen-cache-setup youruser@94.16.105.121
+./qwen-cache-setup youruser@your-cache-host.example.com
 ```
 
 The setup command uses your existing SSH access once, adds a dedicated
@@ -77,7 +74,7 @@ match; a 64k and 128k context intentionally do not share one.
 `qwen-down` now does this before destroying the paid host:
 
 ```text
-slot 0 -> llama.cpp save -> Vast NVMe current.bin -> rsync -> 94.16.105.121
+slot 0 -> llama.cpp save -> Vast NVMe current.bin -> rsync -> QWEN_SLOT_CACHE_HOST
         -> atomic current.bin replacement -> retention -> destroy Vast instance
 ```
 
@@ -390,7 +387,7 @@ The script:
 5. waits for Vast's public port-22 mapping;
 6. connects to the image's own `sshd`;
 7. installs the dedicated external-cache key on the disposable host;
-8. prefetches a compatible persistent slot snapshot from `94.16.105.121` while the model loads;
+8. prefetches a compatible persistent slot snapshot from the cache server while the model loads;
 9. creates a local `localhost:18080 -> instance:127.0.0.1:8080` tunnel;
 10. waits while `hf_xet` downloads the GGUF/FastMTP sidecar and llama.cpp loads;
 11. waits for `/health` and restores slot 0 on a cache hit;

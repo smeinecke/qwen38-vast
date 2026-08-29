@@ -82,7 +82,7 @@
 ## v8 - automatic cross-instance slot/KV persistence
 
 - Added `.qwen-cache-lib.sh` and `qwen-cache-setup` for a dedicated restricted SSH key and an external rsync-backed llama.cpp slot cache. Setup now verifies remote `rsync` before any GPU is rented.
-- Default cache endpoint is `94.16.105.121`; cache user/root/session remain editable in `.env`. `qwen-up --session NAME` selects an independent persistent context without manual transfers.
+- Cache host is configured in `.env` via `QWEN_SLOT_CACHE_HOST`; cache user/root/session remain editable in `.env`. `qwen-up --session NAME` selects an independent persistent context without manual transfers.
 - `qwen-up` automatically prefetches a compatibility-scoped snapshot from the external server in parallel with model loading and restores slot 0 after llama-server becomes healthy.
 - `qwen-down` automatically saves slot 0, uploads `current.bin`/metadata atomically, prunes old snapshots above the configured size budget, and only then destroys the Vast instance.
 - Added `QWEN_SLOT_CACHE_REQUIRE_SAVE` and `--no-cache` shutdown policies.

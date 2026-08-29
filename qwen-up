@@ -192,6 +192,12 @@ qwen_up_restart() {
     exit 7
   fi
 
+  # If the user passed --local-port, override the persisted port before
+  # qwen_ensure_tunnel re-establishes the tunnel.
+  if [[ -n "${local_port_arg:-}" ]]; then
+    jq --argjson p "$local_port_arg" '. + {local_port:$p}' "$STATE_FILE" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+  fi
+
   # Establish the local SSH tunnel.
   if ! qwen_ensure_tunnel 0; then
     echo >&2 "ERROR: SSH tunnel failed"
@@ -365,9 +371,9 @@ PROFILES_FILE="${QWEN_PROFILES_FILE:-$ROOT_DIR/profiles.json}"
 usage() {
   cat <<'USAGE'
 Usage:
-  ./qwen-up [PROFILE] [--session NAME]
-  ./qwen-up --profile PROFILE [--session NAME]
-  ./qwen-up --restart
+  ./qwen-up [PROFILE] [--session NAME] [--local-port PORT]
+  ./qwen-up --profile PROFILE [--session NAME] [--local-port PORT]
+  ./qwen-up --restart [--local-port PORT]
 
 Restart/resume an existing paused Vast instance from .qwen-vast/state.json.
 With --restart, qwen-up does not search the market or create a new instance;
@@ -399,6 +405,7 @@ USAGE
 
 profile_arg=""
 cache_session_arg=""
+local_port_arg=""
 RESTART=0
 while (( $# > 0 )); do
   case "$1" in
@@ -414,6 +421,16 @@ while (( $# > 0 )); do
     -s|--session)
       [[ -n "${2:-}" ]] || { echo >&2 "ERROR: --session requires a value"; exit 2; }
       cache_session_arg="$2"
+      shift 2
+      ;;
+    -l|--local-port)
+      [[ -n "${2:-}" ]] || { echo >&2 "ERROR: --local-port requires a value"; exit 2; }
+      if [[ ! "${2:-}" =~ ^[0-9]+$ ]]; then
+        echo >&2 "ERROR: --local-port must be a number"
+        usage >&2
+        exit 2
+      fi
+      local_port_arg="$2"
       shift 2
       ;;
     --restart)
@@ -436,6 +453,10 @@ while (( $# > 0 )); do
       ;;
   esac
 done
+
+if [[ -n "$local_port_arg" ]]; then
+  LOCAL_PORT="$local_port_arg"
+fi
 
 if [[ -n "$cache_session_arg" ]]; then
   QWEN_SLOT_CACHE_SESSION="$cache_session_arg"

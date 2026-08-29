@@ -8,7 +8,7 @@
 
 qwen_cache_load_config() {
   QWEN_SLOT_CACHE_ENABLED="${QWEN_SLOT_CACHE_ENABLED:-1}"
-  QWEN_SLOT_CACHE_HOST="${QWEN_SLOT_CACHE_HOST:-94.16.105.121}"
+  QWEN_SLOT_CACHE_HOST="${QWEN_SLOT_CACHE_HOST:-}"
   QWEN_SLOT_CACHE_PORT="${QWEN_SLOT_CACHE_PORT:-22}"
   QWEN_SLOT_CACHE_USER="${QWEN_SLOT_CACHE_USER:-qwen-cache}"
   QWEN_SLOT_CACHE_ROOT="${QWEN_SLOT_CACHE_ROOT:-qwen-slot-cache}"
@@ -33,8 +33,10 @@ qwen_cache_validate_config() {
     || { echo >&2 "ERROR: invalid QWEN_SLOT_CACHE_MAX_GB=$QWEN_SLOT_CACHE_MAX_GB"; return 2; }
   [[ "$QWEN_SLOT_CACHE_SLOT_ID" =~ ^[0-9]+$ ]] \
     || { echo >&2 "ERROR: invalid QWEN_SLOT_CACHE_SLOT_ID=$QWEN_SLOT_CACHE_SLOT_ID"; return 2; }
+  [[ -n "$QWEN_SLOT_CACHE_HOST" ]] \
+    || { echo >&2 "ERROR: QWEN_SLOT_CACHE_HOST is not set; set it in .env to enable the slot cache"; return 2; }
   [[ "$QWEN_SLOT_CACHE_HOST" =~ ^[A-Za-z0-9._:-]+$ ]] \
-    || { echo >&2 "ERROR: unsafe QWEN_SLOT_CACHE_HOST"; return 2; }
+    || { echo >&2 "ERROR: unsafe QWEN_SLOT_CACHE_HOST=$QWEN_SLOT_CACHE_HOST"; return 2; }
   [[ "$QWEN_SLOT_CACHE_USER" =~ ^[A-Za-z0-9._-]+$ ]] \
     || { echo >&2 "ERROR: unsafe QWEN_SLOT_CACHE_USER"; return 2; }
   [[ "$QWEN_SLOT_CACHE_SESSION" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] \

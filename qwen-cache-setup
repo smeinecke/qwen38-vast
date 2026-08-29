@@ -22,14 +22,14 @@ DEDICATED Ed25519 key locally, authorizes only that key for the cache account,
 and prepares the remote cache directory. The private key is never committed or
 baked into the Docker image.
 
-Defaults come from .env. Current defaults:
-  host: 94.16.105.121
-  user: qwen-cache
-  root: qwen-slot-cache   (relative to the remote user's home)
+Defaults come from .env (see .env.example):
+  QWEN_SLOT_CACHE_HOST
+  QWEN_SLOT_CACHE_USER  (default: qwen-cache)
+  QWEN_SLOT_CACHE_ROOT  (relative to the remote user's home, default: qwen-slot-cache)
 
-If your existing server user is not qwen-cache:
-  ./qwen-cache-setup youruser@94.16.105.121
-then set QWEN_SLOT_CACHE_USER=youruser in .env.
+If your existing server user or host differs from .env:
+  ./qwen-cache-setup youruser@your-cache-host.example.com
+then set QWEN_SLOT_CACHE_USER and QWEN_SLOT_CACHE_HOST in .env.
 USAGE
 }
 
