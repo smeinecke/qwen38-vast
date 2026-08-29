@@ -97,9 +97,15 @@ qwen_up_restart() {
   [[ -n "$run_dir" ]] || { echo >&2 "ERROR: state missing run_dir"; exit 2; }
   RUN_DIR="$run_dir"
 
-  # Resume respects the mode stored in state. Passing --unsecure on the CLI is
-  # not meaningful for a secure container that already exists.
+  # Resume normally respects the mode stored in state, but allow the user to
+  # override with --unsecure (e.g. they manually switched the container image
+  # or env to unsecure and want qwen-up to re-attach in plain HTTP/TCP mode).
   QWEN_UNSECURE="$(jq -r '.unsecure // "0"' "$STATE_FILE")"
+  if [[ "${unsecure_arg:-0}" == "1" ]]; then
+    QWEN_UNSECURE=1
+    jq '. + {unsecure:1,tls:0,tls_ca:""} | del(.tunnel_pid)' "$STATE_FILE" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+    chmod 600 "$STATE_FILE"
+  fi
   QWEN_TLS_DIR=""
   QWEN_TLS_CA=""
   CURL_CA=()

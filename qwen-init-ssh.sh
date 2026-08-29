@@ -8,21 +8,24 @@ QWEN_UNSECURE="${QWEN_UNSECURE:-0}"
 QWEN_TMPFS_BASE="${QWEN_TMPFS_BASE:-/dev/shm/qwen38}"
 
 if [[ "$QWEN_UNSECURE" != "1" ]]; then
-  # In secure mode all SSH host keys and runtime authorized_keys live in tmpfs
-  # only. Nothing that could identify or authenticate this session is written to
-  # the container's persistent disk.
+  # In secure mode host private keys, TLS certs, and the llama-server socket
+  # live in tmpfs, but the authorized_keys file is kept in /root/.ssh because
+  # sshd's auth_secure_path refuses paths under world-writable directories
+  # (/dev/shm is 1777) even when the sticky bit is set. The public keys here
+  # are not a secret.
   install -d -m 0700 -o root -g root "$QWEN_TMPFS_BASE" "$QWEN_TMPFS_BASE/log" "$QWEN_TMPFS_BASE/run" "$QWEN_TMPFS_BASE/ssh" "$QWEN_TMPFS_BASE/certs" "$QWEN_TMPFS_BASE/tmp"
 
   rm -rf /var/log/qwen38 /run/qwen38
   ln -sfn "$QWEN_TMPFS_BASE/log" /var/log/qwen38
   ln -sfn "$QWEN_TMPFS_BASE/run" /run/qwen38
-
-  TMP_AUTHORIZED_KEYS="$QWEN_TMPFS_BASE/authorized_keys"
 else
   # Legacy/unsecure mode: keep host keys on disk and use standard log/run paths.
   mkdir -p /var/log/qwen38 /run/qwen38
-  TMP_AUTHORIZED_KEYS="/root/.ssh/authorized_keys"
 fi
+
+# authorized_keys is always at the standard path; it is the only part of the
+# SSH setup that sshd requires to be under a non-world-writable directory.
+TMP_AUTHORIZED_KEYS="/root/.ssh/authorized_keys"
 
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
@@ -72,10 +75,10 @@ if [[ "$QWEN_UNSECURE" != "1" ]]; then
     echo 'Include /etc/ssh/sshd_config.d/*.conf' >> /etc/ssh/sshd_config
   fi
 
-  # Use the tmpfs authorized_keys file and force key-only root access.
-  # PermitRootLogin prohibit-password means root can only authenticate by key,
-  # never by password.  This makes the security intent explicit and overrides
-  # any base-image default that may have disabled root login.
+  # Force key-only root access and keep host private keys on tmpfs.
+  # AuthorizedKeysFile is /root/.ssh/authorized_keys, not tmpfs, because sshd
+  # refuses to read authorized_keys under /dev/shm (world-writable 1777).
+  # The public keys are not a secret; only the host private keys need tmpfs.
   cat > /etc/ssh/sshd_config.d/99-qwen-secure.conf <<'EOF'
 PermitRootLogin prohibit-password
 PubkeyAuthentication yes
@@ -83,7 +86,7 @@ PasswordAuthentication no
 PermitEmptyPasswords no
 AuthenticationMethods publickey
 UsePAM no
-AuthorizedKeysFile /dev/shm/qwen38/authorized_keys
+AuthorizedKeysFile /root/.ssh/authorized_keys
 HostKey /dev/shm/qwen38/ssh/ssh_host_ed25519_key
 HostKey /dev/shm/qwen38/ssh/ssh_host_rsa_key
 EOF
