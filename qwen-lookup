@@ -109,8 +109,8 @@ fi
 ALLOW_PAID_TRAFFIC="${QWEN_ALLOW_PAID_TRAFFIC:-0}"
 
 REQUIRE_FREE_TRAFFIC="$(jq -r '.market_policy.require_free_traffic // true' "$PROFILES_FILE")"
-MAX_INET_DOWN_COST="$(jq -r '.market_policy.max_inet_down_cost // 0' "$PROFILES_FILE")"
-MAX_INET_UP_COST="$(jq -r '.market_policy.max_inet_up_cost // 0' "$PROFILES_FILE")"
+MAX_INET_DOWN_COST="${QWEN_MAX_INET_DOWN_COST:-$(jq -r '.market_policy.max_inet_down_cost // 0' "$PROFILES_FILE")}"
+MAX_INET_UP_COST="${QWEN_MAX_INET_UP_COST:-$(jq -r '.market_policy.max_inet_up_cost // 0' "$PROFILES_FILE")}"
 
 CTX_SIZE="${CTX_SIZE_OVERRIDE:-$PROFILE_CTX_SIZE}"
 GPU_QUERY="${GPU_QUERY_OVERRIDE:-$PROFILE_GPU_QUERY}"
