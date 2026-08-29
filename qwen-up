@@ -560,7 +560,7 @@ if [[ "${unverified_arg:-${QWEN_ALLOW_UNVERIFIED:-0}}" == "1" ]]; then
   GPU_QUERY="$(sed -E 's/(^|[[:space:]])reliability[[:space:]]*(>=?|<=?|=)[^[:space:]]*//g' <<<"$GPU_QUERY")"
   # squeeze repeated spaces
   GPU_QUERY="$(echo -n "$GPU_QUERY" | tr -s ' ')"
-  GPU_QUERY+=' verification in ["verified","unverified"]'
+  GPU_QUERY+=' verification in ["verified","unverified","deverified"]'
   echo "[search] allowing unverified/unknown machines (removed reliability floor)"
 fi
 

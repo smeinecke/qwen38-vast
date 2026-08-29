@@ -232,7 +232,7 @@
       "image": "v100",
       "ctx_size": 131072,
       "monitor_group": "q4-128k",
-      "gpu_query": "num_gpus>=1 gpu_name in [\"Tesla V100\"] gpu_ram>=32 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.2 disk_space>=60 rented=False rentable=True direct_port_count>=1",
+      "gpu_query": "num_gpus>=1 gpu_name in [\"Tesla V100\"] gpu_ram>=32 cpu_ram>=32 reliability>0.98 inet_down>=300 disk_bw>=200 cuda_vers>=12.2 disk_space>=60 rented=False rentable=True direct_port_count>=1",
       "monitor_search": true
     }
   ],
