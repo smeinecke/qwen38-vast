@@ -184,6 +184,10 @@ fi
 printf '[bench] session=%s profile=%s ctx=%s label=%s max_tokens=%s\n' \
   "$(basename "$run_dir")" "$profile" "$ctx_size" "$LABEL" "$MAX_TOKENS"
 
+qwen_api_url=""
+qwen_api_ca=""
+IFS=$'\t' read -r qwen_api_url _ qwen_api_ca < <(qwen_api_urls)
+
 python3 - \
   "$STATE_FILE" \
   "$prompt_source" \
@@ -191,7 +195,8 @@ python3 - \
   "$LABEL" \
   "$MAX_TOKENS" \
   "$HTTP_TIMEOUT" \
-  "http://127.0.0.1:${local_port}" \
+  "$qwen_api_url" \
+  "$qwen_api_ca" \
   "$api_key" \
   "$model" <<'PY'
 from __future__ import annotations
@@ -199,12 +204,13 @@ from __future__ import annotations
 import hashlib
 import json
 import pathlib
+import ssl
 import sys
 import time
 import urllib.error
 import urllib.request
 
-state_path, prompt_path, bench_dir_s, label, max_tokens_s, timeout_s, base_url, api_key, model = sys.argv[1:]
+state_path, prompt_path, bench_dir_s, label, max_tokens_s, timeout_s, base_url, ca_path, api_key, model = sys.argv[1:]
 bench_dir = pathlib.Path(bench_dir_s)
 max_tokens = int(max_tokens_s)
 timeout = int(timeout_s)
@@ -212,6 +218,10 @@ state = json.loads(pathlib.Path(state_path).read_text())
 state_public = {k: v for k, v in state.items() if k not in {"api_key", "tunnel_pid"}}
 prompt = pathlib.Path(prompt_path).read_text(errors="replace")
 prompt_bytes = prompt.encode("utf-8")
+
+ssl_context = None
+if ca_path:
+    ssl_context = ssl.create_default_context(cafile=ca_path)
 
 headers = {
     "Authorization": f"Bearer {api_key}",
@@ -222,7 +232,7 @@ headers = {
 def get_text(path: str) -> str | None:
     req = urllib.request.Request(base_url + path, headers={"Authorization": f"Bearer {api_key}"})
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=10, context=ssl_context) as resp:
             return resp.read().decode("utf-8", "replace")
     except Exception:
         return None
@@ -284,7 +294,7 @@ last_obj: dict = {}
 error = None
 
 try:
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=timeout, context=ssl_context) as resp:
         first_byte_s = time.perf_counter() - t0
         for raw in resp:
             line = raw.decode("utf-8", "replace").strip()

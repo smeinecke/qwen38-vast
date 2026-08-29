@@ -19,6 +19,7 @@ mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR"
 
 qwen_source_env
+QWEN_UNSECURE="${QWEN_UNSECURE:-0}"
 
 # shellcheck disable=SC1091
 source "$ROOT_DIR/.qwen-cache-lib.sh"
@@ -36,7 +37,7 @@ qwen_up_restart() {
   local slot_cache_session slot_cache_host slot_cache_port slot_cache_user slot_cache_root slot_cache_max_gb
   local ssh_url ssh_user ssh_host ssh_port
   local -a ssh_opts
-  local tunnel_pid="" base_url=""
+  local tunnel_pid="" base_url="" API_SCHEME="" API_URL=""
   local start_epoch now ready=0
   local remote_log_bytes=0
   local last_tunnel_log=0
@@ -95,6 +96,19 @@ qwen_up_restart() {
   run_dir="$(jq -r '.run_dir // empty' "$STATE_FILE")"
   [[ -n "$run_dir" ]] || { echo >&2 "ERROR: state missing run_dir"; exit 2; }
   RUN_DIR="$run_dir"
+
+  # Resume respects the mode stored in state. Passing --unsecure on the CLI is
+  # not meaningful for a secure container that already exists.
+  QWEN_UNSECURE="$(jq -r '.unsecure // "0"' "$STATE_FILE")"
+  QWEN_TLS_DIR=""
+  QWEN_TLS_CA=""
+  CURL_CA=()
+  if [[ "$QWEN_UNSECURE" != "1" ]]; then
+    QWEN_TLS_DIR="$RUN_DIR/tls"
+    qwen_tls_setup "$QWEN_TLS_DIR"
+    QWEN_TLS_CA="$QWEN_TLS_DIR/ca.crt"
+    CURL_CA=(--cacert "$QWEN_TLS_CA")
+  fi
 
   started_at="$(jq -r '.started_at // empty' "$STATE_FILE")"
   started_epoch="$(jq -r '.started_epoch // empty' "$STATE_FILE")"
@@ -202,7 +216,15 @@ qwen_up_restart() {
   tunnel_pid="$(jq -r '.tunnel_pid // empty' "$STATE_FILE")"
   ssh_url="$(jq -r '.ssh_url // empty' "$STATE_FILE")"
 
-  base_url="http://127.0.0.1:${LOCAL_PORT}/v1"
+  if [[ "$QWEN_UNSECURE" != "1" ]]; then
+    qwen_tls_deliver "$ssh_url" "$QWEN_TLS_DIR"
+    API_SCHEME="https"
+  else
+    API_SCHEME="http"
+  fi
+  API_URL="${API_SCHEME}://127.0.0.1:${LOCAL_PORT}"
+  base_url="${API_URL}/v1"
+
   cat > "$ENV_FILE" <<ENV
 export OPENAI_BASE_URL='${base_url}'
 export OPENAI_API_BASE='${base_url}'
@@ -210,7 +232,17 @@ export OPENAI_API_KEY='${MODEL_API_KEY}'
 export QWEN_MODEL='${MODEL}'
 export QWEN_PROFILE='${PROFILE}'
 export QWEN_VAST_INSTANCE_ID='${instance_id}'
+export QWEN_BASE_URL='${base_url}'
+export QWEN_API_URL='${API_URL}'
 ENV
+  if [[ "$QWEN_UNSECURE" != "1" && -n "$QWEN_TLS_CA" ]]; then
+    cat >> "$ENV_FILE" <<ENV
+export QWEN_CA_CERT='${QWEN_TLS_CA}'
+export SSL_CERT_FILE='${QWEN_TLS_CA}'
+export CURL_CA_BUNDLE='${QWEN_TLS_CA}'
+export REQUESTS_CA_BUNDLE='${QWEN_TLS_CA}'
+ENV
+  fi
   chmod 600 "$ENV_FILE"
 
   # Wait for the model and stream the remote server log while it loads.
@@ -221,9 +253,9 @@ ENV
   remote_log_bytes="${remote_log_bytes:-0}"
   while :; do
     now="$(date +%s)"
-    if curl -fsS --connect-timeout 2 --max-time 5 \
+    if curl -fsS --connect-timeout 2 --max-time 5 "${CURL_CA[@]}" \
         -H "Authorization: Bearer ${MODEL_API_KEY}" \
-        "http://127.0.0.1:${LOCAL_PORT}/health" >/dev/null 2>&1; then
+        "${API_URL}/health" >/dev/null 2>&1; then
       ready=1
       break
     fi
@@ -233,7 +265,8 @@ ENV
         LOCAL_PORT="$(jq -r '.local_port' "$STATE_FILE")"
         tunnel_pid="$(jq -r '.tunnel_pid // empty' "$STATE_FILE")"
         echo "[tunnel] SSH tunnel reconnected on localhost:$LOCAL_PORT (pid $tunnel_pid)"
-        base_url="http://127.0.0.1:${LOCAL_PORT}/v1"
+        API_URL="${API_SCHEME}://127.0.0.1:${LOCAL_PORT}"
+        base_url="${API_URL}/v1"
         cat > "$ENV_FILE" <<ENV
 export OPENAI_BASE_URL='${base_url}'
 export OPENAI_API_BASE='${base_url}'
@@ -241,7 +274,17 @@ export OPENAI_API_KEY='${MODEL_API_KEY}'
 export QWEN_MODEL='${MODEL}'
 export QWEN_PROFILE='${PROFILE}'
 export QWEN_VAST_INSTANCE_ID='${instance_id}'
+export QWEN_BASE_URL='${base_url}'
+export QWEN_API_URL='${API_URL}'
 ENV
+        if [[ "$QWEN_UNSECURE" != "1" && -n "$QWEN_TLS_CA" ]]; then
+          cat >> "$ENV_FILE" <<ENV
+export QWEN_CA_CERT='${QWEN_TLS_CA}'
+export SSL_CERT_FILE='${QWEN_TLS_CA}'
+export CURL_CA_BUNDLE='${QWEN_TLS_CA}'
+export REQUESTS_CA_BUNDLE='${QWEN_TLS_CA}'
+ENV
+        fi
         chmod 600 "$ENV_FILE"
       else
         if (( now - last_tunnel_log >= 30 )); then
@@ -297,12 +340,12 @@ ENV
   if [[ "$state_cache_enabled" == "1" && -n "$cache_signature" ]]; then
     echo "[slot-cache] restoring saved slot cache..."
     restore_rc=0
-    curl -fsS --connect-timeout 3 --max-time 600 \
+    curl -fsS --connect-timeout 3 --max-time 600 "${CURL_CA[@]}" \
       -X POST \
       -H "Authorization: Bearer ${MODEL_API_KEY}" \
       -H 'Content-Type: application/json' \
       -d '{"filename":"current.bin"}' \
-      "http://127.0.0.1:${LOCAL_PORT}/slots/${QWEN_SLOT_CACHE_SLOT_ID}?action=restore" > "$RUN_DIR/cache-restore.json" || restore_rc=$?
+      "${API_URL}/slots/${QWEN_SLOT_CACHE_SLOT_ID}?action=restore" > "$RUN_DIR/cache-restore.json" || restore_rc=$?
     if (( restore_rc == 0 )); then
       n_restored="$(jq -r '.n_restored // 0' "$RUN_DIR/cache-restore.json" 2>/dev/null || echo 0)"
       n_read="$(jq -r '.n_read // 0' "$RUN_DIR/cache-restore.json" 2>/dev/null || echo 0)"
@@ -333,9 +376,9 @@ ENV
     mv "$RUN_DIR/metadata.json.tmp" "$RUN_DIR/metadata.json"
   chmod 600 "$RUN_DIR/metadata.json"
 
-  curl -fsS --connect-timeout 2 --max-time 5 \
+  curl -fsS --connect-timeout 2 --max-time 5 "${CURL_CA[@]}" \
     -H "Authorization: Bearer ${MODEL_API_KEY}" \
-    "http://127.0.0.1:${LOCAL_PORT}/metrics" > "$RUN_DIR/metrics-ready.prom" 2>/dev/null || true
+    "${API_URL}/metrics" > "$RUN_DIR/metrics-ready.prom" 2>/dev/null || true
 
   printf '\nREADY\n'
   printf '  Profile:   %s (sm_%s)\n' "$PROFILE" "$CUDA_ARCH"
@@ -366,9 +409,14 @@ PROFILES_FILE="${QWEN_PROFILES_FILE:-$ROOT_DIR/profiles.json}"
 usage() {
   cat <<'USAGE'
 Usage:
-  ./qwen-up [PROFILE] [--session NAME] [--local-port PORT] [--max-price USD/HOUR] [--allow-paid-traffic] [--unverified] [--offer ID]
-  ./qwen-up --profile PROFILE [--session NAME] [--local-port PORT] [--max-price USD/HOUR] [--allow-paid-traffic] [--unverified] [--offer ID]
-  ./qwen-up --restart [--local-port PORT]
+  ./qwen-up [PROFILE] [--session NAME] [--local-port PORT] [--max-price USD/HOUR] [--allow-paid-traffic] [--unverified] [--unsecure] [--offer ID]
+  ./qwen-up --profile PROFILE [--session NAME] [--local-port PORT] [--max-price USD/HOUR] [--allow-paid-traffic] [--unverified] [--unsecure] [--offer ID]
+  ./qwen-up --restart [--local-port PORT] [--unsecure]
+
+By default qwen-up runs in secure mode: TLS inside the SSH tunnel, a Unix
+socket on the remote, and all logs/configs/host/TLS keys on tmpfs only. Use
+--unsecure for the legacy TCP+on-disk behavior (useful if the new image has not
+been built yet or for local debugging).
 
 Restart/resume an existing paused Vast instance from .qwen-vast/state.json.
 With --restart, qwen-up does not search the market or create a new instance;
@@ -406,6 +454,7 @@ local_port_arg=""
 max_price_arg=""
 allow_paid_arg=""
 unverified_arg=""
+unsecure_arg=""
 offer_id_arg=""
 RESTART=0
 while (( $# > 0 )); do
@@ -450,6 +499,10 @@ while (( $# > 0 )); do
       ;;
     --unverified)
       unverified_arg=1
+      shift
+      ;;
+    --unsecure)
+      unsecure_arg=1
       shift
       ;;
     --offer)
@@ -501,6 +554,9 @@ fi
 
 if [[ -n "$unverified_arg" ]]; then
   QWEN_ALLOW_UNVERIFIED="$unverified_arg"
+fi
+if [[ -n "$unsecure_arg" ]]; then
+  QWEN_UNSECURE="$unsecure_arg"
 fi
 # Validate again after CLI overrides. The initial validation above catches bad
 # .env values before any paid resources are touched.
@@ -675,6 +731,19 @@ RUN_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 RUN_STARTED_EPOCH="$(date +%s)"
 mkdir -p "$RUN_DIR"
 chmod 700 "$RUNS_DIR" "$RUN_DIR" 2>/dev/null || true
+
+# Per-run TLS certificate for secure mode. The private key stays in the local
+# run directory and is delivered to the remote container's tmpfs via SSH.
+QWEN_TLS_DIR=""
+QWEN_TLS_CA=""
+CURL_CA=()
+if [[ "$QWEN_UNSECURE" != "1" ]]; then
+  QWEN_TLS_DIR="$RUN_DIR/tls"
+  qwen_tls_setup "$QWEN_TLS_DIR"
+  QWEN_TLS_CA="$QWEN_TLS_DIR/ca.crt"
+  CURL_CA=(--cacert "$QWEN_TLS_CA")
+fi
+
 CLIENT_LOG="$RUN_DIR/client.log"
 
 # Keep a local copy of qwen-up's output. The run directory is separate from
@@ -701,7 +770,10 @@ jq -n \
   --arg slot_cache_host "$QWEN_SLOT_CACHE_HOST" \
   --arg slot_cache_user "$QWEN_SLOT_CACHE_USER" \
   --arg slot_cache_session "$QWEN_SLOT_CACHE_SESSION" \
-  '{schema_version:1,run_id:$run_id,status:$status,started_at:$started_at,profile:$profile,monitor_group:$monitor_group,gpu_query:$gpu_query,disk_gb:$disk_gb,cuda_arch:$cuda_arch,image:$image,ctx_size:$ctx_size,model:$model,hf_revision:$hf_revision,use_fastmtp:$fastmtp,cache_type_k:$cache_type_k,cache_type_v:$cache_type_v,slot_cache_enabled:$slot_cache_enabled,slot_cache_host:$slot_cache_host,slot_cache_user:$slot_cache_user,slot_cache_session:$slot_cache_session}' \
+  --argjson unsecure "${QWEN_UNSECURE:-0}" \
+  --argjson tls "${QWEN_TLS:-0}" \
+  --arg tls_ca "${QWEN_TLS_CA:-}" \
+  '{schema_version:1,run_id:$run_id,status:$status,started_at:$started_at,profile:$profile,monitor_group:$monitor_group,gpu_query:$gpu_query,disk_gb:$disk_gb,cuda_arch:$cuda_arch,image:$image,ctx_size:$ctx_size,model:$model,hf_revision:$hf_revision,use_fastmtp:$fastmtp,cache_type_k:$cache_type_k,cache_type_v:$cache_type_v,slot_cache_enabled:$slot_cache_enabled,slot_cache_host:$slot_cache_host,slot_cache_user:$slot_cache_user,slot_cache_session:$slot_cache_session,unsecure:$unsecure,tls:$tls,tls_ca:$tls_ca}' \
   > "$RUN_DIR/metadata.json"
 chmod 600 "$RUN_DIR/metadata.json"
 
@@ -834,7 +906,7 @@ printf '[rent] %s | $%.4f/h | down=%s Mbps | traffic down/up=$%s/$%s per GB | di
 # v7 uses Vast's normal entrypoint/args launch mode. Port 22 is a normal
 # Docker mapping and sshd is part of our image; Vast no longer injects a child
 # /ssh image or rewrites authorized_keys at paid-instance startup.
-docker_env="-p 22:22 -e QWEN_PROFILE=${PROFILE} -e LLAMA_API_KEY=${MODEL_API_KEY} -e MODEL=${MODEL} -e CTX_SIZE=${CTX_SIZE} -e USE_FASTMTP=${USE_FASTMTP} -e REASONING_EFFORT=${REASONING_EFFORT} -e HF_REVISION=${HF_REVISION} -e BIND_HOST=127.0.0.1 -e SLOT_SAVE_PATH=${QWEN_SLOT_CACHE_LOCAL_DIR}"
+docker_env="-p 22:22 -e QWEN_PROFILE=${PROFILE} -e LLAMA_API_KEY=${MODEL_API_KEY} -e MODEL=${MODEL} -e CTX_SIZE=${CTX_SIZE} -e USE_FASTMTP=${USE_FASTMTP} -e REASONING_EFFORT=${REASONING_EFFORT} -e HF_REVISION=${HF_REVISION} -e QWEN_UNSECURE=${QWEN_UNSECURE:-0} -e SLOT_SAVE_PATH=${QWEN_SLOT_CACHE_LOCAL_DIR}"
 if [[ -n "${CACHE_TYPE_K:-}" ]]; then
   docker_env+=" -e CACHE_TYPE_K=${CACHE_TYPE_K}"
 fi
@@ -916,7 +988,10 @@ jq -n \
   --arg slot_cache_root "$QWEN_SLOT_CACHE_ROOT" \
   --arg slot_cache_session "$QWEN_SLOT_CACHE_SESSION" \
   --argjson slot_cache_max_gb "$QWEN_SLOT_CACHE_MAX_GB" \
-  '{schema_version:1,instance_id:$instance_id,offer_id:$offer_id,gpu:$gpu,dph:$dph,local_port:$local_port,model:$model,hf_revision:$hf_revision,ctx_size:$ctx,api_key:$api_key,image:$image,label:$label,profile:$profile,monitor_group:$monitor_group,gpu_query:$gpu_query,disk_gb:$disk_gb,cuda_arch:$cuda_arch,run_id:$run_id,run_dir:$run_dir,started_at:$started_at,started_epoch:$started_epoch,run_started_at:$run_started_at,run_started_epoch:$run_started_epoch,location:$location,inet_down:$inet_down,inet_down_cost:$inet_down_cost,inet_up_cost:$inet_up_cost,disk_bw:$disk_bw,reliability:$reliability,use_fastmtp:$fastmtp,reasoning_effort:$reasoning_effort,cache_type_k:$cache_type_k,cache_type_v:$cache_type_v,slot_cache_enabled:$slot_cache_enabled,slot_cache_host:$slot_cache_host,slot_cache_port:$slot_cache_port,slot_cache_user:$slot_cache_user,slot_cache_root:$slot_cache_root,slot_cache_session:$slot_cache_session,slot_cache_max_gb:$slot_cache_max_gb}' \
+  --argjson unsecure "${QWEN_UNSECURE:-0}" \
+  --argjson tls "${QWEN_TLS:-0}" \
+  --arg tls_ca "${QWEN_TLS_CA:-}" \
+  '{schema_version:1,instance_id:$instance_id,offer_id:$offer_id,gpu:$gpu,dph:$dph,local_port:$local_port,model:$model,hf_revision:$hf_revision,ctx_size:$ctx,api_key:$api_key,image:$image,label:$label,profile:$profile,monitor_group:$monitor_group,gpu_query:$gpu_query,disk_gb:$disk_gb,cuda_arch:$cuda_arch,run_id:$run_id,run_dir:$run_dir,started_at:$started_at,started_epoch:$started_epoch,run_started_at:$run_started_at,run_started_epoch:$run_started_epoch,location:$location,inet_down:$inet_down,inet_down_cost:$inet_down_cost,inet_up_cost:$inet_up_cost,disk_bw:$disk_bw,reliability:$reliability,use_fastmtp:$fastmtp,reasoning_effort:$reasoning_effort,cache_type_k:$cache_type_k,cache_type_v:$cache_type_v,slot_cache_enabled:$slot_cache_enabled,slot_cache_host:$slot_cache_host,slot_cache_port:$slot_cache_port,slot_cache_user:$slot_cache_user,slot_cache_root:$slot_cache_root,slot_cache_session:$slot_cache_session,slot_cache_max_gb:$slot_cache_max_gb,unsecure:$unsecure,tls:$tls,tls_ca:$tls_ca}' \
   > "$STATE_FILE"
 chmod 600 "$STATE_FILE"
 sync_run_metadata "provisioning"
@@ -1055,12 +1130,22 @@ tunnel_pid="$(jq -r '.tunnel_pid // empty' "$STATE_FILE")"
 ssh_url="$(jq -r '.ssh_url // empty' "$STATE_FILE")"
 sync_run_metadata "loading-model"
 
+# In secure mode the remote start.sh waits for the TLS cert/key on tmpfs before
+# it starts llama-server. Deliver them over SSH as early as the tunnel allows.
+if [[ "$QWEN_UNSECURE" != "1" ]]; then
+  qwen_tls_deliver "$ssh_url" "$QWEN_TLS_DIR"
+  API_SCHEME="https"
+else
+  API_SCHEME="http"
+fi
+API_URL="${API_SCHEME}://127.0.0.1:${LOCAL_PORT}"
+base_url="${API_URL}/v1"
+
 # Best-effort hardware snapshot. Telemetry must never prevent startup.
 ssh "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" \
   'nvidia-smi --query-gpu=timestamp,index,name,driver_version,memory.total,power.limit --format=csv,noheader 2>/dev/null || nvidia-smi 2>/dev/null || true' \
   > "$RUN_DIR/gpu-start.txt" 2>/dev/null || true
 
-base_url="http://127.0.0.1:${LOCAL_PORT}/v1"
 cat > "$ENV_FILE" <<ENV
 export OPENAI_BASE_URL='${base_url}'
 export OPENAI_API_BASE='${base_url}'
@@ -1068,7 +1153,17 @@ export OPENAI_API_KEY='${MODEL_API_KEY}'
 export QWEN_MODEL='${MODEL}'
 export QWEN_PROFILE='${PROFILE}'
 export QWEN_VAST_INSTANCE_ID='${instance_id}'
+export QWEN_BASE_URL='${base_url}'
+export QWEN_API_URL='${API_URL}'
 ENV
+if [[ "$QWEN_UNSECURE" != "1" && -n "$QWEN_TLS_CA" ]]; then
+  cat >> "$ENV_FILE" <<ENV
+export QWEN_CA_CERT='${QWEN_TLS_CA}'
+export SSL_CERT_FILE='${QWEN_TLS_CA}'
+export CURL_CA_BUNDLE='${QWEN_TLS_CA}'
+export REQUESTS_CA_BUNDLE='${QWEN_TLS_CA}'
+ENV
+fi
 chmod 600 "$ENV_FILE"
 
 echo "[model] SSH tunnel is up; waiting for GGUF download + llama-server..."
@@ -1079,9 +1174,9 @@ remote_log_bytes="${remote_log_bytes:-0}"
 last_tunnel_log=0
 while :; do
   now="$(date +%s)"
-  if curl -fsS --connect-timeout 2 --max-time 5 \
+  if curl -fsS --connect-timeout 2 --max-time 5 "${CURL_CA[@]}" \
       -H "Authorization: Bearer ${MODEL_API_KEY}" \
-      "http://127.0.0.1:${LOCAL_PORT}/health" >/dev/null 2>&1; then
+      "${API_URL}/health" >/dev/null 2>&1; then
     ready=1
     break
   fi
@@ -1096,7 +1191,8 @@ while :; do
       LOCAL_PORT="$(jq -r '.local_port' "$STATE_FILE")"
       tunnel_pid="$(jq -r '.tunnel_pid // empty' "$STATE_FILE")"
       echo "[tunnel] SSH tunnel reconnected on localhost:$LOCAL_PORT (pid $tunnel_pid)"
-      base_url="http://127.0.0.1:${LOCAL_PORT}/v1"
+      API_URL="${API_SCHEME}://127.0.0.1:${LOCAL_PORT}"
+      base_url="${API_URL}/v1"
       cat > "$ENV_FILE" <<ENV
 export OPENAI_BASE_URL='${base_url}'
 export OPENAI_API_BASE='${base_url}'
@@ -1104,7 +1200,17 @@ export OPENAI_API_KEY='${MODEL_API_KEY}'
 export QWEN_MODEL='${MODEL}'
 export QWEN_PROFILE='${PROFILE}'
 export QWEN_VAST_INSTANCE_ID='${instance_id}'
+export QWEN_BASE_URL='${base_url}'
+export QWEN_API_URL='${API_URL}'
 ENV
+      if [[ "$QWEN_UNSECURE" != "1" && -n "$QWEN_TLS_CA" ]]; then
+        cat >> "$ENV_FILE" <<ENV
+export QWEN_CA_CERT='${QWEN_TLS_CA}'
+export SSL_CERT_FILE='${QWEN_TLS_CA}'
+export CURL_CA_BUNDLE='${QWEN_TLS_CA}'
+export REQUESTS_CA_BUNDLE='${QWEN_TLS_CA}'
+ENV
+      fi
       chmod 600 "$ENV_FILE"
     else
       if (( now - last_tunnel_log >= 30 )); then
@@ -1207,12 +1313,12 @@ PY
     echo "[slot-cache] snapshot downloaded; restoring slot ${QWEN_SLOT_CACHE_SLOT_ID}..."
     restore_file="$RUN_DIR/cache-restore.json"
     set +e
-    curl -fsS --connect-timeout 3 --max-time 600 \
+    curl -fsS --connect-timeout 3 --max-time 600 "${CURL_CA[@]}" \
       -X POST \
       -H "Authorization: Bearer ${MODEL_API_KEY}" \
       -H 'Content-Type: application/json' \
       -d '{"filename":"current.bin"}' \
-      "http://127.0.0.1:${LOCAL_PORT}/slots/${QWEN_SLOT_CACHE_SLOT_ID}?action=restore" > "$restore_file"
+      "${API_URL}/slots/${QWEN_SLOT_CACHE_SLOT_ID}?action=restore" > "$restore_file"
     restore_rc=$?
     set -e
     if (( restore_rc == 0 )); then
@@ -1249,9 +1355,9 @@ mv "$STATE_FILE.tmp" "$STATE_FILE"
 chmod 600 "$STATE_FILE"
 sync_run_metadata "ready"
 
-curl -fsS --connect-timeout 2 --max-time 5 \
+curl -fsS --connect-timeout 2 --max-time 5 "${CURL_CA[@]}" \
   -H "Authorization: Bearer ${MODEL_API_KEY}" \
-  "http://127.0.0.1:${LOCAL_PORT}/metrics" > "$RUN_DIR/metrics-ready.prom" 2>/dev/null || true
+  "${API_URL}/metrics" > "$RUN_DIR/metrics-ready.prom" 2>/dev/null || true
 
 printf '\nREADY\n' 
 printf '  Profile:   %s (sm_%s)\n' "$PROFILE" "$CUDA_ARCH"

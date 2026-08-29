@@ -31,7 +31,7 @@ ARG CCACHE_SEED=manual
 # stays unchanged. The compiler cache itself is a BuildKit cache mount, so it is
 # never copied into the image.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates ccache build-essential cmake curl git ninja-build \
+    && apt-get install -y --no-install-recommends ca-certificates ccache build-essential cmake curl git ninja-build libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 ENV CCACHE_DIR=/root/.cache/ccache \
@@ -66,6 +66,7 @@ RUN --mount=type=cache,id=qwen38-ccache,target=/root/.cache/ccache,sharing=locke
       -DGGML_NATIVE=OFF \
       -DBUILD_SHARED_LIBS=OFF \
       -DLLAMA_CURL=OFF \
+      -DLLAMA_OPENSSL=ON \
       -DLLAMA_BUILD_TESTS=OFF \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES}" \
@@ -106,6 +107,7 @@ RUN export DEBIAN_FRONTEND=noninteractive \
          locales \
          sudo \
          libgomp1 \
+         libssl3 \
          python3 \
          python3-venv \
     && python3 -m venv /venv/main \
@@ -118,14 +120,17 @@ COPY --from=builder /src/llama.cpp/build/bin/llama-server /usr/local/bin/llama-s
 COPY start.sh entrypoint.sh qwen-init-ssh.sh /usr/local/bin/
 COPY ssh/ /etc/qwen38/ssh/
 
-# llama-server is mostly statically linked, but GCC OpenMP remains a runtime
-# dependency (libgomp.so.1). Catch this in CI instead of discovering it only
-# after a paid Vast instance has downloaded the model and entered a restart loop.
+# llama-server is mostly statically linked, but GCC OpenMP and OpenSSL remain
+# runtime dependencies. Catch this in CI instead of discovering it only after a
+# paid Vast instance has downloaded the model and entered a restart loop.
 RUN ldconfig \
     && ldd /usr/local/bin/llama-server > /tmp/llama-server.ldd \
     && cat /tmp/llama-server.ldd \
     && if grep -Eq 'libgomp\.so\.1[[:space:]]*=>[[:space:]]*not found' /tmp/llama-server.ldd; then \
          echo >&2 'ERROR: libgomp.so.1 is missing from runtime image'; exit 2; \
+       fi \
+    && if grep -Eq 'lib(ssl|crypto)\.so\.[0-9]+[[:space:]]*=>[[:space:]]*not found' /tmp/llama-server.ldd; then \
+         echo >&2 'ERROR: OpenSSL runtime libraries are missing from runtime image'; exit 2; \
        fi
 
 # Fail CI rather than publishing an entrypoint-mode image that nobody can SSH

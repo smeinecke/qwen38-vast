@@ -3,6 +3,13 @@ set -Eeuo pipefail
 
 umask 077
 
+QWEN_UNSECURE="${QWEN_UNSECURE:-0}"
+QWEN_TMPFS_BASE="${QWEN_TMPFS_BASE:-/dev/shm/qwen38}"
+QWEN_TMP_DIR="${QWEN_TMP_DIR:-$QWEN_TMPFS_BASE/tmp}"
+QWEN_LOG_DIR="${QWEN_LOG_DIR:-$QWEN_TMPFS_BASE/log}"
+QWEN_CERTS_DIR="${QWEN_CERTS_DIR:-$QWEN_TMPFS_BASE/certs}"
+QWEN_TLS_WAIT_TIMEOUT="${QWEN_TLS_WAIT_TIMEOUT:-600}"
+
 HF_REPO="${HF_REPO:-HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF}"
 HF_REVISION="${HF_REVISION:-993a5971fda8f30dd1b7eb2654792ba4415c7460}"
 MODEL="${MODEL:-Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf}"
@@ -12,8 +19,6 @@ CTX_SIZE="${CTX_SIZE:-65536}"
 DEPTH="${DEPTH:-3}"
 BATCH_SIZE="${BATCH_SIZE:-2048}"
 UBATCH_SIZE="${UBATCH_SIZE:-512}"
-BIND_HOST="${BIND_HOST:-127.0.0.1}"
-PORT="${PORT:-8080}"
 REASONING_EFFORT="${REASONING_EFFORT:-xhigh}"
 USE_FASTMTP="${USE_FASTMTP:-1}"
 QWEN_PROFILE="${QWEN_PROFILE:-custom}"
@@ -26,21 +31,37 @@ if [[ -z "${LLAMA_API_KEY:-}" ]]; then
   exit 2
 fi
 
-mkdir -p "$MODEL_DIR" "$SLOT_SAVE_PATH"
+mkdir -p "$MODEL_DIR" "$SLOT_SAVE_PATH" "$QWEN_TMP_DIR" "$QWEN_LOG_DIR" "$QWEN_CERTS_DIR"
 chmod 700 "$SLOT_SAVE_PATH"
+
+if [[ "$QWEN_UNSECURE" != "1" ]]; then
+  # Ensure the log/run paths used by other tools point to tmpfs as well.
+  mkdir -p "$QWEN_TMPFS_BASE" "$QWEN_TMPFS_BASE/log" "$QWEN_TMPFS_BASE/run" \
+           "$QWEN_TMPFS_BASE/ssh" "$QWEN_TMPFS_BASE/certs" "$QWEN_TMPFS_BASE/tmp"
+  rm -rf /var/log/qwen38 /run/qwen38
+  ln -sfn "$QWEN_TMPFS_BASE/log" /var/log/qwen38
+  ln -sfn "$QWEN_TMPFS_BASE/run" /run/qwen38
+  # Guard the socket and certs on tmpfs so only the container owner can reach
+  # them, even though the parent /dev/shm is world-writable.
+  chmod 700 "$QWEN_TMPFS_BASE"
+fi
 
 # Validate the executable before downloading tens of GB. A missing runtime
 # library otherwise causes a crash only after model transfer and looks like an
 # intermittent SSH/tunnel problem from the client side.
 echo "[runtime] validating llama-server dependencies..."
-if ! /usr/local/bin/llama-server --version >/tmp/llama-version.txt 2>/tmp/llama-version.err; then
-  cat /tmp/llama-version.err >&2 || true
+LLAMA_VERSION_OUT="$(mktemp -p "$QWEN_TMP_DIR")"
+LLAMA_VERSION_ERR="$(mktemp -p "$QWEN_TMP_DIR")"
+trap 'rm -f "$LLAMA_VERSION_OUT" "$LLAMA_VERSION_ERR"' EXIT
+
+if ! /usr/local/bin/llama-server --version >"$LLAMA_VERSION_OUT" 2>"$LLAMA_VERSION_ERR"; then
+  cat "$LLAMA_VERSION_ERR" >&2 || true
   echo >&2 "[runtime] linked libraries:"
   ldd /usr/local/bin/llama-server >&2 || true
   echo >&2 "ERROR: llama-server runtime preflight failed; refusing model download."
   exit 70
 fi
-cat /tmp/llama-version.txt
+cat "$LLAMA_VERSION_OUT"
 
 download_file() {
   local filename="$1"
@@ -75,8 +96,6 @@ server_args=(
   --reasoning-effort "$REASONING_EFFORT"
   --reasoning-preserve
   --reasoning-format deepseek
-  --host "$BIND_HOST"
-  --port "$PORT"
   --api-key "$LLAMA_API_KEY"
   --metrics
   --slots
@@ -107,7 +126,47 @@ fi
 # Do not forward the Hugging Face credential into llama-server's environment.
 unset HF_TOKEN HUGGING_FACE_HUB_TOKEN || true
 
-echo "[serve] profile=$QWEN_PROFILE model=$MODEL revision=$HF_REVISION ctx=$CTX_SIZE fastmtp=$USE_FASTMTP bind=$BIND_HOST:$PORT slot_save_path=$SLOT_SAVE_PATH"
+if [[ "$QWEN_UNSECURE" == "1" ]]; then
+  # Legacy path: TCP on loopback. Cert handling is skipped.
+  BIND_HOST="${BIND_HOST:-127.0.0.1}"
+  PORT="${PORT:-8080}"
+  server_args+=(
+    --host "$BIND_HOST"
+    --port "$PORT"
+  )
+  llama_bind="$BIND_HOST:$PORT"
+else
+  # Secure path: HTTPS over a Unix domain socket on tmpfs.
+  llama_socket="$QWEN_TMPFS_BASE/llama.sock"
+  cert_file="$QWEN_CERTS_DIR/server.crt"
+  key_file="$QWEN_CERTS_DIR/server.key"
+
+  echo "[secure] waiting for TLS certificate delivery to tmpfs (timeout ${QWEN_TLS_WAIT_TIMEOUT}s)..."
+  waited=0
+  while [[ ! -f "$cert_file" || ! -f "$key_file" ]]; do
+    if (( waited >= QWEN_TLS_WAIT_TIMEOUT )); then
+      echo >&2 "ERROR: TLS certificate/key did not arrive at $QWEN_CERTS_DIR within ${QWEN_TLS_WAIT_TIMEOUT}s."
+      echo >&2 "       Run qwen-up without --unsecure, or check the SSH delivery to the Vast host."
+      exit 70
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  # Drop certificate material from the environment so it is not visible in
+  # /proc/<pid>/environ after we have written it to tmpfs.
+  unset QWEN_TLS_CERT_B64 QWEN_TLS_KEY_B64 || true
+
+  # The llama-server treats any --host value ending in .sock as a Unix socket.
+  server_args+=(
+    --host "$llama_socket"
+    --ssl-cert-file "$cert_file"
+    --ssl-key-file "$key_file"
+  )
+  llama_bind="unix://$llama_socket"
+fi
+
+echo "[serve] profile=$QWEN_PROFILE model=$MODEL revision=$HF_REVISION ctx=$CTX_SIZE fastmtp=$USE_FASTMTP bind=$llama_bind slot_save_path=$SLOT_SAVE_PATH"
 echo "[runtime] GPU snapshot:"
 nvidia-smi --query-gpu=timestamp,index,name,driver_version,memory.total,power.limit --format=csv,noheader 2>&1 || nvidia-smi 2>&1 || true
 exec /usr/local/bin/llama-server "${server_args[@]}"

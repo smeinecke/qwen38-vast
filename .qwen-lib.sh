@@ -251,16 +251,99 @@ REMOTE
   printf '%s\n' "$output"
 }
 
+qwen_api_scheme_and_ca() {
+  local tls_ca
+  [[ -f "$STATE_FILE" ]] || return 1
+  tls_ca="$(jq -r '.tls_ca // empty' "$STATE_FILE")"
+  if [[ -n "$tls_ca" && -f "$tls_ca" ]]; then
+    printf '%s\t%s\n' "https" "$tls_ca"
+  else
+    printf '%s\t%s\n' "http" ""
+  fi
+}
+
 qwen_api_healthy() {
-  local local_port api_key
+  local local_port api_key scheme ca
   [[ -f "$STATE_FILE" ]] || return 1
   local_port="$(jq -r '.local_port // empty' "$STATE_FILE")"
   local_port="${local_port:-${LOCAL_PORT:-18080}}"
   api_key="$(jq -r '.api_key // empty' "$STATE_FILE")"
   [[ -n "$api_key" ]] || return 1
-  curl -fsS --connect-timeout 2 --max-time 4 \
+  IFS=$'\t' read -r scheme ca < <(qwen_api_scheme_and_ca)
+  local ca_opt=()
+  [[ -n "$ca" ]] && ca_opt=("--cacert" "$ca")
+  curl -fsS --connect-timeout 2 --max-time 4 "${ca_opt[@]}" \
     -H "Authorization: Bearer $api_key" \
-    "http://127.0.0.1:${local_port}/health" >/dev/null 2>&1
+    "${scheme}://127.0.0.1:${local_port}/health" >/dev/null 2>&1
+}
+
+# Build the base (scheme + host:port) and the /v1 endpoint URLs from the
+# persisted state. Scripts should call this instead of hard-coding http://.
+qwen_api_urls() {
+  local local_port scheme ca
+  [[ -f "$STATE_FILE" ]] || return 1
+  local_port="$(jq -r '.local_port // empty' "$STATE_FILE")"
+  local_port="${local_port:-${LOCAL_PORT:-18080}}"
+  IFS=$'\t' read -r scheme ca < <(qwen_api_scheme_and_ca)
+  printf '%s\t%s\t%s\n' "${scheme}://127.0.0.1:${local_port}" "${scheme}://127.0.0.1:${local_port}/v1" "${ca}"
+}
+
+# Return extra curl arguments for the current scheme/CA.
+qwen_api_curl_ca() {
+  local ca
+  IFS=$'\t' read -r _ _ ca < <(qwen_api_urls)
+  if [[ -n "$ca" && -f "$ca" ]]; then
+    printf '%s\n' "--cacert" "$ca"
+  fi
+}
+
+qwen_tls_setup() {
+  local tls_dir="${1:-}"
+  [[ -n "$tls_dir" ]] || { echo >&2 "ERROR: qwen_tls_setup requires a tls_dir"; return 1; }
+  if [[ -f "$tls_dir/ca.crt" && -f "$tls_dir/server.crt" && -f "$tls_dir/server.key" ]]; then
+    return 0
+  fi
+  install -d -m 700 "$tls_dir"
+  if ! openssl req -x509 -newkey rsa:2048 -keyout "$tls_dir/server.key" -out "$tls_dir/server.crt" \
+       -days 1 -nodes -subj "/CN=qwen38" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null; then
+    echo >&2 "ERROR: failed to generate local TLS certificate. Is OpenSSL >= 1.1.1 installed?"
+    return 1
+  fi
+  chmod 600 "$tls_dir/server.key"
+  cp "$tls_dir/server.crt" "$tls_dir/ca.crt"
+}
+
+# Deliver the generated TLS certificate and private key to the remote container's
+# tmpfs over SSH. The key never lives in Docker environment variables or in the
+# container's persistent disk.
+qwen_tls_deliver() {
+  local ssh_url="${1:-}" tls_dir="${2:-}"
+  local ssh_user ssh_host ssh_port
+  local -a ssh_opts
+  [[ -n "$ssh_url" && -n "$tls_dir" ]] || { echo >&2 "ERROR: qwen_tls_deliver requires ssh_url and tls_dir"; return 1; }
+
+  IFS=' ' read -r ssh_user ssh_host ssh_port < <(python3 - "$ssh_url" <<'PY'
+from urllib.parse import urlparse
+import sys
+u = urlparse(sys.argv[1])
+print(u.username or "root", u.hostname or "", u.port or 22)
+PY
+  )
+  [[ -n "$ssh_host" ]] || return 1
+  mapfile -d '' -t ssh_opts < <(qwen_ssh_opts "$ssh_port")
+
+  if [[ ! -f "$tls_dir/server.crt" || ! -f "$tls_dir/server.key" ]]; then
+    echo >&2 "ERROR: qwen_tls_deliver: missing $tls_dir/server.crt or $tls_dir/server.key"
+    return 1
+  fi
+
+  echo "[secure] delivering TLS certificate to remote tmpfs..."
+  ssh "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" \
+    'install -d -m 700 /dev/shm/qwen38/certs && cat > /dev/shm/qwen38/certs/server.crt' < "$tls_dir/server.crt"
+  ssh "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" \
+    'cat > /dev/shm/qwen38/certs/server.key' < "$tls_dir/server.key"
+  ssh "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" \
+    'chmod 600 /dev/shm/qwen38/certs/server.key'
 }
 
 qwen_port_is_free() {
@@ -381,9 +464,17 @@ _qwen_ensure_tunnel_locked() {
   mkdir -p "$(dirname "$KNOWN_HOSTS")"
   local tunnel_log="${TUNNEL_LOG:-$(dirname "$STATE_FILE")/tunnel.log}"
   : > "$tunnel_log"
+
+  local remote_dest
+  if [[ "$(jq -r '.unsecure // "0"' "$STATE_FILE")" == "1" ]]; then
+    remote_dest="127.0.0.1:8080"
+  else
+    remote_dest="/dev/shm/qwen38/llama.sock"
+  fi
+
   nohup ssh "${opts[@]}" \
     -o ExitOnForwardFailure=yes \
-    -N -L "${local_port}:127.0.0.1:8080" \
+    -N -L "${local_port}:${remote_dest}" \
     "${ssh_user}@${ssh_host}" >"$tunnel_log" 2>&1 &
   tunnel_pid=$!
   sleep 2

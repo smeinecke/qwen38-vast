@@ -163,10 +163,14 @@ else
   echo "SSH tunnel: not running"
 fi
 
-if [[ -n "$api_key" ]] && curl -fsS --connect-timeout 2 --max-time 4 \
-  -H "Authorization: Bearer $api_key" "http://127.0.0.1:${local_port}/health" >/dev/null 2>&1; then
+if qwen_api_healthy; then
   echo "llama-server: healthy"
-  metrics="$(curl -fsS --connect-timeout 2 --max-time 4 -H "Authorization: Bearer $api_key" "http://127.0.0.1:${local_port}/metrics" 2>/dev/null || true)"
+  api_url=""
+  ca=""
+  IFS=$'\t' read -r api_url _ ca < <(qwen_api_urls)
+  ca_opt=()
+  [[ -n "$ca" ]] && ca_opt=("--cacert" "$ca")
+  metrics="$(curl -fsS --connect-timeout 2 --max-time 4 "${ca_opt[@]}" -H "Authorization: Bearer $api_key" "${api_url}/metrics" 2>/dev/null || true)"
   if [[ -n "$metrics" ]]; then
     printf '%s\n' "$metrics" | python3 -c '
 import json, sys

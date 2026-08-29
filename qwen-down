@@ -177,13 +177,17 @@ save_slot_cache() {
   # Vast NVMe. This can take a while for a long Qwen3.8 context.
   echo "[slot-cache] saving slot ${QWEN_SLOT_CACHE_SLOT_ID} before destroy..."
   save_response="$run_dir/cache-save.json"
+  local api_url="" ca=""
+  IFS=$'\t' read -r api_url _ ca < <(qwen_api_urls)
+  local ca_opt=()
+  [[ -n "$ca" ]] && ca_opt=("--cacert" "$ca")
   set +e
-  curl -fsS --connect-timeout 3 --max-time 1800 \
+  curl -fsS --connect-timeout 3 --max-time 1800 "${ca_opt[@]}" \
     -X POST \
     -H "Authorization: Bearer ${api_key}" \
     -H 'Content-Type: application/json' \
     -d '{"filename":"current.bin"}' \
-    "http://127.0.0.1:${local_port}/slots/${QWEN_SLOT_CACHE_SLOT_ID}?action=save" > "$save_response"
+    "${api_url}/slots/${QWEN_SLOT_CACHE_SLOT_ID}?action=save" > "$save_response"
   cache_save_api_rc=$?
   set -e
   if (( cache_save_api_rc != 0 )); then
@@ -266,9 +270,13 @@ archive_session() {
   # Scrape counters before killing the tunnel. This is best effort: benchmarks
   # already save per-request timings, so shutdown must never depend on metrics.
   if [[ -n "$api_key" ]]; then
-    curl -fsS --connect-timeout 2 --max-time 8 \
+    local api_url="" ca=""
+    IFS=$'\t' read -r api_url _ ca < <(qwen_api_urls)
+    local ca_opt=()
+    [[ -n "$ca" ]] && ca_opt=("--cacert" "$ca")
+    curl -fsS --connect-timeout 2 --max-time 8 "${ca_opt[@]}" \
       -H "Authorization: Bearer $api_key" \
-      "http://127.0.0.1:${local_port}/metrics" \
+      "${api_url}/metrics" \
       > "$run_dir/metrics-final.prom" 2>/dev/null || true
   fi
 

@@ -139,12 +139,17 @@ chmod 700 "$RUNS_DIR" "$run_dir" 2>/dev/null || true
 echo "[slot-cache] saving slot ${SLOT_ID}..."
 save_response="$run_dir/cache-save.json"
 cache_save_api_rc=0
-curl -fsS --connect-timeout 3 --max-time 1800 \
+copy_api_url=""
+copy_ca=""
+IFS=$'\t' read -r copy_api_url _ copy_ca < <(qwen_api_urls)
+copy_ca_opt=()
+[[ -n "$copy_ca" ]] && copy_ca_opt=("--cacert" "$copy_ca")
+curl -fsS --connect-timeout 3 --max-time 1800 "${copy_ca_opt[@]}" \
   -X POST \
   -H "Authorization: Bearer ${api_key}" \
   -H 'Content-Type: application/json' \
   -d '{"filename":"current.bin"}' \
-  "http://127.0.0.1:${local_port}/slots/${SLOT_ID}?action=save" > "$save_response" || cache_save_api_rc=$?
+  "${copy_api_url}/slots/${SLOT_ID}?action=save" > "$save_response" || cache_save_api_rc=$?
 
 if (( cache_save_api_rc != 0 )); then
   echo >&2 "[slot-cache] ERROR: llama.cpp slot save API failed"
