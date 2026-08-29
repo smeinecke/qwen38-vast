@@ -31,7 +31,7 @@ ARG CCACHE_SEED=manual
 # stays unchanged. The compiler cache itself is a BuildKit cache mount, so it is
 # never copied into the image.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ccache build-essential cmake ninja-build git \
+    && apt-get install -y --no-install-recommends ca-certificates ccache build-essential cmake curl git ninja-build \
     && rm -rf /var/lib/apt/lists/*
 
 ENV CCACHE_DIR=/root/.cache/ccache \
