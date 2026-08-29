@@ -359,6 +359,46 @@ _qwen_ensure_tunnel_locked() {
   return 0
 }
 
+# Try to show a desktop notification using whatever tool is available on the
+# current OS. Designed for background monitors that may not have a TTY visible.
+qwen_desktop_notify() {
+  local title="${1:-qwen38}"
+  local body="${2:-}"
+  [[ -z "$body" ]] && return 0
+
+  # Linux/libnotify via D-Bus. Nohup'd daemons often lose DBUS_SESSION_BUS_ADDRESS,
+  # so fall back to the common systemd user bus path.
+  if command -v notify-send >/dev/null 2>&1; then
+    if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+      local dbus_path="/run/user/$(id - u 2>/dev/null)/bus"
+      [[ -S "$dbus_path" ]] && export DBUS_SESSION_BUS_ADDRESS="unix:path=$dbus_path"
+    fi
+    notify-send "$title" "$body" >/dev/null 2>&1 && return 0
+  fi
+
+  # KDE/Plasma.
+  if command -v kdialog >/dev/null 2>&1; then
+    kdialog --passivepopup "$body" 10 --title "$title" >/dev/null 2>&1 && return 0
+  fi
+
+  # macOS.
+  if command -v osascript >/dev/null 2>&1; then
+    osascript -e "display notification \"$body\" with title \"$title\"" >/dev/null 2>&1 && return 0
+  fi
+
+  # Windows (WSL).
+  if command -v powershell.exe >/dev/null 2>&1; then
+    powershell.exe -Command "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('$body', '$title')" >/dev/null 2>&1 && return 0
+  fi
+
+  # Last-ditch: terminal bell and a message to every local login.
+  printf '\a'
+  if command -v wall >/dev/null 2>&1; then
+    printf '%s\n' "$title: $body" | wall -n >/dev/null 2>&1 || true
+  fi
+  return 1
+}
+
 # Run an arbitrary vastai command with a wall-clock timeout. Kills the whole
 # process group on timeout and returns the captured stdout.
 _qwen_vast_action_timeout() {

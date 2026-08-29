@@ -3,6 +3,10 @@ set -Eeuo pipefail
 export LC_NUMERIC=C
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+# shellcheck disable=SC1091
+source "$ROOT_DIR/.qwen-lib.sh"
+
 STATE_DIR="$ROOT_DIR/.qwen-vast"
 STATE_FILE="$STATE_DIR/state.json"
 PROFILES_FILE="${QWEN_PROFILES_FILE:-$ROOT_DIR/profiles.json}"
@@ -24,6 +28,9 @@ INTERVAL="${QWEN_MONITOR_INTERVAL:-180}"
 MAX_RESULTS="${QWEN_MONITOR_MAX_RESULTS:-5}"
 SAME_PROFILE=0
 QUIET=0
+SEARCH_MODE=0
+PROFILE_ARG=""
+MAX_PRICE_ARG=""
 ALLOW_PAID_TRAFFIC="${QWEN_ALLOW_PAID_TRAFFIC:-0}"
 REQUIRE_FREE_TRAFFIC="$(jq -r '.market_policy.require_free_traffic // true' "$PROFILES_FILE" 2>/dev/null || echo true)"
 MAX_INET_DOWN_COST="$(jq -r '.market_policy.max_inet_down_cost // 0' "$PROFILES_FILE" 2>/dev/null || echo 0)"
@@ -32,26 +39,31 @@ MAX_INET_UP_COST="$(jq -r '.market_policy.max_inet_up_cost // 0' "$PROFILES_FILE
 usage() {
   cat <<'USAGE'
 Usage:
-  ./qwen-monitor once [options]     check now (default)
-  ./qwen-monitor watch [options]    check repeatedly in foreground
-  ./qwen-monitor start [options]    start background monitor
-  ./qwen-monitor stop [--quiet]     stop background monitor
-  ./qwen-monitor status             show monitor state / last alert
-  ./qwen-monitor logs               tail background monitor log
+  ./qwen-monitor once [options]              check now (default)
+  ./qwen-monitor watch [options]             check repeatedly in foreground
+  ./qwen-monitor start [options]             start background monitor
+  ./qwen-monitor stop [--quiet]              stop background monitor
+  ./qwen-monitor status                      show monitor state / last alert
+  ./qwen-monitor logs                        tail background monitor log
 
 Options:
-  --threshold PCT      minimum saving before alert (default: 10)
-  --interval SECONDS   polling interval for watch/start (default: 180)
-  --max-results N      number of qualifying offers to print (default: 5)
-  --same-profile       only search the running profile, not compatible profiles
+  --threshold PCT       minimum saving before alert (default: 10)
+  --max-price USD/HOUR  absolute maximum $/h for an alert (overrides threshold)
+  --interval SECONDS    polling interval for watch/start (default: 180)
+  --max-results N       number of qualifying offers to print (default: 5)
+  --profile PROFILE     monitor a specific profile without a running VM
+  --same-profile        only search the running profile, not compatible profiles
 
-Candidate profiles must use exactly the same context size as the running instance.
-Offers are then filtered by the concrete GPU model using monitor_hardware.gpu_ranks
-in profiles.json: only the same hardware class or a higher-ranked GPU is eligible.
-For example, an A6000 run will not alert on a cheaper A40. Unknown GPU models are
-excluded conservatively. If CTX_SIZE_OVERRIDE uses a context for which no explicit
-profile exists, qwen-monitor falls back to the running profile and preserves the
-override in its switch command.
+With a running VM, qwen-monitor compares the current price against the market.
+Without a VM, use --profile and --max-price to search for any cheap offer for
+that profile. Example:
+  ./qwen-monitor start --profile a6000 --max-price 0.35
+
+Candidate profiles must use exactly the same context size as the running instance
+(or the selected --profile). Offers are then filtered by the concrete GPU model
+using monitor_hardware.gpu_ranks in profiles.json: only the same hardware class
+or a higher-ranked GPU is eligible. In search mode (--profile) the hardware rank
+filter is skipped because there is no current GPU.
 USAGE
 }
 
@@ -60,8 +72,10 @@ if [[ $# -gt 0 ]]; then shift; fi
 while (( $# > 0 )); do
   case "$1" in
     --threshold) THRESHOLD="${2:?--threshold requires a value}"; shift 2 ;;
+    --max-price) MAX_PRICE_ARG="${2:?--max-price requires a value}"; shift 2 ;;
     --interval) INTERVAL="${2:?--interval requires a value}"; shift 2 ;;
     --max-results) MAX_RESULTS="${2:?--max-results requires a value}"; shift 2 ;;
+    --profile) PROFILE_ARG="${2:?--profile requires a value}"; shift 2 ;;
     --same-profile) SAME_PROFILE=1; shift ;;
     --quiet) QUIET=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -75,6 +89,29 @@ import sys
 x=float(sys.argv[1]); assert x >= 0
 PY
 done
+
+if [[ -n "$MAX_PRICE_ARG" ]]; then
+  if ! python3 - "$MAX_PRICE_ARG" <<'PY' >/dev/null 2>&1
+import sys
+try:
+    x=float(sys.argv[1]); assert x > 0
+except Exception:
+    raise SystemExit(1)
+PY
+  then
+    echo >&2 "ERROR: --max-price must be a positive number"
+    exit 2
+  fi
+fi
+
+if [[ -n "$PROFILE_ARG" ]]; then
+  SEARCH_MODE=1
+  SAME_PROFILE=1
+  if [[ -z "$MAX_PRICE_ARG" ]]; then
+    echo >&2 "ERROR: --profile requires --max-price"
+    exit 2
+  fi
+fi
 
 mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR" 2>/dev/null || true
@@ -100,8 +137,31 @@ normalize_offers() {
 }
 
 load_current() {
-  [[ -f "$STATE_FILE" ]] || { echo >&2 "ERROR: no running qwen state. Start with ./qwen-up first."; return 3; }
   [[ -f "$PROFILES_FILE" ]] || { echo >&2 "ERROR: profiles file not found: $PROFILES_FILE"; return 2; }
+
+  if (( SEARCH_MODE == 1 )); then
+    current_profile="$PROFILE_ARG"
+    current_profile_json="$(jq -c --arg p "$current_profile" '[.profiles[] | select(.name == $p)][0] // empty' "$PROFILES_FILE")"
+    [[ -n "$current_profile_json" && "$current_profile_json" != null ]] || {
+      echo >&2 "ERROR: profile '$current_profile' is not present in profiles.json"
+      return 2
+    }
+    current_ctx="$(jq -r '.ctx_size' <<<"$current_profile_json")"
+    monitor_group="$(jq -r '.monitor_group // empty' <<<"$current_profile_json")"
+    disk_gb="$(jq -r '.disk_gb // empty' "$STATE_FILE" 2>/dev/null || true)"
+    disk_gb="${disk_gb:-${DISK_GB:-100}}"
+
+    # Search mode: no current GPU, so no hardware-rank filter.
+    current_gpu="?"
+    current_location="?"
+    current_hardware_rank=-2
+    current_session="default"
+    current_dph="$MAX_PRICE_ARG"
+    target_dph="$MAX_PRICE_ARG"
+    return 0
+  fi
+
+  [[ -f "$STATE_FILE" ]] || { echo >&2 "ERROR: no running qwen state. Start with ./qwen-up first, or use --profile and --max-price."; return 3; }
 
   instance_id="$(jq -r '.instance_id // empty' "$STATE_FILE")"
   current_profile="$(jq -r '.profile // empty' "$STATE_FILE")"
@@ -145,11 +205,15 @@ load_current() {
     (( QUIET == 1 )) || echo >&2 "[monitor] WARNING: current GPU '$current_gpu' has no monitor_hardware rank; only the exact same GPU name will be accepted."
   fi
 
-  target_dph="$(python3 - "$current_dph" "$THRESHOLD" <<'PY'
+  if [[ -n "$MAX_PRICE_ARG" ]]; then
+    target_dph="$MAX_PRICE_ARG"
+  else
+    target_dph="$(python3 - "$current_dph" "$THRESHOLD" <<'PY'
 import sys
 cur=float(sys.argv[1]); pct=float(sys.argv[2]); print(f"{cur*(1-pct/100):.12f}")
 PY
 )"
+  fi
 }
 
 candidate_profiles_json() {
@@ -201,7 +265,8 @@ search_once_json() {
     --argjson threshold "$THRESHOLD" --argjson current "$current_dph" \
     --arg require_free "$REQUIRE_FREE_TRAFFIC" --argjson allow_paid "$ALLOW_PAID_TRAFFIC" \
     --argjson max_down "$MAX_INET_DOWN_COST" --argjson max_up "$MAX_INET_UP_COST" \
-    --argjson target "$target_dph" --argjson limit "$MAX_RESULTS" '
+    --argjson target "$target_dph" --argjson limit "$MAX_RESULTS" \
+    --argjson search_mode "$SEARCH_MODE" '
     def oid: (.id // .ask_contract_id // -1);
     def normgpu($s): ($s // "") | ascii_downcase | gsub("[^a-z0-9]"; "");
     def rank_for($s):
@@ -210,14 +275,22 @@ search_once_json() {
        | .rank][0] // null;
     [ .[]
       | . + {_hardware_rank: rank_for(.gpu_name // "")}
-      | select(._effective_dph < $current)
+      | select(
+          if $search_mode == 1 then
+            (._effective_dph <= $target)
+          else
+            (._effective_dph < $current)
+          end
+        )
       | select(
           if ($require_free == "true" and $allow_paid != 1) then
             ((.inet_down_cost // 999999) <= $max_down and (.inet_up_cost // 999999) <= $max_up)
           else true end
         )
       | select(
-          if $current_rank >= 0 then
+          if $search_mode == 1 then
+            true
+          elif $current_rank >= 0 then
             (._hardware_rank != null and ._hardware_rank >= $current_rank)
           else
             normgpu(.gpu_name // "") == normgpu($current_gpu)
@@ -236,13 +309,22 @@ search_once_json() {
 print_result() {
   local result="$1" count best best_profile best_gpu best_dph best_save
   count="$(jq '.offers | length' <<<"$result")"
-  printf '[monitor] current: %s | hw-rank=%s | profile=%s | ctx=%s | $%.4f/h | %s\n' \
-    "$current_gpu" "$current_hardware_rank" "$current_profile" "$current_ctx" "$current_dph" "$current_location"
-  printf '[monitor] alert threshold: %.1f%% cheaper => <= $%.4f/h\n' "$THRESHOLD" "$target_dph"
+  if (( SEARCH_MODE == 1 )); then
+    printf '[monitor] search: profile=%s | ctx=%s | max=$%.4f/h\n' \
+      "$current_profile" "$current_ctx" "$target_dph"
+  else
+    printf '[monitor] current: %s | hw-rank=%s | profile=%s | ctx=%s | $%.4f/h | %s\n' \
+      "$current_gpu" "$current_hardware_rank" "$current_profile" "$current_ctx" "$current_dph" "$current_location"
+    printf '[monitor] alert threshold: %.1f%% cheaper => <= $%.4f/h\n' "$THRESHOLD" "$target_dph"
+  fi
 
   profiles_line="$(candidate_profiles_json | jq -r '[.[].name] | join(", ")')"
   printf '[monitor] same-context search profiles: %s\n' "$profiles_line"
-  echo '[monitor] hardware policy: same-or-better only'
+  if (( SEARCH_MODE == 1 )); then
+    echo '[monitor] hardware policy: any GPU (search mode)'
+  else
+    echo '[monitor] hardware policy: same-or-better only'
+  fi
   if [[ "$REQUIRE_FREE_TRAFFIC" == "true" && "$ALLOW_PAID_TRAFFIC" != "1" ]]; then
     printf '[monitor] traffic policy: free only (download <= $%s/GB, upload <= $%s/GB)\n' "$MAX_INET_DOWN_COST" "$MAX_INET_UP_COST"
   else
@@ -277,13 +359,23 @@ print_result() {
   best_dph="$(jq -r '._effective_dph' <<<"$best")"
   best_save="$(jq -r '._saving_pct' <<<"$best")"
   printf '\n[monitor] BEST: %s / %s at $%.4f/h (%.1f%% cheaper)\n' "$best_profile" "$best_gpu" "$best_dph" "$best_save"
-  printf '[monitor] safe switch (slot cache is preserved by qwen-down/up):\n'
-  printf '  uv run ./qwen-down --yes\n'
-  best_profile_ctx="$(jq -r --arg p "$best_profile" '[.profiles[] | select(.name == $p)][0].ctx_size // 0' "$PROFILES_FILE")"
-  if [[ "$best_profile_ctx" == "$current_ctx" ]]; then
-    printf '  uv run ./qwen-up %q --session %q\n' "$best_profile" "$current_session"
+  if (( SEARCH_MODE == 1 )); then
+    printf '[monitor] start command:\n'
+    best_profile_ctx="$(jq -r --arg p "$best_profile" '[.profiles[] | select(.name == $p)][0].ctx_size // 0' "$PROFILES_FILE")"
+    if [[ "$best_profile_ctx" == "$current_ctx" ]]; then
+      printf '  uv run ./qwen-up %q\n' "$best_profile"
+    else
+      printf '  CTX_SIZE_OVERRIDE=%q uv run ./qwen-up %q\n' "$current_ctx" "$best_profile"
+    fi
   else
-    printf '  CTX_SIZE_OVERRIDE=%q uv run ./qwen-up %q --session %q\n' "$current_ctx" "$best_profile" "$current_session"
+    printf '[monitor] safe switch (slot cache is preserved by qwen-down/up):\n'
+    printf '  uv run ./qwen-down --yes\n'
+    best_profile_ctx="$(jq -r --arg p "$best_profile" '[.profiles[] | select(.name == $p)][0].ctx_size // 0' "$PROFILES_FILE")"
+    if [[ "$best_profile_ctx" == "$current_ctx" ]]; then
+      printf '  uv run ./qwen-up %q --session %q\n' "$best_profile" "$current_session"
+    else
+      printf '  CTX_SIZE_OVERRIDE=%q uv run ./qwen-up %q --session %q\n' "$current_ctx" "$best_profile" "$current_session"
+    fi
   fi
 }
 
@@ -304,13 +396,19 @@ write_alert_if_changed() {
     --argjson current_dph "$current_dph" --argjson ctx "$current_ctx" --arg session "$current_session" --argjson best "$best" \
     '{created_at:$at,current_profile:$current_profile,current_gpu:$current_gpu,current_dph:$current_dph,ctx_size:$ctx,session:$session,best_offer:$best}' > "$ALERT_FILE"
 
-  local bp bg bd bs
+  local bp bg bd bs notif_title notif_body
   bp="$(jq -r '._monitor_profile' <<<"$best")"; bg="$(jq -r '.gpu_name // "?"' <<<"$best")"
   bd="$(jq -r '._effective_dph' <<<"$best")"; bs="$(jq -r '._saving_pct' <<<"$best")"
-  printf '\a[ALERT] %s / %s: $%.4f/h, %.1f%% cheaper than current $%.4f/h\n' "$bp" "$bg" "$bd" "$bs" "$current_dph"
-  if command -v notify-send >/dev/null 2>&1; then
-    notify-send "Qwen Vast: cheaper GPU available" "$bg / $bp: \$$bd/h (${bs}% cheaper)" >/dev/null 2>&1 || true
+  if (( SEARCH_MODE == 1 )); then
+    notif_title="Qwen Vast: offer under \$$current_dph/h"
+    notif_body="$bp / $bg: \$$bd/h"
+    printf '\a[ALERT] %s / %s: $%.4f/h (max $%.4f/h)\n' "$bp" "$bg" "$bd" "$current_dph"
+  else
+    notif_title="Qwen Vast: cheaper GPU available"
+    notif_body="$bg / $bp: \$$bd/h (${bs}% cheaper)"
+    printf '\a[ALERT] %s / %s: $%.4f/h, %.1f%% cheaper than current $%.4f/h\n' "$bp" "$bg" "$bd" "$bs" "$current_dph"
   fi
+  qwen_desktop_notify "$notif_title" "$notif_body"
 }
 
 run_once() {
@@ -353,6 +451,8 @@ case "$COMMAND" in
     rm -f "$PID_FILE"
     start_args=(run --threshold "$THRESHOLD" --interval "$INTERVAL" --max-results "$MAX_RESULTS")
     (( SAME_PROFILE == 1 )) && start_args+=(--same-profile)
+    [[ -n "$MAX_PRICE_ARG" ]] && start_args+=(--max-price "$MAX_PRICE_ARG")
+    [[ -n "$PROFILE_ARG" ]] && start_args+=(--profile "$PROFILE_ARG")
     nohup "$0" "${start_args[@]}" >> "$LOG_FILE" 2>&1 < /dev/null &
     pid=$!
     echo "$pid" > "$PID_FILE"
