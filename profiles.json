@@ -25,8 +25,8 @@
       "cuda_arch": "70",
       "image_tag": "v100",
       "description": "Tesla V100 / Volta SM70",
-      "builder_base": "nvidia/cuda:12.2.2-cudnn-devel-ubuntu22.04",
-      "runtime_base": "nvidia/cuda:12.2.2-runtime-ubuntu22.04"
+      "builder_base": "nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04",
+      "runtime_base": "nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04"
     }
   ],
   "profiles": [
