@@ -66,8 +66,23 @@ chown root:root "$TMP_AUTHORIZED_KEYS"
 chmod 0600 "$TMP_AUTHORIZED_KEYS"
 
 if [[ "$QWEN_UNSECURE" != "1" ]]; then
-  # Use the tmpfs authorized_keys file.
+  # Some base images do not include sshd_config.d by default, or the Include
+  # line is missing. Make sure the drop-in directory is loaded.
+  if ! grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config.d/\*\.conf' /etc/ssh/sshd_config; then
+    echo 'Include /etc/ssh/sshd_config.d/*.conf' >> /etc/ssh/sshd_config
+  fi
+
+  # Use the tmpfs authorized_keys file and force key-only root access.
+  # PermitRootLogin prohibit-password means root can only authenticate by key,
+  # never by password.  This makes the security intent explicit and overrides
+  # any base-image default that may have disabled root login.
   cat > /etc/ssh/sshd_config.d/99-qwen-secure.conf <<'EOF'
+PermitRootLogin prohibit-password
+PubkeyAuthentication yes
+PasswordAuthentication no
+PermitEmptyPasswords no
+AuthenticationMethods publickey
+UsePAM no
 AuthorizedKeysFile /dev/shm/qwen38/authorized_keys
 HostKey /dev/shm/qwen38/ssh/ssh_host_ed25519_key
 HostKey /dev/shm/qwen38/ssh/ssh_host_rsa_key
@@ -83,8 +98,21 @@ EOF
   done
 else
   # Legacy mode: remove any secure drop-in so the default /etc/ssh host keys are
-  # used, and generate them on disk if absent.
+  # used, and generate them on disk if absent. Still force key-only root and
+  # make sure sshd_config.d is loaded if the base image omits it.
   rm -f /etc/ssh/sshd_config.d/99-qwen-secure.conf
+  if ! grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config.d/\*\.conf' /etc/ssh/sshd_config; then
+    echo 'Include /etc/ssh/sshd_config.d/*.conf' >> /etc/ssh/sshd_config
+  fi
+  cat > /etc/ssh/sshd_config.d/99-qwen.conf <<'EOF'
+PermitRootLogin prohibit-password
+PubkeyAuthentication yes
+PasswordAuthentication no
+PermitEmptyPasswords no
+AuthenticationMethods publickey
+UsePAM no
+EOF
+  chmod 0600 /etc/ssh/sshd_config.d/99-qwen.conf
   ssh-keygen -A >/dev/null
 fi
 
@@ -95,3 +123,10 @@ printf '[ssh] authorized keys: %s | mode=%s owner=%s\n' \
   "$(wc -l < "$TMP_AUTHORIZED_KEYS" | tr -d ' ')" \
   "$(stat -c '%a' "$TMP_AUTHORIZED_KEYS")" \
   "$(stat -c '%U:%G' "$TMP_AUTHORIZED_KEYS")"
+
+# Validate the resulting sshd configuration before entrypoint starts sshd. A
+# config error here is far easier to diagnose than sshd exiting in a restart loop.
+if ! /usr/sbin/sshd -t 2>&1 | tee /var/log/qwen38/sshd-config-test.log; then
+  echo >&2 "ERROR: sshd configuration test failed; see /var/log/qwen38/sshd-config-test.log"
+  exit 5
+fi
