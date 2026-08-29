@@ -3,6 +3,36 @@
 # have been defined. Functions deliberately use only standard tools already
 # required by the qwen-* scripts.
 
+# Source a .env file without overwriting variables that are already set in the
+# current environment. This lets users override .env values with command-line
+# env vars such as MAX_DPH=0.22 ./qwen-up ....
+qwen_source_env() {
+  local env_file="${1:-$ROOT_DIR/.env}"
+  [[ -f "$env_file" ]] || return 0
+  local line key val
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+    [[ "$line" == *"="* ]] || continue
+    key="${line%%=*}"
+    val="${line#*=}"
+    # trim leading/trailing whitespace from key
+    key="${key#"${key%%[![:space:]]*}"}"
+    key="${key%"${key##*[![:space:]]}"}"
+    # optional `export ` prefix
+    if [[ "$key" == export* ]]; then
+      key="${key#export}"
+      key="${key#"${key%%[![:space:]]*}"}"
+      key="${key%"${key##*[![:space:]]}"}"
+    fi
+    [[ -z "$key" ]] && continue
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    # preserve existing environment (allows CLI override)
+    [[ -n "${!key+set}" ]] && continue
+    export "$key=$val"
+  done < "$env_file"
+}
+
 qwen_parse_ssh_text() {
   python3 -c '
 import json, re, sys

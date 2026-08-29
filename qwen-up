@@ -18,12 +18,7 @@ source "$ROOT_DIR/.qwen-lib.sh"
 mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR"
 
-if [[ -f "$ROOT_DIR/.env" ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source "$ROOT_DIR/.env"
-  set +a
-fi
+qwen_source_env
 
 # shellcheck disable=SC1091
 source "$ROOT_DIR/.qwen-cache-lib.sh"
@@ -371,8 +366,8 @@ PROFILES_FILE="${QWEN_PROFILES_FILE:-$ROOT_DIR/profiles.json}"
 usage() {
   cat <<'USAGE'
 Usage:
-  ./qwen-up [PROFILE] [--session NAME] [--local-port PORT]
-  ./qwen-up --profile PROFILE [--session NAME] [--local-port PORT]
+  ./qwen-up [PROFILE] [--session NAME] [--local-port PORT] [--max-price USD/HOUR] [--allow-paid-traffic]
+  ./qwen-up --profile PROFILE [--session NAME] [--local-port PORT] [--max-price USD/HOUR] [--allow-paid-traffic]
   ./qwen-up --restart [--local-port PORT]
 
 Restart/resume an existing paused Vast instance from .qwen-vast/state.json.
@@ -397,6 +392,7 @@ Examples:
   ./qwen-up a6000-128k
   ./qwen-up blackwell-128k
   ./qwen-up a6000-128k --session my-project
+  ./qwen-up v100-128k --max-price 0.22 --allow-paid-traffic
   CTX_SIZE_OVERRIDE=98304 ./qwen-up a6000
 
 Use *_OVERRIDE variables only for intentional one-off tests.
@@ -406,6 +402,8 @@ USAGE
 profile_arg=""
 cache_session_arg=""
 local_port_arg=""
+max_price_arg=""
+allow_paid_arg=""
 RESTART=0
 while (( $# > 0 )); do
   case "$1" in
@@ -432,6 +430,20 @@ while (( $# > 0 )); do
       fi
       local_port_arg="$2"
       shift 2
+      ;;
+    --max-price)
+      [[ -n "${2:-}" ]] || { echo >&2 "ERROR: --max-price requires a value"; exit 2; }
+      if [[ ! "${2:-}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        echo >&2 "ERROR: --max-price must be a positive number"
+        usage >&2
+        exit 2
+      fi
+      max_price_arg="$2"
+      shift 2
+      ;;
+    --allow-paid-traffic)
+      allow_paid_arg=1
+      shift
       ;;
     --restart)
       RESTART=1
@@ -460,6 +472,14 @@ fi
 
 if [[ -n "$cache_session_arg" ]]; then
   QWEN_SLOT_CACHE_SESSION="$cache_session_arg"
+fi
+
+if [[ -n "$max_price_arg" ]]; then
+  MAX_DPH="$max_price_arg"
+fi
+
+if [[ -n "$allow_paid_arg" ]]; then
+  QWEN_ALLOW_PAID_TRAFFIC="$allow_paid_arg"
 fi
 # Validate again after CLI overrides. The initial validation above catches bad
 # .env values before any paid resources are touched.
