@@ -190,7 +190,9 @@ jq -r --argjson n "$max_results_arg" '
       (.machine_id // "?"),
       (.num_gpus // "?"),
       (.gpu_name // "?"),
-      (.dph_total // .dph_base // "?"),
+      (.dph_total // "?"),
+      (.dph_base // "?"),
+      (.discounted_dph_total // "?"),
       (.reliability2 // .reliability // "?"),
       (.verification // "?"),
       (.geolocation // "?"),
@@ -198,4 +200,4 @@ jq -r --argjson n "$max_results_arg" '
       (.inet_up_cost // 0)
     ]
   | @tsv
-' <<<"$matches" | column -t -s $'\t' -N "id,machine_id,num_gpus,gpu,dph_total,reliability,verification,location,inet_down_cost,inet_up_cost"
+' <<<"$matches" | column -t -s $'\t' -N "id,machine_id,num_gpus,gpu,dph_total,dph_base,discounted_dph_total,reliability,verification,location,inet_down_cost,inet_up_cost"
