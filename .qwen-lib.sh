@@ -135,6 +135,30 @@ qwen_ssh_sanitize_known_hosts() {
   ssh-keygen -R "${host}" -f "$KNOWN_HOSTS" >/dev/null 2>&1 || true
 }
 
+# Stop the remote llama.cpp/llama-server process on a Vast host.  Best-effort:
+# the destroy step will hard-kill the container afterwards, but this ensures
+# the slot state cannot be reused if Vast takes a while to drop the instance.
+qwen_stop_remote_model() {
+  local ssh_url="${1:-}"
+  local ssh_user ssh_host ssh_port
+  [[ -n "$ssh_url" ]] || return 0
+
+  IFS=' ' read -r ssh_user ssh_host ssh_port < <(python3 - "$ssh_url" <<'PY'
+from urllib.parse import urlparse
+import sys
+u = urlparse(sys.argv[1])
+print(u.username or "root", u.hostname or "", u.port or 22)
+PY
+  )
+  [[ -n "$ssh_host" ]] || return 0
+
+  local -a ssh_opts
+  mapfile -d '' -t ssh_opts < <(qwen_ssh_opts "$ssh_port")
+  ssh -n "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" \
+    'pkill -TERM llama-server 2>/dev/null || true; sleep 2; pkill -KILL llama-server 2>/dev/null || true' \
+    >/dev/null 2>&1 || true
+}
+
 qwen_api_healthy() {
   local local_port api_key
   [[ -f "$STATE_FILE" ]] || return 1

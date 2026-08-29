@@ -311,6 +311,14 @@ if (( ARCHIVE == 1 )); then
   archive_session || echo >&2 "[archive] warning: telemetry archive was incomplete"
 fi
 
+# Stop the inference process after the cache has been safely uploaded and
+# telemetry has been scraped, but before the instance is destroyed (or if the
+# destroy itself is delayed, so the slot state cannot be reused).
+if [[ -n "$ssh_url" ]]; then
+  echo "[down] stopping llama.cpp server..."
+  qwen_stop_remote_model "$ssh_url"
+fi
+
 # End the local tunnel only after metrics/logs have been copied.
 if [[ -n "$tunnel_pid" ]] && kill -0 "$tunnel_pid" >/dev/null 2>&1; then
   kill "$tunnel_pid" >/dev/null 2>&1 || true
