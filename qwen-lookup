@@ -106,7 +106,9 @@ MAX_DPH="${MAX_DPH:-0.80}"
 if [[ -n "$allow_paid_arg" ]]; then
   QWEN_ALLOW_PAID_TRAFFIC="$allow_paid_arg"
 fi
-ALLOW_PAID_TRAFFIC="${QWEN_ALLOW_PAID_TRAFFIC:-0}"
+# qwen-lookup is a market scanner: by default it shows paid-traffic offers too,
+# so cheap machines don't get hidden. Set QWEN_ALLOW_PAID_TRAFFIC=0 to hide them.
+ALLOW_PAID_TRAFFIC="${QWEN_ALLOW_PAID_TRAFFIC:-1}"
 
 REQUIRE_FREE_TRAFFIC="$(jq -r '.market_policy.require_free_traffic // true' "$PROFILES_FILE")"
 MAX_INET_DOWN_COST="${QWEN_MAX_INET_DOWN_COST:-$(jq -r '.market_policy.max_inet_down_cost // 0' "$PROFILES_FILE")}"
