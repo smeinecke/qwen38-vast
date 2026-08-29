@@ -1120,14 +1120,16 @@ if qwen_cache_enabled && [[ -n "$cache_signature" ]]; then
     # Poll the remote download and show a progress bar until rsync finishes.
     # This keeps qwen-up in the foreground and visible while the snapshot is
     # being pulled from the cache server.
-    local part_bytes total_bytes last_pct=""
+    part_bytes=""
+    total_bytes=""
+    last_pct=""
     echo "[slot-cache] waiting for snapshot download..."
     (
       while :; do
         part_bytes="$(ssh "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" 'stat -c %s /var/lib/qwen38/slots/current.bin.part 2>/dev/null || echo 0' 2>/dev/null || echo 0)"
         total_bytes="$(ssh "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" 'cat /run/qwen38/cache-prefetch.total 2>/dev/null || echo 0' 2>/dev/null || echo 0)"
         if [[ "$part_bytes" =~ ^[0-9]+$ && "$total_bytes" =~ ^[0-9]+$ && "$total_bytes" -gt 0 ]]; then
-          local pct
+          pct=""
           pct="$(python3 - "$part_bytes" "$total_bytes" <<'PY'
 import sys
 b=int(sys.argv[1]); t=int(sys.argv[2])
@@ -1143,7 +1145,7 @@ PY
         sleep 2
       done
     ) &
-    local cache_prefetch_progress_pid=$!
+    cache_prefetch_progress_pid=$!
     wait "$cache_prefetch_pid" >/dev/null 2>&1 || true
     cache_prefetch_pid=""
     kill "$cache_prefetch_progress_pid" >/dev/null 2>&1 || true
