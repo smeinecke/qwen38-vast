@@ -37,7 +37,18 @@ jobs:
       - name: Build matrix from profiles.json
         id: matrix
         run: |
-          matrix="$(jq -c '{include:[.images[] | {profile:.name,cuda_arch:.cuda_arch,image_tag:.image_tag,description:.description}]}' profiles.json)"
+          matrix="$(jq -c '{
+            include:[
+              .images[] | {
+                profile:.name,
+                cuda_arch:.cuda_arch,
+                image_tag:.image_tag,
+                description:.description,
+                builder_base:(.builder_base // "vastai/base-image:cuda-12.8.1-cudnn-devel-ubuntu24.04-py312"),
+                runtime_base:(.runtime_base // "nvidia/cuda:12.8.1-runtime-ubuntu24.04")
+              }
+            ]
+          }' profiles.json)"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "$matrix" | jq .
 
@@ -119,6 +130,8 @@ jobs:
           platforms: linux/amd64
           push: true
           build-args: |
+            BUILDER_BASE=${{ matrix.builder_base }}
+            RUNTIME_BASE=${{ matrix.runtime_base }}
             CUDA_ARCHITECTURES=${{ matrix.cuda_arch }}
             QWEN_BUILD_PROFILE=${{ matrix.profile }}
             CCACHE_SEED=${{ hashFiles('Dockerfile') }}

@@ -1,8 +1,9 @@
 # syntax=docker/dockerfile:1.7
 
-# Compile against CUDA 12.8 in a full devel image, but ship a much smaller CUDA
+# Compile against CUDA in a full devel image, but ship a much smaller CUDA
 # runtime image. The previous runtime inherited the ~multi-GB devel toolchain,
 # which was unnecessary on disposable inference hosts.
+# Older architectures (e.g. Volta V100 / SM70) are pinned to a CUDA 12.2 base.
 ARG BUILDER_BASE=vastai/base-image:cuda-12.8.1-cudnn-devel-ubuntu24.04-py312
 ARG RUNTIME_BASE=nvidia/cuda:12.8.1-runtime-ubuntu24.04
 
@@ -30,7 +31,7 @@ ARG CCACHE_SEED=manual
 # stays unchanged. The compiler cache itself is a BuildKit cache mount, so it is
 # never copied into the image.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ccache \
+    && apt-get install -y --no-install-recommends ccache build-essential cmake ninja-build git \
     && rm -rf /var/lib/apt/lists/*
 
 ENV CCACHE_DIR=/root/.cache/ccache \

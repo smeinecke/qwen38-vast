@@ -700,6 +700,11 @@ on_signal() {
 trap on_signal INT TERM
 
 printf '[profile] %s | sm_%s | ctx=%s | image=%s\n' "$PROFILE" "$CUDA_ARCH" "$CTX_SIZE" "$SELECTED_IMAGE"
+# Apply MAX_DPH to the Vast query itself, not just the post-search filter, so
+# Vast can return more cheap offers and we don't accidentally rely on dph_base.
+if [[ "$GPU_QUERY" != *"dph"* ]]; then
+  GPU_QUERY="$GPU_QUERY dph_total <= $MAX_DPH"
+fi
 printf '[search] %s\n' "$GPU_QUERY"
 offers_raw="$(vastai search offers "$GPU_QUERY" --order dph_total --limit 25 --storage "$DISK_GB" --raw)"
 
@@ -717,7 +722,7 @@ offer="$(jq -c --argjson max "$MAX_DPH" \
   --argjson max_down "$MAX_INET_DOWN_COST" \
   --argjson max_up "$MAX_INET_UP_COST" '
   [ .[]
-    | ._effective_dph = (.dph_total // .dph_base // 999999)
+    | ._effective_dph = (.dph_total // 999999)
     | select(._effective_dph <= $max)
     | select(
         if ($require_free == "true" and $allow_paid != 1) then
