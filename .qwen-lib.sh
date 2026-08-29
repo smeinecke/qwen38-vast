@@ -159,6 +159,56 @@ PY
     >/dev/null 2>&1 || true
 }
 
+# Fetch remote startup status and any new server-log lines since last_lines.
+# Outputs three blocks:
+#   __QWEN_START_EXIT__:<rc or empty>
+#   __QWEN_LOG_TOTAL__:<current line count>
+#   <new log lines>
+# This is used by qwen-up to watch the model download / llama-server load and
+# to detect a failing start.sh without issuing a separate SSH call each loop.
+qwen_remote_startup_status() {
+  local ssh_url="${1:-}"
+  local last_lines="${2:-0}"
+  local count_only="${3:-}"
+  local ssh_user ssh_host ssh_port
+  [[ -n "$ssh_url" ]] || return 0
+
+  IFS=' ' read -r ssh_user ssh_host ssh_port < <(python3 - "$ssh_url" <<'PY'
+from urllib.parse import urlparse
+import sys
+u = urlparse(sys.argv[1])
+print(u.username or "root", u.hostname or "", u.port or 22)
+PY
+  )
+  [[ -n "$ssh_host" ]] || return 0
+
+  local -a ssh_opts
+  local output
+  mapfile -d '' -t ssh_opts < <(qwen_ssh_opts "$ssh_port")
+  output="$(
+    ssh "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" bash -s -- "$last_lines" "$count_only" <<'REMOTE' 2>/dev/null
+set +e
+last_lines="$1"
+count_only="$2"
+start_exit_rc=$(cat /run/qwen38/start.exitcode 2>/dev/null || true)
+total_lines=$(wc -l < /var/log/qwen38/server.log 2>/dev/null || echo 0)
+printf '%s\n' "__QWEN_START_EXIT__:${start_exit_rc}"
+printf '%s\n' "__QWEN_LOG_TOTAL__:${total_lines}"
+if [[ -z "$count_only" && "$total_lines" =~ ^[0-9]+$ ]]; then
+  if (( total_lines >= last_lines )); then
+    new_lines=$((total_lines - last_lines))
+    if (( new_lines > 0 )); then
+      tail -n "$new_lines" /var/log/qwen38/server.log
+    fi
+  else
+    tail -n "$total_lines" /var/log/qwen38/server.log
+  fi
+fi
+REMOTE
+  )" || true
+  printf '%s\n' "$output"
+}
+
 qwen_api_healthy() {
   local local_port api_key
   [[ -f "$STATE_FILE" ]] || return 1

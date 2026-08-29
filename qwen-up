@@ -630,7 +630,11 @@ ENV
 chmod 600 "$ENV_FILE"
 
 echo "[model] SSH tunnel is up; waiting for GGUF download + llama-server..."
-last_log=0
+# Start tailing from the current end of the log so we don't dump the whole file.
+remote_log_init="$(qwen_remote_startup_status "$ssh_url" 0 "count" 2>/dev/null || true)"
+remote_log_lines="$(printf '%s\n' "$remote_log_init" | sed -n 's/^__QWEN_LOG_TOTAL__://p')"
+remote_log_lines="${remote_log_lines:-0}"
+last_tunnel_log=0
 while :; do
   now="$(date +%s)"
   if curl -fsS --connect-timeout 2 --max-time 5 \
@@ -661,7 +665,8 @@ export QWEN_VAST_INSTANCE_ID='${instance_id}'
 ENV
       chmod 600 "$ENV_FILE"
     else
-      if (( now - last_log >= 30 )); then
+      if (( now - last_tunnel_log >= 30 )); then
+        last_tunnel_log="$now"
         echo >&2 "[tunnel] SSH connection temporarily unavailable; waiting for Vast host to recover..."
       fi
       sleep 5
@@ -669,28 +674,38 @@ ENV
     fi
   fi
 
+  # Poll start.sh state and stream any new server-log lines (download/loading
+  # progress) in a single SSH round trip.
+  remote_status="$(qwen_remote_startup_status "$ssh_url" "$remote_log_lines" 2>/dev/null || true)"
+  start_exit_rc="$(printf '%s\n' "$remote_status" | sed -n 's/^__QWEN_START_EXIT__://p')"
+  new_total="$(printf '%s\n' "$remote_status" | sed -n 's/^__QWEN_LOG_TOTAL__://p')"
+  new_log_output="$(printf '%s\n' "$remote_status" | sed '/^__QWEN_START_EXIT__:/d; /^__QWEN_LOG_TOTAL__:/d')"
+
+  if [[ -n "$new_log_output" ]]; then
+    printf '%s\n' "$new_log_output" | sed 's/^/[remote] /' || true
+  fi
+  if [[ "$new_total" =~ ^[0-9]+$ ]]; then
+    remote_log_lines="$new_total"
+  fi
+
   # entrypoint.sh keeps sshd alive when start.sh exits. Detect that marker
   # immediately instead of waiting for START_TIMEOUT while reconnecting a
   # perfectly healthy SSH daemon to a dead model server.
-  start_exit_rc="$(ssh "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" 'cat /run/qwen38/start.exitcode 2>/dev/null || true' 2>/dev/null || true)"
   if [[ "$start_exit_rc" =~ ^[0-9]+$ ]]; then
     echo >&2 "[model] ERROR: remote start.sh exited with rc=$start_exit_rc"
-    ssh "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" 'tail -n 60 /var/log/qwen38/server.log 2>/dev/null || true' 2>/dev/null | sed 's/^/[remote] /' >&2 || true
+    echo >&2 "[model] last remote log lines:"
+    printf '%s\n' "$new_log_output" | sed 's/^/[remote] /' >&2 || true
     cleanup_paid_instance "remote model server exited (rc=$start_exit_rc)"
     exit 8
   fi
 
   if (( now - start_epoch > START_TIMEOUT )); then
     echo >&2 "[model] last remote log lines:"
-    ssh "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" 'tail -n 20 /var/log/qwen38/server.log 2>/dev/null || true' >&2 || true
+    ssh -n "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" 'tail -n 20 /var/log/qwen38/server.log 2>/dev/null || true' >&2 || true
     cleanup_paid_instance "startup timeout while loading model"
     exit 8
   fi
 
-  if (( now - last_log >= 30 )); then
-    last_log="$now"
-    ssh "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" 'tail -n 2 /var/log/qwen38/server.log 2>/dev/null || true' 2>/dev/null | sed 's/^/[remote] /' || true
-  fi
   sleep 5
 done
 
