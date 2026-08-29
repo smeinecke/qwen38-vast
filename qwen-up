@@ -366,8 +366,8 @@ PROFILES_FILE="${QWEN_PROFILES_FILE:-$ROOT_DIR/profiles.json}"
 usage() {
   cat <<'USAGE'
 Usage:
-  ./qwen-up [PROFILE] [--session NAME] [--local-port PORT] [--max-price USD/HOUR] [--allow-paid-traffic]
-  ./qwen-up --profile PROFILE [--session NAME] [--local-port PORT] [--max-price USD/HOUR] [--allow-paid-traffic]
+  ./qwen-up [PROFILE] [--session NAME] [--local-port PORT] [--max-price USD/HOUR] [--allow-paid-traffic] [--unverified]
+  ./qwen-up --profile PROFILE [--session NAME] [--local-port PORT] [--max-price USD/HOUR] [--allow-paid-traffic] [--unverified]
   ./qwen-up --restart [--local-port PORT]
 
 Restart/resume an existing paused Vast instance from .qwen-vast/state.json.
@@ -404,6 +404,7 @@ cache_session_arg=""
 local_port_arg=""
 max_price_arg=""
 allow_paid_arg=""
+unverified_arg=""
 RESTART=0
 while (( $# > 0 )); do
   case "$1" in
@@ -445,6 +446,10 @@ while (( $# > 0 )); do
       allow_paid_arg=1
       shift
       ;;
+    --unverified)
+      unverified_arg=1
+      shift
+      ;;
     --restart)
       RESTART=1
       shift
@@ -480,6 +485,10 @@ fi
 
 if [[ -n "$allow_paid_arg" ]]; then
   QWEN_ALLOW_PAID_TRAFFIC="$allow_paid_arg"
+fi
+
+if [[ -n "$unverified_arg" ]]; then
+  QWEN_ALLOW_UNVERIFIED="$unverified_arg"
 fi
 # Validate again after CLI overrides. The initial validation above catches bad
 # .env values before any paid resources are touched.
@@ -531,6 +540,18 @@ fi
 
 CTX_SIZE="${CTX_SIZE_OVERRIDE:-$PROFILE_CTX_SIZE}"
 GPU_QUERY="${GPU_QUERY_OVERRIDE:-$PROFILE_GPU_QUERY}"
+
+if [[ "${unverified_arg:-${QWEN_ALLOW_UNVERIFIED:-0}}" == "1" ]]; then
+  # Allow unverified/unknown hosts. This removes the profile's reliability
+  # floor (unverified machines often have no/missing reliability) and forces
+  # Vast to consider both verification states.
+  GPU_QUERY="$(sed -E 's/(^|[[:space:]])reliability[[:space:]]*(>=?|<=?|=)[^[:space:]]*//g' <<<"$GPU_QUERY")"
+  # squeeze repeated spaces
+  GPU_QUERY="$(echo -n "$GPU_QUERY" | tr -s ' ')"
+  GPU_QUERY+=' verification in ["verified","unverified"]'
+  echo "[search] allowing unverified/unknown machines (removed reliability floor)"
+fi
+
 MAX_DPH="${MAX_DPH:-0.80}"
 REQUIRE_FREE_TRAFFIC="$(jq -r '.market_policy.require_free_traffic // true' "$PROFILES_FILE")"
 MAX_INET_DOWN_COST="$(jq -r '.market_policy.max_inet_down_cost // 0' "$PROFILES_FILE")"
