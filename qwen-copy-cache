@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+# Manually save slot 0 (or --slot N) and upload it to the persistent cache
+# server without destroying the Vast instance. Useful for verifying the cache
+# save/upload path before running qwen-down.
+#
+# Usage:
+#   ./qwen-copy-cache [--slot N]
+#
+# The script leaves the Vast instance and SSH tunnel running.
+set -Eeuo pipefail
+
+export LC_NUMERIC=C
+
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+STATE_DIR="$ROOT_DIR/.qwen-vast"
+STATE_FILE="$STATE_DIR/state.json"
+KNOWN_HOSTS="$STATE_DIR/known_hosts"
+RUNS_DIR="${QWEN_RUNS_DIR:-$ROOT_DIR/.qwen-runs}"
+
+# shellcheck disable=SC1091
+source "$ROOT_DIR/.qwen-lib.sh"
+
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"
+
+if [[ -f "$ROOT_DIR/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$ROOT_DIR/.env"
+  set +a
+fi
+
+# shellcheck disable=SC1091
+source "$ROOT_DIR/.qwen-cache-lib.sh"
+qwen_cache_load_config
+qwen_cache_validate_config
+
+SLOT_ID="${QWEN_SLOT_CACHE_SLOT_ID:-0}"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  ./qwen-copy-cache [--slot N]
+
+Save the current llama.cpp slot to the Vast NVMe and then upload it to the
+persistent cache server. The instance is kept running so you can verify the
+remote snapshot before destroying it with ./qwen-down.
+USAGE
+}
+
+while (( $# > 0 )); do
+  case "$1" in
+    --slot)
+      [[ -n "${2:-}" ]] || { echo >&2 "ERROR: --slot requires a value"; exit 2; }
+      SLOT_ID="$2"
+      shift 2
+      ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo >&2 "ERROR: unknown option: $1"; usage >&2; exit 2 ;;
+  esac
+done
+
+[[ "$SLOT_ID" =~ ^[0-9]+$ ]] || { echo >&2 "ERROR: invalid slot id: $SLOT_ID"; exit 2; }
+QWEN_SLOT_CACHE_SLOT_ID="$SLOT_ID"
+
+for cmd in vastai jq python3 ssh scp curl; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo >&2 "ERROR: missing dependency: $cmd"; exit 2; }
+done
+
+if [[ ! -f "$STATE_FILE" ]]; then
+  echo "No local qwen38 Vast state found. Start an instance with ./qwen-up first."
+  exit 1
+fi
+
+qwen_cache_enabled || { echo "Slot cache is disabled; nothing to do."; exit 0; }
+qwen_cache_require_key || exit $?
+
+if ! qwen_ensure_tunnel; then
+  echo >&2 "ERROR: could not establish API tunnel to the Vast instance"
+  exit 1
+fi
+
+if ! qwen_refresh_ssh_state; then
+  echo >&2 "ERROR: Vast SSH endpoint is not available"
+  exit 1
+fi
+
+instance_id="$(jq -r '.instance_id // empty' "$STATE_FILE")"
+[[ -n "$instance_id" ]] || { echo >&2 "ERROR: no instance_id in state"; exit 1; }
+
+local_port="$(jq -r '.local_port // 18080' "$STATE_FILE")"
+api_key="$(jq -r '.api_key // empty' "$STATE_FILE")"
+[[ -n "$api_key" ]] || { echo >&2 "ERROR: API key missing from state"; exit 1; }
+
+model="$(jq -r '.model // empty' "$STATE_FILE")"
+hf_revision="$(jq -r '.hf_revision // empty' "$STATE_FILE")"
+hf_revision="${hf_revision:-${HF_REVISION:-993a5971fda8f30dd1b7eb2654792ba4415c7460}}"
+ctx_size="$(jq -r '.ctx_size // 0' "$STATE_FILE")"
+use_fastmtp="$(jq -r '.use_fastmtp // 1' "$STATE_FILE")"
+profile="$(jq -r '.profile // "unknown"' "$STATE_FILE")"
+cache_type_k="$(jq -r '.cache_type_k // "default"' "$STATE_FILE")"
+cache_type_v="$(jq -r '.cache_type_v // "default"' "$STATE_FILE")"
+llama_commit="$(jq -r '.llama_cpp_commit // empty' "$STATE_FILE")"
+cache_signature="$(jq -r '.slot_cache_signature // empty' "$STATE_FILE")"
+
+if [[ -n "$llama_commit" && ! "$llama_commit" =~ ^[a-f0-9]+$ ]]; then
+  llama_commit=""
+  cache_signature=""
+fi
+
+endpoint=""
+IFS=$'\t' read -r cache_vast_user cache_vast_host cache_vast_port _ <<<"$(qwen_refresh_ssh_state 2>/dev/null)"
+[[ -n "$cache_vast_host" && "$cache_vast_port" =~ ^[0-9]+$ ]] || { echo >&2 "ERROR: could not resolve Vast SSH endpoint"; exit 1; }
+mapfile -d '' -t cache_vast_ssh_opts < <(qwen_ssh_opts "$cache_vast_port")
+
+if ! qwen_cache_copy_key_to_vast "$cache_vast_user" "$cache_vast_host" "$cache_vast_port"; then
+  echo >&2 "ERROR: could not install cache key on Vast host"
+  exit 1
+fi
+
+if [[ -z "$llama_commit" ]]; then
+  build_json="$(ssh "${cache_vast_ssh_opts[@]}" "${cache_vast_user}@${cache_vast_host}" 'cat /etc/qwen38-build.json 2>/dev/null || true' 2>/dev/null | head -n 1 || true)"
+  llama_commit="$(jq -r '.llama_cpp_commit // "unknown"' <<<"${build_json:-{}}" 2>/dev/null | head -n 1)"
+  [[ "$llama_commit" == "unknown" || "$llama_commit" =~ ^[a-f0-9]+$ ]] || llama_commit="unknown"
+fi
+
+if [[ -z "$cache_signature" ]]; then
+  cache_signature="$(qwen_cache_signature "$llama_commit" "$model" "$hf_revision" "$ctx_size" "$use_fastmtp" "$cache_type_k" "$cache_type_v")"
+fi
+
+cache_remote_dir="$(qwen_cache_remote_dir "$cache_signature")"
+
+timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+run_id="${timestamp}-copy-cache-${instance_id}"
+run_dir="$RUNS_DIR/$run_id"
+mkdir -p "$run_dir"
+chmod 700 "$RUNS_DIR" "$run_dir" 2>/dev/null || true
+
+echo "[slot-cache] saving slot ${SLOT_ID}..."
+save_response="$run_dir/cache-save.json"
+cache_save_api_rc=0
+curl -fsS --connect-timeout 3 --max-time 1800 \
+  -X POST \
+  -H "Authorization: Bearer ${api_key}" \
+  -H 'Content-Type: application/json' \
+  -d '{"filename":"current.bin"}' \
+  "http://127.0.0.1:${local_port}/slots/${SLOT_ID}?action=save" > "$save_response" || cache_save_api_rc=$?
+
+if (( cache_save_api_rc != 0 )); then
+  echo >&2 "[slot-cache] ERROR: llama.cpp slot save API failed"
+  exit 1
+fi
+
+n_saved="$(jq -r '.n_saved // 0' "$save_response" 2>/dev/null || echo 0)"
+n_written="$(jq -r '.n_written // 0' "$save_response" 2>/dev/null || echo 0)"
+save_ms="$(jq -r '.timings.save_ms // 0' "$save_response" 2>/dev/null || echo 0)"
+if [[ ! "$n_saved" =~ ^[0-9]+$ ]] || (( n_saved <= 0 )); then
+  echo "[slot-cache] slot is empty; nothing to persist."
+  exit 0
+fi
+echo "[slot-cache] llama.cpp wrote ${n_saved} tokens / ${n_written} bytes (${save_ms} ms); uploading to ${QWEN_SLOT_CACHE_HOST}..."
+
+metadata_tmp="$(mktemp)"
+python3 - "$metadata_tmp" "$cache_signature" "$QWEN_SLOT_CACHE_SESSION" "$model" "$hf_revision" "$ctx_size" "$use_fastmtp" "$llama_commit" "$profile" "$instance_id" "$n_saved" "$n_written" "$save_ms" "$SLOT_ID" <<'PYMETA'
+import json, pathlib, sys, datetime
+(path, signature, session, model, revision, ctx, fastmtp, commit, profile,
+ instance_id, n_saved, n_written, save_ms, slot_id) = sys.argv[1:]
+obj = {
+    "schema_version": 1,
+    "saved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "signature": signature,
+    "session": session,
+    "model": model,
+    "hf_revision": revision,
+    "ctx_size": int(ctx),
+    "use_fastmtp": int(fastmtp),
+    "llama_cpp_commit": commit,
+    "profile": profile,
+    "source_instance_id": int(instance_id),
+    "slot_id": int(slot_id),
+    "n_saved": int(n_saved),
+    "n_written": int(n_written),
+    "save_ms": float(save_ms),
+}
+pathlib.Path(path).write_text(json.dumps(obj, indent=2) + "\n")
+PYMETA
+
+scp_opts=(
+  -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o ServerAliveCountMax=3
+  -o StrictHostKeyChecking=accept-new -o "UserKnownHostsFile=$KNOWN_HOSTS" -P "$cache_vast_port"
+)
+if ! scp -q "${scp_opts[@]}" "$metadata_tmp" "${cache_vast_user}@${cache_vast_host}:${QWEN_SLOT_CACHE_LOCAL_DIR}/current.json.tmp"; then
+  echo >&2 "[slot-cache] ERROR: could not copy slot metadata to Vast host"
+  rm -f "$metadata_tmp"
+  exit 1
+fi
+rm -f "$metadata_tmp"
+
+if ! ssh "${cache_vast_ssh_opts[@]}" "${cache_vast_user}@${cache_vast_host}" \
+    "mv '${QWEN_SLOT_CACHE_LOCAL_DIR}/current.json.tmp' '${QWEN_SLOT_CACHE_LOCAL_DIR}/current.json' && chmod 600 '${QWEN_SLOT_CACHE_LOCAL_DIR}/current.json'"; then
+  echo >&2 "[slot-cache] ERROR: could not stage slot metadata on Vast host"
+  exit 1
+fi
+
+if ! qwen_cache_upload_from_vast "$cache_vast_user" "$cache_vast_host" "$cache_vast_port" "$cache_signature" | tee "$run_dir/cache-upload.log"; then
+  echo >&2 "[slot-cache] ERROR: upload failed"
+  exit 1
+fi
+
+jq --arg signature "$cache_signature" --arg remote_dir "$cache_remote_dir" --argjson n_saved "$n_saved" --argjson n_written "$n_written" \
+  '. + {slot_cache_save:"uploaded",slot_cache_signature:$signature,slot_cache_remote_dir:$remote_dir,slot_cache_n_saved:$n_saved,slot_cache_bytes_saved:$n_written}' \
+  "$STATE_FILE" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+chmod 600 "$STATE_FILE"
+
+echo "[slot-cache] persisted: ${QWEN_SLOT_CACHE_USER}@${QWEN_SLOT_CACHE_HOST}:${cache_remote_dir}/current.bin"
+
+# Verify the snapshot is actually readable on the cache server.
+remote_bin_size="$(ssh -n -i "$QWEN_SLOT_CACHE_KEY" -p "$QWEN_SLOT_CACHE_PORT" \
+  -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new \
+  -o "UserKnownHostsFile=$ROOT_DIR/.qwen-cache/known_hosts" \
+  "${QWEN_SLOT_CACHE_USER}@${QWEN_SLOT_CACHE_HOST}" \
+  "stat -c %s '${cache_remote_dir}/current.bin'" 2>/dev/null || true)"
+if [[ "$remote_bin_size" == "$n_written" ]]; then
+  echo "[slot-cache] verified: remote ${cache_remote_dir}/current.bin is ${remote_bin_size} bytes"
+else
+  echo >&2 "[slot-cache] WARNING: remote size ${remote_bin_size:-unknown} does not match expected ${n_written}"
+  exit 1
+fi
+
+jq --arg run_dir "$run_dir" --arg run_id "$run_id" '. + {last_cache_copy_run:$run_dir,last_cache_copy_run_id:$run_id}' \
+  "$STATE_FILE" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+chmod 600 "$STATE_FILE"
+
+echo "[slot-cache] run log: $run_dir"
