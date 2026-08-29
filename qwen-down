@@ -154,8 +154,8 @@ save_slot_cache() {
   fi
 
   if [[ -z "$llama_commit" ]]; then
-    build_json="$(ssh "${cache_vast_ssh_opts[@]}" "${cache_vast_user}@${cache_vast_host}" 'cat /etc/qwen38-build.json 2>/dev/null || true' 2>/dev/null | head -n 1 || true)"
-    llama_commit="$(jq -r '.llama_cpp_commit // "unknown"' <<<"${build_json:-{}}" 2>/dev/null | head -n 1)"
+    build_json="$(ssh "${cache_vast_ssh_opts[@]}" "${cache_vast_user}@${cache_vast_host}" 'cat /etc/qwen38-build.json 2>/dev/null || true' 2>/dev/null || true)"
+    llama_commit="$(jq -r '.llama_cpp_commit // "unknown"' <<<"${build_json:-{\}}" 2>/dev/null)" || llama_commit="unknown"
     [[ "$llama_commit" == "unknown" || "$llama_commit" =~ ^[a-f0-9]+$ ]] || llama_commit="unknown"
   fi
   if [[ -z "$cache_signature" ]]; then

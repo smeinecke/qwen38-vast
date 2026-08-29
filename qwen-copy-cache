@@ -101,7 +101,7 @@ profile="$(jq -r '.profile // "unknown"' "$STATE_FILE")"
 cache_type_k="$(jq -r '.cache_type_k // "default"' "$STATE_FILE")"
 cache_type_v="$(jq -r '.cache_type_v // "default"' "$STATE_FILE")"
 llama_commit="$(jq -r '.llama_cpp_commit // empty' "$STATE_FILE")"
-cache_signature="$(jq -r '.slot_cache_signature // empty' "$STATE_FILE")"
+cache_signature=""
 
 if [[ -n "$llama_commit" && ! "$llama_commit" =~ ^[a-f0-9]+$ ]]; then
   llama_commit=""
@@ -119,8 +119,8 @@ if ! qwen_cache_copy_key_to_vast "$cache_vast_user" "$cache_vast_host" "$cache_v
 fi
 
 if [[ -z "$llama_commit" ]]; then
-  build_json="$(ssh "${cache_vast_ssh_opts[@]}" "${cache_vast_user}@${cache_vast_host}" 'cat /etc/qwen38-build.json 2>/dev/null || true' 2>/dev/null | head -n 1 || true)"
-  llama_commit="$(jq -r '.llama_cpp_commit // "unknown"' <<<"${build_json:-{}}" 2>/dev/null | head -n 1)"
+  build_json="$(ssh "${cache_vast_ssh_opts[@]}" "${cache_vast_user}@${cache_vast_host}" 'cat /etc/qwen38-build.json 2>/dev/null || true' 2>/dev/null || true)"
+  llama_commit="$(jq -r '.llama_cpp_commit // "unknown"' <<<"${build_json:-{\}}" 2>/dev/null)" || llama_commit="unknown"
   [[ "$llama_commit" == "unknown" || "$llama_commit" =~ ^[a-f0-9]+$ ]] || llama_commit="unknown"
 fi
 
