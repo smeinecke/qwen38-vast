@@ -45,6 +45,11 @@ if [[ -n "${QWEN_SSH_PUBLIC_KEY_B64:-}" ]]; then
   printf '\n' >> "$TMP"
 fi
 
+# Defensive: users may have quoted the key in .env, which the local parser now
+# strips. Existing running images still benefit from cleaning up any quotes that
+# accidentally made it through.
+sed -i -e 's/^[[:space:]]*"//; s/"[[:space:]]*$//' -e "s/^[[:space:]]*'//; s/'[[:space:]]*$//" "$TMP"
+
 grep -E '^[[:space:]]*(ssh-|ecdsa-|sk-)[^[:space:]]+[[:space:]]+[^[:space:]]+' "$TMP" \
   | sed -E 's/^[[:space:]]+//' \
   | awk '!seen[$0]++' > "$TMP_AUTHORIZED_KEYS.new" || true

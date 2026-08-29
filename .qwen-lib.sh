@@ -19,6 +19,16 @@ qwen_source_env() {
     # trim leading/trailing whitespace from key
     key="${key#"${key%%[![:space:]]*}"}"
     key="${key%"${key##*[![:space:]]}"}"
+    # trim leading/trailing whitespace from val and strip matching surrounding
+    # quotes; .env.example tells users to quote an SSH public key, so we must
+    # not pass the quotes on to the consumer.
+    val="${val#"${val%%[![:space:]]*}"}"
+    val="${val%"${val##*[![:space:]]}"}"
+    if [[ "${val:0:1}" == "\"" && "${val: -1}" == "\"" ]]; then
+      val="${val:1:${#val}-2}"
+    elif [[ "${val:0:1}" == "'" && "${val: -1}" == "'" ]]; then
+      val="${val:1:${#val}-2}"
+    fi
     # optional `export ` prefix
     if [[ "$key" == export* ]]; then
       key="${key#export}"
