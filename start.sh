@@ -109,6 +109,16 @@ if [[ -n "$CACHE_TYPE_V" ]]; then
   server_args+=(--cache-type-v "$CACHE_TYPE_V")
 fi
 
+# llama-server's host prompt cache defaults to 8192 MiB. For 128k/256k context
+# the prompt state can be >8 GB, so allow explicit tuning or disabling.
+# CACHE_RAM=0 disables the host prompt cache; -1 means no limit.
+if [[ -n "${CACHE_RAM:-}" ]]; then
+  server_args+=(--cache-ram "$CACHE_RAM")
+fi
+if [[ -n "${CTX_CHECKPOINTS:-}" ]]; then
+  server_args+=(--ctx-checkpoints "$CTX_CHECKPOINTS")
+fi
+
 if [[ "$USE_FASTMTP" == "1" ]]; then
   download_file "$DRAFT"
   server_args+=(

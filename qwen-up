@@ -919,6 +919,12 @@ fi
 if [[ -n "${CACHE_TYPE_V:-}" ]]; then
   docker_env+=" -e CACHE_TYPE_V=${CACHE_TYPE_V}"
 fi
+if [[ -n "${CACHE_RAM:-}" ]]; then
+  docker_env+=" -e CACHE_RAM=${CACHE_RAM}"
+fi
+if [[ -n "${CTX_CHECKPOINTS:-}" ]]; then
+  docker_env+=" -e CTX_CHECKPOINTS=${CTX_CHECKPOINTS}"
+fi
 if [[ -n "${HF_TOKEN:-}" ]]; then
   docker_env+=" -e HF_TOKEN=${HF_TOKEN}"
 fi
@@ -933,11 +939,17 @@ PYKEY
   docker_env+=" -e QWEN_SSH_PUBLIC_KEY_B64=${ssh_public_key_b64}"
 fi
 
+vastai_volume_args=()
+if [[ -n "${QWEN_VOLUME_ID:-}" && -n "${QWEN_VOLUME_MOUNT_PATH:-}" ]]; then
+  vastai_volume_args=(--link-volume "$QWEN_VOLUME_ID" --mount-path "$QWEN_VOLUME_MOUNT_PATH")
+fi
+
 create_raw="$(vastai create instance "$offer_id" \
   --image "$SELECTED_IMAGE" \
   --disk "$DISK_GB" \
   --label "$LABEL" \
   --env "$docker_env" \
+  "${vastai_volume_args[@]}" \
   --raw \
   --args qwen38)" || {
     echo >&2 "ERROR: Vast failed to create the instance."
