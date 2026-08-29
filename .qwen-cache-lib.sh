@@ -151,7 +151,8 @@ umask 077
 cache_host="$1"; cache_port="$2"; cache_user="$3"; remote_dir="$4"; slot_dir="$5"
 key=/root/.ssh/qwen-slot-cache
 known=/root/.ssh/qwen-slot-cache-known_hosts
-ssh_base=(ssh -i "$key" -p "$cache_port" -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o "UserKnownHostsFile=$known")
+# -n and < /dev/null stop the nested ssh/rsync from slurping this heredoc.
+ssh_base=(ssh -n -i "$key" -p "$cache_port" -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o "UserKnownHostsFile=$known")
 mkdir -p "$slot_dir"
 chmod 700 "$slot_dir"
 
@@ -166,7 +167,7 @@ for attempt in 1 2 3; do
   if rsync -a --partial --info=stats2 \
     -e "ssh -i $key -p $cache_port -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$known" \
     "${cache_user}@${cache_host}:${remote_dir}/current.bin" \
-    "$slot_dir/current.bin.part"; then
+    "$slot_dir/current.bin.part" < /dev/null; then
     break
   fi
   (( attempt == 3 )) && { echo >&2 "[slot-cache] download failed after 3 attempts"; exit 13; }
@@ -181,7 +182,7 @@ if "${ssh_base[@]}" "${cache_user}@${cache_host}" "test -s '$remote_dir/current.
   rsync -a --partial \
     -e "ssh -i $key -p $cache_port -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$known" \
     "${cache_user}@${cache_host}:${remote_dir}/current.json" \
-    "$slot_dir/remote-current.json" || true
+    "$slot_dir/remote-current.json" < /dev/null || true
 fi
 bytes=$(stat -c %s "$slot_dir/current.bin")
 end=$(date +%s)
@@ -207,16 +208,18 @@ cache_host="$1"; cache_port="$2"; cache_user="$3"; cache_root="$4"; remote_dir="
 key=/root/.ssh/qwen-slot-cache
 known=/root/.ssh/qwen-slot-cache-known_hosts
 ssh_base=(ssh -i "$key" -p "$cache_port" -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o "UserKnownHostsFile=$known")
+# -n and < /dev/null stop the nested ssh/rsync from slurping this heredoc.
+ssh_base_n=(ssh -n -i "$key" -p "$cache_port" -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o "UserKnownHostsFile=$known")
 [[ -s "$slot_dir/current.bin" ]] || { echo >&2 "[slot-cache] local current.bin missing/empty"; exit 11; }
 [[ -s "$slot_dir/current.json" ]] || { echo >&2 "[slot-cache] local current.json missing/empty"; exit 12; }
 
-"${ssh_base[@]}" "${cache_user}@${cache_host}" "mkdir -p '$remote_dir' && chmod 700 '$cache_root' '$cache_root/'* 2>/dev/null || true; mkdir -p '$remote_dir'"
+"${ssh_base_n[@]}" "${cache_user}@${cache_host}" "mkdir -p '$remote_dir' && chmod 700 '$cache_root' '$cache_root/'* 2>/dev/null || true; mkdir -p '$remote_dir'"
 # Keep fixed .part names so a failed upload can resume on the next retry/run,
 # while the previous current.bin remains valid until the final atomic rename.
 remote_bin="${remote_dir}/.current.bin.part"
 remote_json="${remote_dir}/.current.json.part"
 local_bytes=$(stat -c %s "$slot_dir/current.bin")
-remote_free=$("${ssh_base[@]}" "${cache_user}@${cache_host}" "df -PB1 '$remote_dir' | awk 'NR==2 {print \$4}'" 2>/dev/null || echo 0)
+remote_free=$("${ssh_base_n[@]}" "${cache_user}@${cache_host}" "df -PB1 '$remote_dir' | awk 'NR==2 {print \$4}'" 2>/dev/null || echo 0)
 if [[ "$remote_free" =~ ^[0-9]+$ ]] && (( remote_free > 0 && remote_free < local_bytes )); then
   echo >&2 "[slot-cache] cache server has only ${remote_free} free bytes; snapshot needs ${local_bytes} bytes before atomic replacement"
   exit 14
@@ -225,7 +228,7 @@ start=$(date +%s)
 for attempt in 1 2 3; do
   if rsync -a --partial --info=stats2 \
     -e "ssh -i $key -p $cache_port -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$known" \
-    "$slot_dir/current.bin" "${cache_user}@${cache_host}:${remote_bin}"; then
+    "$slot_dir/current.bin" "${cache_user}@${cache_host}:${remote_bin}" < /dev/null; then
     break
   fi
   (( attempt == 3 )) && { echo >&2 "[slot-cache] upload failed after 3 attempts"; exit 15; }
@@ -235,7 +238,7 @@ done
 for attempt in 1 2 3; do
   if rsync -a --partial \
     -e "ssh -i $key -p $cache_port -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$known" \
-    "$slot_dir/current.json" "${cache_user}@${cache_host}:${remote_json}"; then
+    "$slot_dir/current.json" "${cache_user}@${cache_host}:${remote_json}" < /dev/null; then
     break
   fi
   (( attempt == 3 )) && { echo >&2 "[slot-cache] metadata upload failed after 3 attempts"; exit 16; }
@@ -243,7 +246,7 @@ for attempt in 1 2 3; do
   sleep 3
 done
 
-"${ssh_base[@]}" "${cache_user}@${cache_host}" \
+"${ssh_base_n[@]}" "${cache_user}@${cache_host}" \
   "chmod 600 '$remote_bin' '$remote_json' && mv -f '$remote_bin' '$remote_dir/current.bin' && mv -f '$remote_json' '$remote_dir/current.json'"
 bytes=$(stat -c %s "$slot_dir/current.bin")
 end=$(date +%s)
