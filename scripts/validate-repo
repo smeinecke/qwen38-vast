@@ -22,7 +22,7 @@ bash -n start.sh entrypoint.sh qwen-init-ssh.sh .qwen-lib.sh .qwen-cache-lib.sh 
 
 jq -e '
   .schema_version == 1 and
-  ([.images[].cuda_arch | tostring] | sort | unique) == ["120","86","89"] and
+  ([.images[].cuda_arch | tostring] | sort | unique) == ["120","70","86","89"] and
   any(.profiles[]; .ctx_size == 65536) and
   any(.profiles[]; .ctx_size == 131072) and
   any(.profiles[]; .ctx_size == 262144) and

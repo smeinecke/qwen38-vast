@@ -19,6 +19,12 @@
       "cuda_arch": "120",
       "image_tag": "blackwell-128k",
       "description": "RTX 5090 / RTX PRO 6000 Blackwell / SM120"
+    },
+    {
+      "name": "v100",
+      "cuda_arch": "70",
+      "image_tag": "v100",
+      "description": "Tesla V100 / Volta SM70"
     }
   ],
   "profiles": [
@@ -214,11 +220,31 @@
       "image": "blackwell",
       "ctx_size": 262144,
       "gpu_query": "num_gpus=1 gpu_name in [\"RTX_PRO_6000\",\"RTX_PRO_6000_WS\",\"RTX_PRO_6000_S\"] gpu_ram>=90 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1"
+    },
+    {
+      "name": "v100-128k",
+      "aliases": [
+        "volta-128k",
+        "sm70-128k"
+      ],
+      "image": "v100",
+      "ctx_size": 131072,
+      "monitor_group": "q4-128k",
+      "gpu_query": "num_gpus=1 gpu_name=V100 gpu_ram>=32 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1",
+      "monitor_search": true
     }
   ],
   "monitor_hardware": {
     "policy": "same_or_better",
     "gpu_ranks": [
+      {
+        "gpu": "Tesla V100",
+        "aliases": [
+          "V100",
+          "Tesla V100"
+        ],
+        "rank": 90
+      },
       {
         "gpu": "A40",
         "aliases": [
