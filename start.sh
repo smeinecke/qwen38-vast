@@ -169,4 +169,41 @@ fi
 echo "[serve] profile=$QWEN_PROFILE model=$MODEL revision=$HF_REVISION ctx=$CTX_SIZE fastmtp=$USE_FASTMTP bind=$llama_bind slot_save_path=$SLOT_SAVE_PATH"
 echo "[runtime] GPU snapshot:"
 nvidia-smi --query-gpu=timestamp,index,name,driver_version,memory.total,power.limit --format=csv,noheader 2>&1 || nvidia-smi 2>&1 || true
-exec /usr/local/bin/llama-server "${server_args[@]}"
+
+if [[ "$QWEN_UNSECURE" == "1" ]]; then
+  # Legacy: just run the server; no key to remove.
+  exec /usr/local/bin/llama-server "${server_args[@]}"
+fi
+
+# In secure mode the TLS private key is only needed while llama-server builds
+# its SSL context. Start the server, wait for the Unix socket to appear, then
+# remove the key file from tmpfs so it is no longer reachable from the
+# filesystem even if /dev/shm itself is readable.
+/usr/local/bin/llama-server "${server_args[@]}" &
+llama_pid=$!
+
+QWEN_TLS_SOCKET_TIMEOUT="${QWEN_TLS_SOCKET_TIMEOUT:-1800}"
+socket_wait=0
+while [[ ! -S "$llama_socket" ]]; do
+  if ! kill -0 "$llama_pid" >/dev/null 2>&1; then
+    echo >&2 "ERROR: llama-server exited before the Unix socket appeared."
+    wait "$llama_pid" || true
+    exit 70
+  fi
+  if (( socket_wait >= QWEN_TLS_SOCKET_TIMEOUT )); then
+    echo >&2 "ERROR: llama-server did not create $llama_socket within ${QWEN_TLS_SOCKET_TIMEOUT}s."
+    kill -TERM "$llama_pid" >/dev/null 2>&1 || true
+    wait "$llama_pid" || true
+    exit 70
+  fi
+  sleep 1
+  socket_wait=$((socket_wait + 1))
+done
+
+if [[ -f "$key_file" ]]; then
+  rm -f "$key_file"
+  echo "[secure] TLS private key removed from tmpfs after socket bind"
+fi
+
+# Forward the real exit code to the entrypoint supervisor.
+wait "$llama_pid"
