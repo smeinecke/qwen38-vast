@@ -366,8 +366,8 @@ PROFILES_FILE="${QWEN_PROFILES_FILE:-$ROOT_DIR/profiles.json}"
 usage() {
   cat <<'USAGE'
 Usage:
-  ./qwen-up [PROFILE] [--session NAME] [--local-port PORT] [--max-price USD/HOUR] [--allow-paid-traffic] [--unverified]
-  ./qwen-up --profile PROFILE [--session NAME] [--local-port PORT] [--max-price USD/HOUR] [--allow-paid-traffic] [--unverified]
+  ./qwen-up [PROFILE] [--session NAME] [--local-port PORT] [--max-price USD/HOUR] [--allow-paid-traffic] [--unverified] [--offer ID]
+  ./qwen-up --profile PROFILE [--session NAME] [--local-port PORT] [--max-price USD/HOUR] [--allow-paid-traffic] [--unverified] [--offer ID]
   ./qwen-up --restart [--local-port PORT]
 
 Restart/resume an existing paused Vast instance from .qwen-vast/state.json.
@@ -393,6 +393,7 @@ Examples:
   ./qwen-up blackwell-128k
   ./qwen-up a6000-128k --session my-project
   ./qwen-up v100-128k --max-price 0.22 --allow-paid-traffic
+  ./qwen-up v100-128k --max-price 0.3 --allow-paid-traffic --unverified --offer 46568462
   CTX_SIZE_OVERRIDE=98304 ./qwen-up a6000
 
 Use *_OVERRIDE variables only for intentional one-off tests.
@@ -405,6 +406,7 @@ local_port_arg=""
 max_price_arg=""
 allow_paid_arg=""
 unverified_arg=""
+offer_id_arg=""
 RESTART=0
 while (( $# > 0 )); do
   case "$1" in
@@ -449,6 +451,16 @@ while (( $# > 0 )); do
     --unverified)
       unverified_arg=1
       shift
+      ;;
+    --offer)
+      [[ -n "${2:-}" ]] || { echo >&2 "ERROR: --offer requires a value"; exit 2; }
+      if [[ ! "${2:-}" =~ ^[0-9]+$ ]]; then
+        echo >&2 "ERROR: --offer must be a numeric offer/machine ID"
+        usage >&2
+        exit 2
+      fi
+      offer_id_arg="$2"
+      shift 2
       ;;
     --restart)
       RESTART=1
@@ -743,11 +755,18 @@ trap on_signal INT TERM
 printf '[profile] %s | sm_%s | ctx=%s | image=%s\n' "$PROFILE" "$CUDA_ARCH" "$CTX_SIZE" "$SELECTED_IMAGE"
 # Apply MAX_DPH to the Vast query itself, not just the post-search filter, so
 # Vast can return more cheap offers and we don't accidentally rely on dph_base.
-if [[ "$GPU_QUERY" != *"dph"* ]]; then
+# If an explicit offer ID was given, cast a wider net but still filter by
+# traffic/verifiation so we can locate that specific offer in the raw results.
+MAX_DPH_FOR_JQ="$MAX_DPH"
+VAST_LIMIT=25
+if [[ -n "$offer_id_arg" ]]; then
+  VAST_LIMIT=100
+  MAX_DPH_FOR_JQ="999999"
+elif [[ "$GPU_QUERY" != *"dph"* ]]; then
   GPU_QUERY="$GPU_QUERY dph_total <= $MAX_DPH"
 fi
 printf '[search] %s\n' "$GPU_QUERY"
-offers_raw="$(vastai search offers "$GPU_QUERY" --order dph_total --limit 25 --storage "$DISK_GB" --raw)"
+offers_raw="$(vastai search offers "$GPU_QUERY" --order dph_total --limit "$VAST_LIMIT" --storage "$DISK_GB" --raw)"
 
 offers="$(jq -c '
   if type == "array" then .
@@ -757,14 +776,20 @@ offers="$(jq -c '
   else [] end
 ' <<<"$offers_raw")"
 
-offer="$(jq -c --argjson max "$MAX_DPH" \
+offer="$(jq -c --argjson max "$MAX_DPH_FOR_JQ" \
+  --arg offer_id "$offer_id_arg" \
   --arg require_free "$REQUIRE_FREE_TRAFFIC" \
   --argjson allow_paid "$ALLOW_PAID_TRAFFIC" \
   --argjson max_down "$MAX_INET_DOWN_COST" \
   --argjson max_up "$MAX_INET_UP_COST" '
   [ .[]
     | ._effective_dph = (.dph_total // 999999)
-    | select(._effective_dph <= $max)
+    | select($offer_id == "" or (.id == $offer_id or .ask_contract_id == $offer_id))
+    | select(
+        if $offer_id == "" then
+          (._effective_dph <= $max)
+        else true end
+      )
     | select(
         if ($require_free == "true" and $allow_paid != 1) then
           ((.inet_down_cost // 999999) <= $max_down and (.inet_up_cost // 999999) <= $max_up)
@@ -776,7 +801,11 @@ offer="$(jq -c --argjson max "$MAX_DPH" \
 ' <<<"$offers")"
 
 if [[ -z "$offer" || "$offer" == "null" ]]; then
-  echo >&2 "ERROR: no matching offer at or below \$$MAX_DPH/h."
+  if [[ -n "$offer_id_arg" ]]; then
+    echo >&2 "ERROR: offer $offer_id_arg not found, no longer matches the profile, or is above \$$MAX_DPH/h."
+  else
+    echo >&2 "ERROR: no matching offer at or below \$$MAX_DPH/h."
+  fi
   if [[ "$REQUIRE_FREE_TRAFFIC" == "true" && "$ALLOW_PAID_TRAFFIC" != "1" ]]; then
     echo >&2 "Traffic policy allows traffic up to \$0.001/GB (inet_down_cost and inet_up_cost <= 0.001)."
   fi

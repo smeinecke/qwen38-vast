@@ -9,7 +9,7 @@ require_grep() { local pat="$1" file="$2"; grep -Eq -- "$pat" "$file" || fail "$
 
 for f in \
   profiles.json Dockerfile .env.example .qwen-lib.sh .qwen-cache-lib.sh \
-  qwen-up qwen-down qwen-status qwen-monitor qwen-bench qwen-results qwen-cache-setup \
+  qwen-up qwen-down qwen-status qwen-monitor qwen-bench qwen-results qwen-cache-setup qwen-lookup \
   start.sh entrypoint.sh qwen-init-ssh.sh \
   .github/workflows/docker.yml .github/workflows/docker-self-hosted.yml; do
   require_file "$f"
@@ -17,7 +17,7 @@ done
 
 # Syntax first.
 bash -n start.sh entrypoint.sh qwen-init-ssh.sh .qwen-lib.sh .qwen-cache-lib.sh \
-  qwen-up qwen-down qwen-status qwen-monitor qwen-bench qwen-results qwen-cache-setup \
+  qwen-up qwen-down qwen-status qwen-monitor qwen-bench qwen-results qwen-cache-setup qwen-lookup \
   scripts/prepare-authorized-keys scripts/validate-repo
 
 jq -e '
