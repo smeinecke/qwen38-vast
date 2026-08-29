@@ -17,7 +17,7 @@ done
 
 # Syntax first.
 bash -n start.sh entrypoint.sh qwen-init-ssh.sh .qwen-lib.sh .qwen-cache-lib.sh \
-  qwen-up qwen-down qwen-status qwen-logs qwen-monitor qwen-bench qwen-results qwen-cache-setup \
+  qwen-up qwen-down qwen-status qwen-monitor qwen-bench qwen-results qwen-cache-setup \
   scripts/prepare-authorized-keys scripts/validate-repo
 
 jq -e '

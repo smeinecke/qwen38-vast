@@ -30,15 +30,20 @@ qwen_cache_validate_config
 YES=0
 ARCHIVE=1
 SAVE_CACHE=1
+PAUSE=0
 usage() {
   cat <<'USAGE'
 Usage:
-  ./qwen-down [--yes] [--no-archive] [--no-cache]
+  ./qwen-down [--yes] [--no-archive] [--no-cache] [--pause]
 
 By default qwen-down first saves/uploads slot 0 to the persistent cache server,
 then archives the remote llama-server log, a final GPU snapshot,
 Prometheus metrics and sanitized session metadata into .qwen-runs/<session>/
 before destroying the Vast instance.
+
+With --pause, the slot cache is still saved, the llama-server is stopped and
+local tunnel is closed, but the Vast instance is paused (vastai stop instance)
+instead of destroyed. Local state is kept so you can resume with ./qwen-up --restart.
 USAGE
 }
 
@@ -47,6 +52,7 @@ while (( $# > 0 )); do
     --yes) YES=1; shift ;;
     --no-archive) ARCHIVE=0; shift ;;
     --no-cache) SAVE_CACHE=0; shift ;;
+    --pause) PAUSE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo >&2 "ERROR: unknown option: $1"; usage >&2; exit 2 ;;
   esac
@@ -111,7 +117,11 @@ tunnel_pid="$(jq -r '.tunnel_pid // empty' "$STATE_FILE")"
 local_port="$(jq -r '.local_port // 18080' "$STATE_FILE")"
 
 if (( YES == 0 )); then
-  printf 'Destroy Vast instance %s (%s, $%s/h)? [y/N] ' "$instance_id" "$gpu" "$dph"
+  if (( PAUSE == 1 )); then
+    printf 'Pause Vast instance %s (%s, $%s/h)? [y/N] ' "$instance_id" "$gpu" "$dph"
+  else
+    printf 'Destroy Vast instance %s (%s, $%s/h)? [y/N] ' "$instance_id" "$gpu" "$dph"
+  fi
   read -r answer
   [[ "$answer" =~ ^[Yy]$ ]] || { echo "Cancelled."; exit 0; }
 fi
@@ -299,7 +309,11 @@ if [[ "$state_cache_enabled" == "1" && "$SAVE_CACHE" == "1" ]]; then
   set -e
   if (( cache_save_rc != 0 )); then
     if [[ "$QWEN_SLOT_CACHE_REQUIRE_SAVE" == "1" ]]; then
-      echo >&2 "ERROR: slot cache save/upload failed (rc=$cache_save_rc); QWEN_SLOT_CACHE_REQUIRE_SAVE=1, so the Vast instance was NOT destroyed."
+      if (( PAUSE == 1 )); then
+        echo >&2 "ERROR: slot cache save/upload failed (rc=$cache_save_rc); QWEN_SLOT_CACHE_REQUIRE_SAVE=1, so the Vast instance was NOT paused."
+      else
+        echo >&2 "ERROR: slot cache save/upload failed (rc=$cache_save_rc); QWEN_SLOT_CACHE_REQUIRE_SAVE=1, so the Vast instance was NOT destroyed."
+      fi
       exit 4
     fi
     echo >&2 "[slot-cache] continuing shutdown despite cache failure (rc=$cache_save_rc) to stop billing."
@@ -325,24 +339,44 @@ if [[ -n "$tunnel_pid" ]] && kill -0 "$tunnel_pid" >/dev/null 2>&1; then
 fi
 
 destroy_outcome="none"
+pause_outcome="none"
 if [[ -n "$instance_id" ]]; then
-  echo "Destroying Vast instance $instance_id (non-interactive, timeout=${QWEN_DESTROY_TIMEOUT_SECONDS:-45}s)..."
-  set +e
-  qwen_destroy_instance "$instance_id"
-  destroy_rc=$?
-  set -e
-  destroy_output="$QWEN_DESTROY_OUTPUT"
-  destroy_outcome="$QWEN_DESTROY_OUTCOME"
-  [[ -n "$destroy_output" ]] && printf '%s\n' "$destroy_output"
+  if (( PAUSE == 1 )); then
+    echo "Pausing Vast instance $instance_id (non-interactive, timeout=${QWEN_PAUSE_TIMEOUT_SECONDS:-60}s)..."
+    set +e
+    qwen_pause_instance "$instance_id"
+    pause_rc=$?
+    set -e
+    pause_output="$QWEN_PAUSE_OUTPUT"
+    pause_outcome="$QWEN_PAUSE_OUTCOME"
+    [[ -n "$pause_output" ]] && printf '%s\n' "$pause_output"
 
-  # 404 is success for shutdown: the required postcondition is that the rental
-  # no longer exists. A real timeout/error keeps local state for a safe retry.
-  if [[ "$destroy_outcome" == "timeout" ]]; then
-    echo >&2 "ERROR: Vast destroy exceeded ${QWEN_DESTROY_TIMEOUT_SECONDS:-45}s. State was kept so you can retry; verify the instance in Vast before assuming billing stopped."
-    exit 3
-  elif (( destroy_rc != 0 )); then
-    echo >&2 "ERROR: Vast destroy failed (rc=$destroy_rc). State was kept so you can retry."
-    exit 3
+    if [[ "$pause_outcome" == "timeout" ]]; then
+      echo >&2 "ERROR: Vast pause exceeded ${QWEN_PAUSE_TIMEOUT_SECONDS:-60}s. State was kept so you can retry."
+      exit 3
+    elif (( pause_rc != 0 )); then
+      echo >&2 "ERROR: Vast pause failed (rc=$pause_rc). State was kept so you can retry."
+      exit 3
+    fi
+  else
+    echo "Destroying Vast instance $instance_id (non-interactive, timeout=${QWEN_DESTROY_TIMEOUT_SECONDS:-45}s)..."
+    set +e
+    qwen_destroy_instance "$instance_id"
+    destroy_rc=$?
+    set -e
+    destroy_output="$QWEN_DESTROY_OUTPUT"
+    destroy_outcome="$QWEN_DESTROY_OUTCOME"
+    [[ -n "$destroy_output" ]] && printf '%s\n' "$destroy_output"
+
+    # 404 is success for shutdown: the required postcondition is that the rental
+    # no longer exists. A real timeout/error keeps local state for a safe retry.
+    if [[ "$destroy_outcome" == "timeout" ]]; then
+      echo >&2 "ERROR: Vast destroy exceeded ${QWEN_DESTROY_TIMEOUT_SECONDS:-45}s. State was kept so you can retry; verify the instance in Vast before assuming billing stopped."
+      exit 3
+    elif (( destroy_rc != 0 )); then
+      echo >&2 "ERROR: Vast destroy failed (rc=$destroy_rc). State was kept so you can retry."
+      exit 3
+    fi
   fi
 fi
 
@@ -362,7 +396,28 @@ PY
 )"
 
 if [[ -n "$run_dir" ]]; then
-  python3 - "$STATE_FILE" "$run_dir/metadata.json" "$ended_at" "$ended_epoch" "$duration_seconds" "$estimated_cost" "$destroy_outcome" <<'PY'
+  if (( PAUSE == 1 )); then
+    python3 - "$STATE_FILE" "$run_dir/metadata.json" "$ended_at" "$ended_epoch" "$duration_seconds" "$estimated_cost" "$pause_outcome" <<'PY'
+import json, pathlib, sys
+state_path, metadata_path, ended_at, ended_epoch, duration, cost, pause_outcome = sys.argv[1:]
+try:
+    state = json.loads(pathlib.Path(state_path).read_text())
+except Exception:
+    state = {}
+state.pop("api_key", None)
+state.pop("tunnel_pid", None)
+state.update({
+    "status": "paused",
+    "ended_at": ended_at,
+    "ended_epoch": int(ended_epoch),
+    "duration_seconds": int(duration),
+    "estimated_compute_cost_usd": float(cost),
+    "pause_outcome": pause_outcome,
+})
+pathlib.Path(metadata_path).write_text(json.dumps(state, indent=2, ensure_ascii=False))
+PY
+  else
+    python3 - "$STATE_FILE" "$run_dir/metadata.json" "$ended_at" "$ended_epoch" "$duration_seconds" "$estimated_cost" "$destroy_outcome" <<'PY'
 import json, pathlib, sys
 state_path, metadata_path, ended_at, ended_epoch, duration, cost, destroy_outcome = sys.argv[1:]
 try:
@@ -381,14 +436,24 @@ state.update({
 })
 pathlib.Path(metadata_path).write_text(json.dumps(state, indent=2, ensure_ascii=False))
 PY
+  fi
   chmod 600 "$run_dir/metadata.json" 2>/dev/null || true
 fi
 
-rm -rf "$STATE_DIR"
-if [[ "$destroy_outcome" == "already_absent" ]]; then
-  final_action="Already absent"
+# Keep local state when pausing so qwen-up --restart can resume.
+if (( PAUSE == 0 )); then
+  rm -rf "$STATE_DIR"
+  if [[ "$destroy_outcome" == "already_absent" ]]; then
+    final_action="Already absent"
+  else
+    final_action="Destroyed"
+  fi
 else
-  final_action="Destroyed"
+  jq --arg ended_at "$ended_at" --argjson ended_epoch "$ended_epoch" --argjson duration "$duration_seconds" --arg outcome "$pause_outcome" \
+    '. + {status:"paused",paused_at:$ended_at,paused_epoch:$ended_epoch,duration_seconds:$duration,pause_outcome:$outcome} | del(.tunnel_pid)' \
+    "$STATE_FILE" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+  chmod 600 "$STATE_FILE"
+  final_action="Paused"
 fi
 # Format the cost in Python as well; this avoids locale-sensitive bash printf
 # conversions on systems using decimal commas.

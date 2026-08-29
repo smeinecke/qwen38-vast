@@ -43,7 +43,7 @@ jobs:
           docker version
           jq -e '.schema_version == 1 and (.images|length > 0) and (.profiles|length > 0)' profiles.json >/dev/null
           bash -n start.sh entrypoint.sh qwen-init-ssh.sh .qwen-lib.sh \
-            qwen-up qwen-down qwen-status qwen-logs qwen-bench qwen-results qwen-cache-setup \
+            qwen-up qwen-down qwen-status qwen-bench qwen-results qwen-cache-setup \
             .qwen-cache-lib.sh scripts/prepare-authorized-keys
 
       - name: Select build target(s)

@@ -359,9 +359,137 @@ _qwen_ensure_tunnel_locked() {
   return 0
 }
 
+# Run an arbitrary vastai command with a wall-clock timeout. Kills the whole
+# process group on timeout and returns the captured stdout.
+_qwen_vast_action_timeout() {
+  local deadline="$1"
+  shift
+  if [[ ! "$deadline" =~ ^[0-9]+$ ]] || (( deadline < 5 )); then
+    deadline=45
+  fi
+  python3 - "$deadline" "$@" <<'PYACTION'
+import os, signal, subprocess, sys
+deadline = int(sys.argv[1])
+cmd = sys.argv[2:]
+try:
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+except Exception as exc:
+    print(f"failed to start {' '.join(cmd)}: {exc}")
+    raise SystemExit(127)
+try:
+    output, _ = proc.communicate(timeout=deadline)
+    if output:
+        sys.stdout.write(output)
+    raise SystemExit(proc.returncode)
+except subprocess.TimeoutExpired as exc:
+    partial = exc.output or ""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        rest, _ = proc.communicate(timeout=3)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        rest, _ = proc.communicate()
+    if isinstance(partial, bytes):
+        partial = partial.decode(errors="replace")
+    if isinstance(rest, bytes):
+        rest = rest.decode(errors="replace")
+    if partial:
+        sys.stdout.write(partial)
+    if rest and rest != partial:
+        sys.stdout.write(rest)
+    print(f"vastai {' '.join(cmd[1:])} timed out after {deadline}s")
+    raise SystemExit(124)
+PYACTION
+}
+
+# Pause (stop) a Vast instance while preserving its disk. Returns via globals:
+#   QWEN_PAUSE_OUTCOME = paused | not_found | timeout | failed
+#   QWEN_PAUSE_OUTPUT  = captured CLI stdout/stderr
+#   QWEN_PAUSE_RC      = CLI/timeout exit code
+qwen_pause_instance() {
+  local instance_id="$1"
+  local deadline="${2:-${QWEN_PAUSE_TIMEOUT_SECONDS:-60}}"
+
+  QWEN_PAUSE_OUTCOME="failed"
+  QWEN_PAUSE_OUTPUT=""
+  QWEN_PAUSE_RC=0
+
+  if QWEN_PAUSE_OUTPUT="$(_qwen_vast_action_timeout "$deadline" vastai stop instance "$instance_id" --raw)"; then
+    QWEN_PAUSE_RC=0
+  else
+    QWEN_PAUSE_RC=$?
+  fi
+
+  if grep -Eiq 'Instance [0-9]+ not found|instance[^[:alnum:]]+not found|not found' <<<"$QWEN_PAUSE_OUTPUT"; then
+    QWEN_PAUSE_OUTCOME="not_found"
+    return 0
+  fi
+
+  if (( QWEN_PAUSE_RC == 124 )); then
+    QWEN_PAUSE_OUTCOME="timeout"
+    return 124
+  fi
+
+  if (( QWEN_PAUSE_RC != 0 )) || grep -Eq '"error"[[:space:]]*:[[:space:]]*true' <<<"$QWEN_PAUSE_OUTPUT"; then
+    QWEN_PAUSE_OUTCOME="failed"
+    return "${QWEN_PAUSE_RC:-1}"
+  fi
+
+  QWEN_PAUSE_OUTCOME="paused"
+  return 0
+}
+
+# Start (resume) a stopped Vast instance. Returns via globals:
+#   QWEN_START_OUTCOME = started | not_found | timeout | failed
+#   QWEN_START_OUTPUT  = captured CLI stdout/stderr
+#   QWEN_START_RC      = CLI/timeout exit code
+qwen_start_instance() {
+  local instance_id="$1"
+  local deadline="${2:-${QWEN_START_TIMEOUT_SECONDS:-120}}"
+
+  QWEN_START_OUTCOME="failed"
+  QWEN_START_OUTPUT=""
+  QWEN_START_RC=0
+
+  if QWEN_START_OUTPUT="$(_qwen_vast_action_timeout "$deadline" vastai start instance "$instance_id" --raw)"; then
+    QWEN_START_RC=0
+  else
+    QWEN_START_RC=$?
+  fi
+
+  if grep -Eiq 'Instance [0-9]+ not found|instance[^[:alnum:]]+not found|not found' <<<"$QWEN_START_OUTPUT"; then
+    QWEN_START_OUTCOME="not_found"
+    return 0
+  fi
+
+  if (( QWEN_START_RC == 124 )); then
+    QWEN_START_OUTCOME="timeout"
+    return 124
+  fi
+
+  if (( QWEN_START_RC != 0 )) || grep -Eq '"error"[[:space:]]*:[[:space:]]*true' <<<"$QWEN_START_OUTPUT"; then
+    QWEN_START_OUTCOME="failed"
+    return "${QWEN_START_RC:-1}"
+  fi
+
+  QWEN_START_OUTCOME="started"
+  return 0
+}
+
 # Destroy a Vast instance non-interactively and with a hard deadline.
 #
-# Vast's CLI asks for irreversible-action confirmation unless -y is supplied.
 # qwen-down captures CLI output, so without -y that prompt is invisible and the
 # process appears to hang forever. Keep this helper as the only destroy path so
 # shutdown and failure cleanup cannot regress independently.
