@@ -28,8 +28,8 @@ jq -e '
   any(.profiles[]; .ctx_size == 262144) and
   ((.monitor_hardware.gpu_ranks // []) | length) > 0 and
   (.market_policy.require_free_traffic == true) and
-  (.market_policy.max_inet_down_cost == 0) and
-  (.market_policy.max_inet_up_cost == 0)
+  (.market_policy.max_inet_down_cost == 0.001) and
+  (.market_policy.max_inet_up_cost == 0.001)
 ' profiles.json >/dev/null || fail "profiles.json lost a required cumulative profile/market feature"
 
 # Compiler cache + persistent local builder.

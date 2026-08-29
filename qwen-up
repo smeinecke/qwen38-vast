@@ -703,7 +703,7 @@ offer="$(jq -c --argjson max "$MAX_DPH" \
 if [[ -z "$offer" || "$offer" == "null" ]]; then
   echo >&2 "ERROR: no matching offer at or below \$$MAX_DPH/h."
   if [[ "$REQUIRE_FREE_TRAFFIC" == "true" && "$ALLOW_PAID_TRAFFIC" != "1" ]]; then
-    echo >&2 "Traffic policy requires inet_down_cost=0 and inet_up_cost=0 (free transfer)."
+    echo >&2 "Traffic policy allows traffic up to \$0.001/GB (inet_down_cost and inet_up_cost <= 0.001)."
   fi
   echo >&2 "Raise MAX_DPH or set GPU_QUERY_OVERRIDE for this test."
   exit 4

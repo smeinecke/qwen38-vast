@@ -326,7 +326,7 @@ print_result() {
     echo '[monitor] hardware policy: same-or-better only'
   fi
   if [[ "$REQUIRE_FREE_TRAFFIC" == "true" && "$ALLOW_PAID_TRAFFIC" != "1" ]]; then
-    printf '[monitor] traffic policy: free only (download <= $%s/GB, upload <= $%s/GB)\n' "$MAX_INET_DOWN_COST" "$MAX_INET_UP_COST"
+    printf '[monitor] traffic policy: low-cost only (download <= $%s/GB, upload <= $%s/GB)\n' "$MAX_INET_DOWN_COST" "$MAX_INET_UP_COST"
   else
     echo '[monitor] traffic policy: paid transfer allowed by override'
   fi

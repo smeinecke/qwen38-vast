@@ -295,8 +295,8 @@
   },
   "market_policy": {
     "require_free_traffic": true,
-    "max_inet_down_cost": 0,
-    "max_inet_up_cost": 0,
-    "description": "Reject offers that charge for internet ingress or egress. Vast inet_*_cost values are USD/GB."
+    "max_inet_down_cost": 0.001,
+    "max_inet_up_cost": 0.001,
+    "description": "Reject offers that charge more than $0.001/GB for internet ingress or egress. Vast inet_*_cost values are USD/GB."
   }
 }
