@@ -43,7 +43,7 @@ qwen_up_restart() {
   local -a ssh_opts
   local tunnel_pid="" base_url=""
   local start_epoch now ready=0
-  local remote_log_lines=0
+  local remote_log_bytes=0
   local last_tunnel_log=0
   local runtime_preflight runtime_preflight_rc
   local last_ssh_log=0
@@ -214,10 +214,10 @@ ENV
 
   # Wait for the model and stream the remote server log while it loads.
   echo "[model] SSH tunnel is up; waiting for llama-server..."
-  local remote_status start_exit_rc new_total new_log_output
+  local remote_status start_exit_rc new_total new_log_b64 new_log_output
   remote_status="$(qwen_remote_startup_status "$ssh_url" 0 "count" 2>/dev/null || true)"
-  remote_log_lines="$(printf '%s\n' "$remote_status" | sed -n 's/^__QWEN_LOG_TOTAL__://p')"
-  remote_log_lines="${remote_log_lines:-0}"
+  remote_log_bytes="$(printf '%s\n' "$remote_status" | sed -n 's/^__QWEN_LOG_BYTES__://p')"
+  remote_log_bytes="${remote_log_bytes:-0}"
   while :; do
     now="$(date +%s)"
     if curl -fsS --connect-timeout 2 --max-time 5 \
@@ -251,15 +251,23 @@ ENV
         continue
       fi
     fi
-    remote_status="$(qwen_remote_startup_status "$ssh_url" "$remote_log_lines" 2>/dev/null || true)"
+    remote_status="$(qwen_remote_startup_status "$ssh_url" "$remote_log_bytes" 2>/dev/null || true)"
     start_exit_rc="$(printf '%s\n' "$remote_status" | sed -n 's/^__QWEN_START_EXIT__://p')"
-    new_total="$(printf '%s\n' "$remote_status" | sed -n 's/^__QWEN_LOG_TOTAL__://p')"
-    new_log_output="$(printf '%s\n' "$remote_status" | sed '/^__QWEN_START_EXIT__:/d; /^__QWEN_LOG_TOTAL__:/d')"
-    if [[ -n "$new_log_output" ]]; then
-      printf '%s\n' "$new_log_output" | sed 's/^/[remote] /' || true
+    new_total="$(printf '%s\n' "$remote_status" | sed -n 's/^__QWEN_LOG_BYTES__://p')"
+    new_log_b64="$(printf '%s\n' "$remote_status" | sed '1,2d')"
+    if [[ -n "$new_log_b64" ]]; then
+      new_log_output="$(printf '%s' "$new_log_b64" | base64 -d 2>/dev/null)"
+      if [[ -n "$new_log_output" ]]; then
+        # Print raw so CR-based progress bars overwrite in place; only add a final
+        # newline if the chunk does not already end with a newline or CR.
+        printf '%s' "$new_log_output"
+        if [[ "${new_log_output: -1}" != $'\n' && "${new_log_output: -1}" != $'\r' ]]; then
+          printf '\n'
+        fi
+      fi
     fi
     if [[ "$new_total" =~ ^[0-9]+$ ]]; then
-      remote_log_lines="$new_total"
+      remote_log_bytes="$new_total"
     fi
     if [[ "$start_exit_rc" =~ ^[0-9]+$ ]]; then
       echo >&2 "[model] ERROR: remote start.sh exited with rc=$start_exit_rc"
@@ -924,9 +932,10 @@ if qwen_cache_enabled; then
       "$STATE_FILE" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
     chmod 600 "$STATE_FILE"
     echo "[slot-cache] prefetching session=${QWEN_SLOT_CACHE_SESSION} signature=${cache_signature} from ${QWEN_SLOT_CACHE_HOST} (in parallel with model load)"
+    : > "$cache_prefetch_log"
     (
       set +e
-      qwen_cache_prefetch_to_vast "$ssh_user" "$ssh_host" "$ssh_port" "$cache_signature" >"$cache_prefetch_log" 2>&1
+      qwen_cache_prefetch_to_vast "$ssh_user" "$ssh_host" "$ssh_port" "$cache_signature" >>"$cache_prefetch_log" 2>&1
       rc=$?
       printf '%s\n' "$rc" > "$cache_prefetch_status"
       exit 0
@@ -969,8 +978,8 @@ chmod 600 "$ENV_FILE"
 echo "[model] SSH tunnel is up; waiting for GGUF download + llama-server..."
 # Start tailing from the current end of the log so we don't dump the whole file.
 remote_log_init="$(qwen_remote_startup_status "$ssh_url" 0 "count" 2>/dev/null || true)"
-remote_log_lines="$(printf '%s\n' "$remote_log_init" | sed -n 's/^__QWEN_LOG_TOTAL__://p')"
-remote_log_lines="${remote_log_lines:-0}"
+remote_log_bytes="$(printf '%s\n' "$remote_log_init" | sed -n 's/^__QWEN_LOG_BYTES__://p')"
+remote_log_bytes="${remote_log_bytes:-0}"
 last_tunnel_log=0
 while :; do
   now="$(date +%s)"
@@ -1011,18 +1020,25 @@ ENV
     fi
   fi
 
-  # Poll start.sh state and stream any new server-log lines (download/loading
-  # progress) in a single SSH round trip.
-  remote_status="$(qwen_remote_startup_status "$ssh_url" "$remote_log_lines" 2>/dev/null || true)"
+  # Poll start.sh state and stream any new server-log bytes (download/loading
+  # progress, including CR-based tqdm progress bars) in a single SSH round trip.
+  remote_status="$(qwen_remote_startup_status "$ssh_url" "$remote_log_bytes" 2>/dev/null || true)"
   start_exit_rc="$(printf '%s\n' "$remote_status" | sed -n 's/^__QWEN_START_EXIT__://p')"
-  new_total="$(printf '%s\n' "$remote_status" | sed -n 's/^__QWEN_LOG_TOTAL__://p')"
-  new_log_output="$(printf '%s\n' "$remote_status" | sed '/^__QWEN_START_EXIT__:/d; /^__QWEN_LOG_TOTAL__:/d')"
-
-  if [[ -n "$new_log_output" ]]; then
-    printf '%s\n' "$new_log_output" | sed 's/^/[remote] /' || true
+  new_total="$(printf '%s\n' "$remote_status" | sed -n 's/^__QWEN_LOG_BYTES__://p')"
+  new_log_b64="$(printf '%s\n' "$remote_status" | sed '1,2d')"
+  if [[ -n "$new_log_b64" ]]; then
+    new_log_output="$(printf '%s' "$new_log_b64" | base64 -d 2>/dev/null)"
+    if [[ -n "$new_log_output" ]]; then
+      # Print raw so CR-based progress bars overwrite in place; only add a final
+      # newline if the chunk does not already end with a newline or CR.
+      printf '%s' "$new_log_output"
+      if [[ "${new_log_output: -1}" != $'\n' && "${new_log_output: -1}" != $'\r' ]]; then
+        printf '\n'
+      fi
+    fi
   fi
   if [[ "$new_total" =~ ^[0-9]+$ ]]; then
-    remote_log_lines="$new_total"
+    remote_log_bytes="$new_total"
   fi
 
   # entrypoint.sh keeps sshd alive when start.sh exits. Detect that marker
@@ -1031,7 +1047,12 @@ ENV
   if [[ "$start_exit_rc" =~ ^[0-9]+$ ]]; then
     echo >&2 "[model] ERROR: remote start.sh exited with rc=$start_exit_rc"
     echo >&2 "[model] last remote log lines:"
-    printf '%s\n' "$new_log_output" | sed 's/^/[remote] /' >&2 || true
+    if [[ -n "${new_log_output:-}" ]]; then
+      printf '%s' "$new_log_output" >&2
+      if [[ "${new_log_output: -1}" != $'\n' && "${new_log_output: -1}" != $'\r' ]]; then
+        printf '\n' >&2
+      fi
+    fi
     cleanup_paid_instance "remote model server exited (rc=$start_exit_rc)"
     exit 8
   fi
@@ -1050,8 +1071,38 @@ done
 # is healthy. A miss/failure is non-fatal and simply leaves a cold slot.
 if qwen_cache_enabled && [[ -n "$cache_signature" ]]; then
   if [[ -n "$cache_prefetch_pid" ]]; then
+    # Poll the remote download and show a progress bar until rsync finishes.
+    # This keeps qwen-up in the foreground and visible while the snapshot is
+    # being pulled from the cache server.
+    local part_bytes total_bytes last_pct=""
+    echo "[slot-cache] waiting for snapshot download..."
+    (
+      while :; do
+        part_bytes="$(ssh "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" 'stat -c %s /var/lib/qwen38/slots/current.bin.part 2>/dev/null || echo 0' 2>/dev/null || echo 0)"
+        total_bytes="$(ssh "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" 'cat /run/qwen38/cache-prefetch.total 2>/dev/null || echo 0' 2>/dev/null || echo 0)"
+        if [[ "$part_bytes" =~ ^[0-9]+$ && "$total_bytes" =~ ^[0-9]+$ && "$total_bytes" -gt 0 ]]; then
+          local pct
+          pct="$(python3 - "$part_bytes" "$total_bytes" <<'PY'
+import sys
+b=int(sys.argv[1]); t=int(sys.argv[2])
+if t>0: print(f"{(b/t)*100:.1f}")
+else: print("0.0")
+PY
+)"
+          if [[ "$pct" != "$last_pct" ]]; then
+            printf '\r[slot-cache] download progress: %s%% (%s / %s bytes)' "$pct" "$part_bytes" "$total_bytes"
+            last_pct="$pct"
+          fi
+        fi
+        sleep 2
+      done
+    ) &
+    local cache_prefetch_progress_pid=$!
     wait "$cache_prefetch_pid" >/dev/null 2>&1 || true
     cache_prefetch_pid=""
+    kill "$cache_prefetch_progress_pid" >/dev/null 2>&1 || true
+    wait "$cache_prefetch_progress_pid" >/dev/null 2>&1 || true
+    printf '\n'
   fi
   prefetch_rc="$(cat "$cache_prefetch_status" 2>/dev/null || echo 99)"
   if [[ "$prefetch_rc" == "0" ]]; then

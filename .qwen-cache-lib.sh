@@ -162,6 +162,11 @@ if ! "${ssh_base[@]}" "${cache_user}@${cache_host}" "test -s '$remote_dir/curren
 fi
 
 start=$(date +%s)
+remote_bytes=$("${ssh_base[@]}" "${cache_user}@${cache_host}" "stat -c %s '$remote_dir/current.bin'" 2>/dev/null || echo 0)
+if [[ "$remote_bytes" =~ ^[0-9]+$ ]] && (( remote_bytes > 0 )); then
+  echo "[slot-cache] snapshot size: ${remote_bytes} bytes"
+  printf '%s\n' "$remote_bytes" > /run/qwen38/cache-prefetch.total
+fi
 rm -f "$slot_dir/current.bin.part"
 for attempt in 1 2 3; do
   if rsync -a --partial --info=progress2,stats2 \

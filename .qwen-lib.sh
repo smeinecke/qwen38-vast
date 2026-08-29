@@ -159,16 +159,19 @@ PY
     >/dev/null 2>&1 || true
 }
 
-# Fetch remote startup status and any new server-log lines since last_lines.
-# Outputs three blocks:
+# Fetch remote startup status and any new server-log bytes since last_bytes.
+# Outputs:
 #   __QWEN_START_EXIT__:<rc or empty>
-#   __QWEN_LOG_TOTAL__:<current line count>
-#   <new log lines>
+#   __QWEN_LOG_BYTES__:<current byte count>
+#   <base64 of new log bytes (no trailing newline)>
 # This is used by qwen-up to watch the model download / llama-server load and
 # to detect a failing start.sh without issuing a separate SSH call each loop.
+# Using bytes instead of lines makes CR-based progress bars (tqdm, hf download)
+# stream correctly. Base64 prevents bash command substitution from stripping
+# trailing CR/newline bytes.
 qwen_remote_startup_status() {
   local ssh_url="${1:-}"
-  local last_lines="${2:-0}"
+  local last_bytes="${2:-0}"
   local count_only="${3:-}"
   local ssh_user ssh_host ssh_port
   [[ -n "$ssh_url" ]] || return 0
@@ -186,24 +189,33 @@ PY
   local output
   mapfile -d '' -t ssh_opts < <(qwen_ssh_opts "$ssh_port")
   output="$(
-    ssh "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" bash -s -- "$last_lines" "$count_only" <<'REMOTE' 2>/dev/null
+    ssh "${ssh_opts[@]}" "${ssh_user}@${ssh_host}" bash -s -- "$last_bytes" "$count_only" <<'REMOTE' 2>/dev/null
 set +e
-last_lines="$1"
+last_bytes="$1"
 count_only="$2"
 start_exit_rc=$(cat /run/qwen38/start.exitcode 2>/dev/null || true)
-total_lines=$(wc -l < /var/log/qwen38/server.log 2>/dev/null || echo 0)
+log_file="/var/log/qwen38/server.log"
+if [[ -s "$log_file" ]]; then
+  total_bytes=$(stat -c %s "$log_file" 2>/dev/null || echo 0)
+else
+  total_bytes=0
+fi
 printf '%s\n' "__QWEN_START_EXIT__:${start_exit_rc}"
-printf '%s\n' "__QWEN_LOG_TOTAL__:${total_lines}"
-if [[ -z "$count_only" && "$total_lines" =~ ^[0-9]+$ ]]; then
-  if (( total_lines >= last_lines )); then
-    new_lines=$((total_lines - last_lines))
-    if (( new_lines > 0 )); then
-      tail -n "$new_lines" /var/log/qwen38/server.log
+printf '%s\n' "__QWEN_LOG_BYTES__:${total_bytes}"
+if [[ -z "$count_only" && "$total_bytes" =~ ^[0-9]+$ && "$last_bytes" =~ ^[0-9]+$ ]]; then
+  if (( total_bytes >= last_bytes )); then
+    new_bytes=$((total_bytes - last_bytes))
+    if (( new_bytes > 0 )); then
+      # Output base64 without newlines and do not emit a trailing newline so
+      # command substitution does not mangle the bytes (it only strips \n).
+      tail -c "$new_bytes" "$log_file" | base64 -w0
     fi
   else
-    tail -n "$total_lines" /var/log/qwen38/server.log
+    # Log was truncated/rotated; send the whole file.
+    tail -c +1 "$log_file" | base64 -w0
   fi
 fi
+printf ''
 REMOTE
   )" || true
   printf '%s\n' "$output"
