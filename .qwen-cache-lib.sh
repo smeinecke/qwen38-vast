@@ -164,7 +164,7 @@ fi
 start=$(date +%s)
 rm -f "$slot_dir/current.bin.part"
 for attempt in 1 2 3; do
-  if rsync -a --partial --info=stats2 \
+  if rsync -a --partial --info=progress2,stats2 \
     -e "ssh -i $key -p $cache_port -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$known" \
     "${cache_user}@${cache_host}:${remote_dir}/current.bin" \
     "$slot_dir/current.bin.part" < /dev/null; then
@@ -226,7 +226,7 @@ if [[ "$remote_free" =~ ^[0-9]+$ ]] && (( remote_free > 0 && remote_free < local
 fi
 start=$(date +%s)
 for attempt in 1 2 3; do
-  if rsync -a --partial --info=stats2 \
+  if rsync -a --partial --info=progress2,stats2 \
     -e "ssh -i $key -p $cache_port -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$known" \
     "$slot_dir/current.bin" "${cache_user}@${cache_host}:${remote_bin}" < /dev/null; then
     break
