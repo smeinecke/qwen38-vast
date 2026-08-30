@@ -593,6 +593,8 @@ PROFILE="$(jq -r '.name' <<<"$PROFILE_JSON")"
 IMAGE_NAME="$(jq -r '.image' <<<"$PROFILE_JSON")"
 PROFILE_CTX_SIZE="$(jq -r '.ctx_size' <<<"$PROFILE_JSON")"
 PROFILE_GPU_QUERY="$(jq -r '.gpu_query' <<<"$PROFILE_JSON")"
+PROFILE_CACHE_RAM="$(jq -r '.cache_ram // empty' <<<"$PROFILE_JSON")"
+PROFILE_CTX_CHECKPOINTS="$(jq -r '.ctx_checkpoints // empty' <<<"$PROFILE_JSON")"
 MONITOR_GROUP="$(jq -r '.monitor_group // empty' <<<"$PROFILE_JSON")"
 IMAGE_JSON="$(jq -c --arg image "$IMAGE_NAME" '[.images[] | select(.name == $image)][0] // empty' "$PROFILES_FILE")"
 if [[ -z "$IMAGE_JSON" || "$IMAGE_JSON" == "null" ]]; then
@@ -614,6 +616,8 @@ fi
 
 CTX_SIZE="${CTX_SIZE_OVERRIDE:-$PROFILE_CTX_SIZE}"
 GPU_QUERY="${GPU_QUERY_OVERRIDE:-$PROFILE_GPU_QUERY}"
+CACHE_RAM="${CACHE_RAM:-$PROFILE_CACHE_RAM}"
+CTX_CHECKPOINTS="${CTX_CHECKPOINTS:-$PROFILE_CTX_CHECKPOINTS}"
 
 if [[ "${unverified_arg:-${QWEN_ALLOW_UNVERIFIED:-0}}" == "1" ]]; then
   # Allow unverified/unknown hosts. This removes the profile's reliability
