@@ -24,7 +24,6 @@ QWEN_UNSECURE="${QWEN_UNSECURE:-0}"
 # shellcheck disable=SC1091
 source "$ROOT_DIR/.qwen-cache-lib.sh"
 qwen_cache_load_config
-qwen_cache_validate_config
 
 # Source the restart function here so it can be called early.
 # shellcheck source=/dev/stdin
@@ -86,6 +85,10 @@ qwen_up_restart() {
   QWEN_SLOT_CACHE_ROOT="$slot_cache_root"
   QWEN_SLOT_CACHE_SESSION="$slot_cache_session"
   QWEN_SLOT_CACHE_MAX_GB="$slot_cache_max_gb"
+  QWEN_SLOT_CACHE_NO_CACHE="${QWEN_SLOT_CACHE_NO_CACHE:-0}"
+  if [[ "${no_cache_arg:-0}" == "1" ]]; then
+    QWEN_SLOT_CACHE_NO_CACHE=1
+  fi
 
   gpu_name="$(jq -r '.gpu // "unknown"' "$STATE_FILE")"
   dph="$(jq -r '.dph // 0' "$STATE_FILE")"
@@ -343,7 +346,7 @@ ENV
 
   # Best-effort restore of the previously saved slot cache. The snapshot file
   # should still be on the paused instance's disk.
-  if [[ "$state_cache_enabled" == "1" && -n "$cache_signature" ]]; then
+  if qwen_cache_enabled && [[ -n "$cache_signature" ]]; then
     echo "[slot-cache] restoring saved slot cache..."
     restore_rc=0
     curl -fsS --connect-timeout 3 --max-time 600 "${CURL_CA[@]}" \
@@ -395,7 +398,7 @@ ENV
   printf '  API:       %s\n' "$base_url"
   printf '  Instance:  %s\n' "$instance_id"
   printf '  Run log:   %s\n' "$RUN_DIR"
-  if [[ "$state_cache_enabled" == "1" ]]; then
+  if qwen_cache_enabled; then
     printf '  Slot cache: %s (session=%s, signature=%s)\n' "$(jq -r '.slot_cache_restore // "unknown"' "$STATE_FILE")" "$slot_cache_session" "${cache_signature:-?}"
   fi
   printf '\nRun: source .qwen-vast/env\n'
@@ -415,14 +418,18 @@ PROFILES_FILE="${QWEN_PROFILES_FILE:-$ROOT_DIR/profiles.json}"
 usage() {
   cat <<'USAGE'
 Usage:
-  ./qwen-up [PROFILE] [--session NAME] [--local-port PORT] [--max-price USD/HOUR] [--allow-paid-traffic] [--unverified] [--unsecure] [--offer ID]
-  ./qwen-up --profile PROFILE [--session NAME] [--local-port PORT] [--max-price USD/HOUR] [--allow-paid-traffic] [--unverified] [--unsecure] [--offer ID]
-  ./qwen-up --restart [--local-port PORT] [--unsecure]
+  ./qwen-up [PROFILE] [--session NAME] [--local-port PORT] [--max-price USD/HOUR] [--allow-paid-traffic] [--unverified] [--unsecure] [--no-cache] [--offer ID]
+  ./qwen-up --profile PROFILE [--session NAME] [--local-port PORT] [--max-price USD/HOUR] [--allow-paid-traffic] [--unverified] [--unsecure] [--no-cache] [--offer ID]
+  ./qwen-up --restart [--local-port PORT] [--unsecure] [--no-cache]
 
 By default qwen-up runs in secure mode: TLS inside the SSH tunnel, a Unix
 socket on the remote, and all logs/configs/host/TLS keys on tmpfs only. Use
 --unsecure for the legacy TCP+on-disk behavior (useful if the new image has not
 been built yet or for local debugging).
+
+Use --no-cache to skip prefetching/restoring the slot cache for this run. The
+slot will start cold, but it can still be saved on shutdown unless you also pass
+--no-cache to qwen-down.
 
 Restart/resume an existing paused Vast instance from .qwen-vast/state.json.
 With --restart, qwen-up does not search the market or create a new instance;
@@ -461,6 +468,7 @@ max_price_arg=""
 allow_paid_arg=""
 unverified_arg=""
 unsecure_arg=""
+no_cache_arg=0
 offer_id_arg=""
 RESTART=0
 while (( $# > 0 )); do
@@ -509,6 +517,10 @@ while (( $# > 0 )); do
       ;;
     --unsecure)
       unsecure_arg=1
+      shift
+      ;;
+    --no-cache)
+      no_cache_arg=1
       shift
       ;;
     --offer)
@@ -564,8 +576,10 @@ fi
 if [[ -n "$unsecure_arg" ]]; then
   QWEN_UNSECURE="$unsecure_arg"
 fi
-# Validate again after CLI overrides. The initial validation above catches bad
-# .env values before any paid resources are touched.
+if [[ "$no_cache_arg" == "1" ]]; then
+  QWEN_SLOT_CACHE_NO_CACHE=1
+fi
+# Validate cache config after CLI overrides. --no-cache disables it.
 qwen_cache_validate_config
 
 if (( RESTART == 1 )); then
@@ -640,7 +654,7 @@ if [[ "$REQUIRE_FREE_TRAFFIC" == "true" && "$ALLOW_PAID_TRAFFIC" != "1" ]]; then
   # rather than duplicating it across every GPU profile.
   GPU_QUERY+=" inet_down_cost<=${MAX_INET_DOWN_COST} inet_up_cost<=${MAX_INET_UP_COST}"
 fi
-if qwen_cache_enabled; then
+if [[ "${QWEN_SLOT_CACHE_ENABLED:-0}" == "1" ]]; then
   # A slot snapshot is first written to local Vast disk before it is uploaded.
   # 100 GB avoids failing a long-context save for lack of scratch space.
   DISK_GB="${DISK_GB:-100}"

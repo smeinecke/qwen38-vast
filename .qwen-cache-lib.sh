@@ -21,7 +21,7 @@ qwen_cache_load_config() {
 }
 
 qwen_cache_enabled() {
-  [[ "${QWEN_SLOT_CACHE_ENABLED:-0}" == "1" ]]
+  [[ "${QWEN_SLOT_CACHE_ENABLED:-0}" == "1" && "${QWEN_SLOT_CACHE_NO_CACHE:-0}" != "1" ]]
 }
 
 qwen_cache_validate_config() {
@@ -171,7 +171,7 @@ if [[ "$remote_bytes" =~ ^[0-9]+$ ]] && (( remote_bytes > 0 )); then
 fi
 rm -f "$slot_dir/current.bin.part"
 for attempt in 1 2 3; do
-  if rsync -a --partial --info=progress2,stats2 \
+  if rsync -a --inplace --partial --info=progress2,stats2 \
     -e "ssh -i $key -p $cache_port -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$known" \
     "${cache_user}@${cache_host}:${remote_dir}/current.bin" \
     "$slot_dir/current.bin.part" < /dev/null; then
@@ -186,7 +186,7 @@ chmod 600 "$slot_dir/current.bin"
 
 # Metadata is optional and not needed by llama.cpp; copy it when available.
 if "${ssh_base[@]}" "${cache_user}@${cache_host}" "test -s '$remote_dir/current.json'"; then
-  rsync -a --partial \
+  rsync -a --inplace --partial \
     -e "ssh -i $key -p $cache_port -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$known" \
     "${cache_user}@${cache_host}:${remote_dir}/current.json" \
     "$slot_dir/remote-current.json" < /dev/null || true
@@ -233,7 +233,7 @@ if [[ "$remote_free" =~ ^[0-9]+$ ]] && (( remote_free > 0 && remote_free < local
 fi
 start=$(date +%s)
 for attempt in 1 2 3; do
-  if rsync -a --partial --info=progress2,stats2 \
+  if rsync -a --inplace --partial --info=progress2,stats2 \
     -e "ssh -i $key -p $cache_port -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$known" \
     "$slot_dir/current.bin" "${cache_user}@${cache_host}:${remote_bin}" < /dev/null; then
     break
@@ -243,7 +243,7 @@ for attempt in 1 2 3; do
   sleep 3
 done
 for attempt in 1 2 3; do
-  if rsync -a --partial \
+  if rsync -a --inplace --partial \
     -e "ssh -i $key -p $cache_port -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$known" \
     "$slot_dir/current.json" "${cache_user}@${cache_host}:${remote_json}" < /dev/null; then
     break
