@@ -65,9 +65,18 @@ def _upload_slot_cache_from_vast(
     known_hosts: Path,
     upload_log: Optional[Path] = None,
 ) -> bool:
-    """Run rsync on the Vast host to push current.bin/json to the cache server."""
-    if not config.cache.host:
+    """Push current.bin/json to the cache server (rsync or rclone)."""
+    cache_configured = config.cache.host or config.cache.rclone_url or config.cache.rclone_remote
+    if not cache_configured:
         return False
+
+    if config.cache.rclone:
+        script = cache.rclone_upload_script(config, slot_dir, remote_dir)
+        res = ssh.run_remote(ssh_url, "bash -s", input_data=script, known_hosts=known_hosts, timeout=1800)
+        if upload_log is not None:
+            upload_log.parent.mkdir(parents=True, exist_ok=True)
+            upload_log.write_text(res.stdout or "")
+        return res.returncode == 0 and "ok" in (res.stdout or "")
 
     script = """set -Eeuo pipefail
 umask 077
@@ -118,7 +127,8 @@ def _save_and_upload_slot_cache(
     slot_id: Optional[int] = None,
 ) -> bool:
     """Save slot, create metadata and upload to the cache server."""
-    if no_cache or not state.slot_cache_enabled or not config.cache.enabled or not config.cache.host:
+    cache_configured = config.cache.host or config.cache.rclone_url or config.cache.rclone_remote
+    if no_cache or not state.slot_cache_enabled or not config.cache.enabled or not cache_configured:
         return True
 
     if not state.ssh_url:
@@ -127,7 +137,7 @@ def _save_and_upload_slot_cache(
             raise click.ClickException("slot cache save failed and require_save is set")
         return False
 
-    if not _install_cache_key_on_vast(state, config):
+    if not config.cache.rclone and not _install_cache_key_on_vast(state, config):
         click.echo("[slot-cache] WARNING: could not install cache key on Vast", err=True)
         if config.cache.require_save:
             raise click.ClickException("slot cache key install failed and require_save is set")

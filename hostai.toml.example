@@ -51,6 +51,13 @@ session = "default"
 use_shm = false
 shm_min_gb = 0
 shm_require = false
+# Set rclone = true to use rclone instead of SSH/rsync.
+rclone = false
+# rclone_remote = "mywebdav"
+# rclone_type = "webdav"
+# rclone_url = "https://your-cache-server.example.com/"
+# rclone_user = "qwen-cache"
+# rclone_password = ""
 
 [monitor]
 threshold_pct = 10

@@ -101,6 +101,7 @@ RUN export DEBIAN_FRONTEND=noninteractive \
          tmux \
          git \
          rsync \
+         rclone \
          wget \
          curl \
          less \

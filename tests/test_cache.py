@@ -11,8 +11,12 @@ from hostai.cache import (
     ensure_cache_key,
     install_cache_key_on_vast,
     remote_cache_dir,
+    rclone_prefetch_script,
+    rclone_remote_name,
+    rclone_upload_script,
     upload_cache,
     validate_cache,
+    validate_cache_config,
 )
 
 
@@ -153,3 +157,54 @@ def test_install_cache_key_on_vast(running_state, config, project_dir):
     assert ok is True
     run.assert_called_once()
     scp.assert_called_once()
+
+
+def test_validate_cache_config_ssh(config):
+    assert validate_cache_config(config) is True
+
+
+def test_validate_cache_config_rclone_missing_url(config):
+    config.cache.rclone = True
+    config.cache.rclone_url = ""
+    config.cache.host = ""
+    assert validate_cache_config(config) is False
+
+
+def test_validate_cache_config_rclone_url(config):
+    config.cache.rclone = True
+    config.cache.rclone_url = "https://cache.example.com/"
+    config.cache.rclone_password = "secret"
+    assert validate_cache_config(config) is True
+
+
+def test_rclone_remote_name_default(config):
+    assert rclone_remote_name(config) == "qwenwebdav"
+
+
+def test_rclone_remote_name_configured(config):
+    config.cache.rclone_remote = "mywebdav"
+    assert rclone_remote_name(config) == "mywebdav"
+
+
+def test_rclone_prefetch_script_contains_rclone_copyto(config):
+    config.cache.rclone = True
+    config.cache.rclone_url = "https://cache.example.com/"
+    config.cache.rclone_password = "secret"
+    script = rclone_prefetch_script(config, "/var/lib/qwen38/slots", "qwen-slot-cache/default/sig")
+    assert "rclone copyto" in script
+    assert '"$remote_name:$remote_dir/current.bin"' in script
+    assert "RCLONE_CONFIG_QWENWEBDAV_URL" in script
+    assert "pass_plain=" in script
+    assert "rclone obscure" in script
+
+
+def test_rclone_upload_script_contains_rclone_copyto(config):
+    config.cache.rclone = True
+    config.cache.rclone_url = "https://cache.example.com/"
+    config.cache.rclone_password = "secret"
+    script = rclone_upload_script(config, "/var/lib/qwen38/slots", "qwen-slot-cache/default/sig")
+    assert "rclone copyto" in script
+    assert '"$remote_name:$remote_dir/current.bin"' in script
+    assert "RCLONE_CONFIG_QWENWEBDAV_URL" in script
+    assert "pass_plain=" in script
+    assert "rclone obscure" in script

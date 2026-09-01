@@ -162,6 +162,12 @@ class CacheSection:
     slot_id: int = 0
     local_dir: str = ""
     require_save: bool = False
+    rclone: bool = False
+    rclone_remote: str = ""
+    rclone_type: str = ""
+    rclone_url: str = ""
+    rclone_user: str = ""
+    rclone_password: str = ""
 
 
 @dataclass
@@ -252,6 +258,12 @@ ENV_MAP: Dict[str, tuple[str, str, Optional[Type[Any]]]] = {
     "QWEN_SLOT_CACHE_SLOT_ID": ("cache", "slot_id", int),
     "QWEN_SLOT_CACHE_LOCAL_DIR": ("cache", "local_dir", str),
     "QWEN_SLOT_CACHE_REQUIRE_SAVE": ("cache", "require_save", bool),
+    "QWEN_SLOT_CACHE_RCLONE": ("cache", "rclone", bool),
+    "QWEN_SLOT_CACHE_RCLONE_REMOTE": ("cache", "rclone_remote", str),
+    "QWEN_SLOT_CACHE_RCLONE_TYPE": ("cache", "rclone_type", str),
+    "QWEN_SLOT_CACHE_RCLONE_URL": ("cache", "rclone_url", str),
+    "QWEN_SLOT_CACHE_RCLONE_USER": ("cache", "rclone_user", str),
+    "QWEN_SLOT_CACHE_RCLONE_PASSWORD": ("cache", "rclone_password", str),
     "QWEN_MONITOR_THRESHOLD_PCT": ("monitor", "threshold_pct", float),
     "QWEN_MONITOR_INTERVAL": ("monitor", "interval", int),
     "QWEN_MONITOR_MAX_RESULTS": ("monitor", "max_results", int),

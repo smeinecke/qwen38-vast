@@ -14,8 +14,9 @@ Disposable Vast.ai deployment for:
 ## v8 persistent slot/KV cache
 
 v8 automatically persists the single llama.cpp slot between disposable Vast
-instances. The cache server is configured via `QWEN_SLOT_CACHE_HOST` in your
-`.env` file (see `.env.example`).
+instances. The cache server is configured in your `.env` file (see
+`.env.example`): either via SSH/rsync (`QWEN_SLOT_CACHE_HOST`) or via rclone
+(`QWEN_SLOT_CACHE_RCLONE=1`).
 
 The remote server does **not** run llama.cpp. It only needs SSH and `rsync` and
 stores `current.bin` plus a small JSON metadata file. The default cache root is
@@ -41,6 +42,23 @@ The setup command uses your existing SSH access once, adds a dedicated
 creates the remote cache directory and verifies the new key. Afterwards the
 whole lifecycle is automatic. If `rsync` is missing, install it once on the
 cache server (Ubuntu/Debian: `sudo apt install rsync`).
+
+### Alternative: rclone backend
+
+Instead of SSH/rsync, the cache can use any rclone-supported backend (WebDAV,
+S3, SFTP, etc.). Set in `.env`:
+
+```dotenv
+QWEN_SLOT_CACHE_RCLONE=1
+QWEN_SLOT_CACHE_RCLONE_TYPE=webdav
+QWEN_SLOT_CACHE_RCLONE_URL=https://your-cache-server.example.com/
+QWEN_SLOT_CACHE_RCLONE_PASSWORD=your-webdav-password
+```
+
+`QWEN_SLOT_CACHE_HOST`, `PORT`, and `KEY` are ignored when `QWEN_SLOT_CACHE_RCLONE=1`.
+`QWEN_SLOT_CACHE_USER` still sets the default backend user unless you override it
+with `QWEN_SLOT_CACHE_RCLONE_USER`. Use `QWEN_SLOT_CACHE_RCLONE_REMOTE` to point
+to a preconfigured remote in the image instead of supplying a URL.
 
 For independent coding contexts, choose a logical session name when starting:
 
@@ -351,11 +369,14 @@ GHCR_IMAGE_BASE=ghcr.io/YOUR_USER/YOUR_REPO
 QWEN_SLOT_CACHE_USER=qwen-cache   # change if your existing server user differs
 ```
 
-Then prepare the external cache once:
+Then prepare the external cache once. For SSH/rsync:
 
 ```bash
 ./qwen-cache-setup
 ```
+
+For rclone, no key setup is needed; just set the rclone variables in `.env` and
+use `./qwen-cache-setup` to validate the configuration.
 
 `HF_TOKEN` is optional because the current model repository is public.
 

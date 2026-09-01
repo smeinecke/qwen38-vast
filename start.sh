@@ -31,6 +31,12 @@ if [[ -z "${LLAMA_API_KEY:-}" ]]; then
   exit 2
 fi
 
+if [[ "${QWEN_SLOT_CACHE_RCLONE:-0}" == "1" ]] && ! command -v rclone >/dev/null 2>&1; then
+  echo "[rclone] installing rclone for slot-cache backend..."
+  apt-get update -qq
+  apt-get install -y --no-install-recommends rclone
+fi
+
 mkdir -p "$MODEL_DIR" "$SLOT_SAVE_PATH" "$QWEN_TMP_DIR" "$QWEN_LOG_DIR" "$QWEN_CERTS_DIR"
 chmod 700 "$SLOT_SAVE_PATH"
 

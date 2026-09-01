@@ -272,7 +272,8 @@ def _env_dict(
         env["CACHE_TYPE_K"] = config.model.cache_type_k
     if config.model.cache_type_v and config.model.cache_type_v != "default":
         env["CACHE_TYPE_V"] = config.model.cache_type_v
-    if not no_cache and config.cache.enabled and config.cache.host:
+    cache_configured = config.cache.host or config.cache.rclone_url or config.cache.rclone_remote
+    if not no_cache and config.cache.enabled and cache_configured:
         env["QWEN_SLOT_CACHE_ENABLED"] = "1"
         env["QWEN_SLOT_CACHE_HOST"] = config.cache.host
         env["QWEN_SLOT_CACHE_PORT"] = str(config.cache.port)
@@ -282,6 +283,18 @@ def _env_dict(
         env["QWEN_SLOT_CACHE_MAX_GB"] = str(config.cache.max_gb)
         env["QWEN_SLOT_CACHE_USE_SHM"] = "1" if config.cache.use_shm else "0"
         env["QWEN_SLOT_CACHE_LOCAL_DIR"] = slot_dir
+        if config.cache.rclone:
+            env["QWEN_SLOT_CACHE_RCLONE"] = "1"
+            if config.cache.rclone_remote:
+                env["QWEN_SLOT_CACHE_RCLONE_REMOTE"] = config.cache.rclone_remote
+            if config.cache.rclone_type:
+                env["QWEN_SLOT_CACHE_RCLONE_TYPE"] = config.cache.rclone_type
+            if config.cache.rclone_url:
+                env["QWEN_SLOT_CACHE_RCLONE_URL"] = config.cache.rclone_url
+            if config.cache.rclone_user:
+                env["QWEN_SLOT_CACHE_RCLONE_USER"] = config.cache.rclone_user
+            if config.cache.rclone_password:
+                env["QWEN_SLOT_CACHE_RCLONE_PASSWORD"] = config.cache.rclone_password
     return env
 
 
@@ -387,11 +400,17 @@ def _prefetch_slot_cache_to_vast(
     remote_dir: str,
     known_hosts: Path,
 ) -> bool:
-    """Run rsync on the Vast host to pull current.bin/json from the cache server."""
+    """Pull current.bin/json from the cache server (rsync or rclone)."""
     if not ssh_url:
         return False
-    if not config.cache.host:
+    cache_configured = config.cache.host or config.cache.rclone_url or config.cache.rclone_remote
+    if not cache_configured:
         return False
+
+    if config.cache.rclone:
+        script = cache.rclone_prefetch_script(config, slot_dir, remote_dir)
+        res = ssh.run_remote(ssh_url, "bash -s", input_data=script, known_hosts=known_hosts, timeout=1800)
+        return res.returncode == 0 and "ok" in (res.stdout or "")
 
     script = """set -Eeuo pipefail
 umask 077
@@ -627,7 +646,7 @@ def _do_fresh_core(
         cache_enabled = False
         state.slot_cache_enabled = False
 
-    if cache_enabled and not cache.install_cache_key_on_vast(state, config):
+    if cache_enabled and not config.cache.rclone and not cache.install_cache_key_on_vast(state, config):
         click.echo("[cache] WARNING: could not install cache private key; continuing cold", err=True)
         cache_enabled = False
         state.slot_cache_enabled = False
@@ -773,7 +792,7 @@ def _do_restart(
         state.slot_cache_enabled = False
 
     if cache_enabled:
-        if not cache.install_cache_key_on_vast(state, config):
+        if not config.cache.rclone and not cache.install_cache_key_on_vast(state, config):
             click.echo("[cache] WARNING: could not install cache key; continuing cold", err=True)
             cache_enabled = False
             state.slot_cache_enabled = False

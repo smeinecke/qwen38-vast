@@ -90,13 +90,135 @@ def cache_config(config: Config) -> SimpleNamespace:
         key=_cache_key_path_for_config(config),
         slot_id=config.cache.slot_id,
         require_save=config.cache.require_save,
+        rclone=config.cache.rclone,
+        rclone_remote=config.cache.rclone_remote,
+        rclone_type=config.cache.rclone_type,
+        rclone_url=config.cache.rclone_url,
+        rclone_user=config.cache.rclone_user,
+        rclone_password=config.cache.rclone_password,
     )
+
+
+def rclone_enabled(config: Config) -> bool:
+    """Return True when the rclone cache backend is enabled."""
+    return config.cache.rclone
+
+
+def rclone_remote_name(config: Config) -> str:
+    """Return the configured rclone remote name, or the built-in default."""
+    if config.cache.rclone_remote:
+        return config.cache.rclone_remote
+    return "qwenwebdav"
+
+
+def _rclone_type(config: Config) -> str:
+    """Return the configured rclone backend type, defaulting to webdav."""
+    return config.cache.rclone_type or "webdav"
+
+
+def _rclone_user(config: Config) -> str:
+    """Return the rclone backend user, falling back to the cache user."""
+    return config.cache.rclone_user or config.cache.user
+
+
+def _rclone_env_script(config: Config) -> str:
+    """Return shell export statements for a non-preconfigured rclone backend.
+
+    The password is obfuscated at runtime with ``rclone obscure`` so the raw
+    password only lives in the shell script for a single moment.  When a
+    preconfigured remote is used, no extra environment is generated.
+    """
+    if config.cache.rclone_remote:
+        return ""
+
+    name = rclone_remote_name(config).upper()
+    rtype = _rclone_type(config)
+    url = config.cache.rclone_url or config.cache.host
+    user = _rclone_user(config)
+    password = config.cache.rclone_password
+
+    lines = [
+        f"export RCLONE_CONFIG_{name}_TYPE={shlex.quote(rtype)}",
+        f"export RCLONE_CONFIG_{name}_URL={shlex.quote(url)}",
+        f"export RCLONE_CONFIG_{name}_USER={shlex.quote(user)}",
+    ]
+    if password:
+        pass_quoted = shlex.quote(password)
+        lines.extend(
+            [
+                f"pass_plain={pass_quoted}",
+                f"export RCLONE_CONFIG_{name}_PASS=\"$(printf '%s\\n' \"$pass_plain\" | rclone obscure)\"",
+                "unset pass_plain",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def rclone_prefetch_script(config: Config, slot_dir: str, remote_dir: str) -> str:
+    """Return a bash script that downloads current.bin/json via rclone."""
+    env = _rclone_env_script(config)
+    remote_name = rclone_remote_name(config)
+    return f"""set -Eeuo pipefail
+umask 077
+slot_dir={shlex.quote(slot_dir)}
+remote_dir={shlex.quote(remote_dir)}
+mkdir -p "$slot_dir"
+chmod 700 "$slot_dir"
+{env}
+remote_name={shlex.quote(remote_name)}
+rclone copyto "$remote_name:$remote_dir/current.bin" "$slot_dir/current.bin"
+rclone copyto "$remote_name:$remote_dir/current.json" "$slot_dir/current.json" || true
+chmod 600 "$slot_dir/current.bin" "$slot_dir/current.json" 2>/dev/null || true
+echo ok
+"""
+
+
+def rclone_upload_script(config: Config, slot_dir: str, remote_dir: str) -> str:
+    """Return a bash script that uploads current.bin/json via rclone."""
+    env = _rclone_env_script(config)
+    remote_name = rclone_remote_name(config)
+    return f"""set -Eeuo pipefail
+umask 077
+slot_dir={shlex.quote(slot_dir)}
+remote_dir={shlex.quote(remote_dir)}
+chmod 600 "$slot_dir/current.bin" "$slot_dir/current.json" 2>/dev/null || true
+{env}
+remote_name={shlex.quote(remote_name)}
+if ! command -v rclone >/dev/null 2>&1; then
+  apt-get update -qq
+  apt-get install -y --no-install-recommends rclone
+fi
+rclone copyto "$slot_dir/current.bin" "$remote_name:$remote_dir/current.bin"
+rclone copyto "$slot_dir/current.json" "$remote_name:$remote_dir/current.json"
+echo ok
+"""
 
 
 def validate_cache_config(config: Config) -> bool:
     """Validate cache settings; returns False and warns when invalid."""
     if not config.cache.enabled:
         return False
+
+    if not config.cache.root or ".." in config.cache.root:
+        click.echo("[cache] ERROR: invalid cache.root", err=True)
+        return False
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", config.cache.session):
+        click.echo("[cache] ERROR: cache.session must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}", err=True)
+        return False
+    if config.cache.max_gb <= 0:
+        click.echo("[cache] ERROR: cache.max_gb must be positive", err=True)
+        return False
+
+    if config.cache.rclone:
+        if config.cache.rclone_remote:
+            return True
+        if not config.cache.rclone_url and not config.cache.host:
+            click.echo("[cache] ERROR: rclone enabled but no rclone_url or host configured", err=True)
+            return False
+        if not _rclone_user(config):
+            click.echo("[cache] ERROR: rclone enabled but no user configured", err=True)
+            return False
+        return True
 
     if not config.cache.host or not re.match(r"^[A-Za-z0-9._:-]+$", config.cache.host):
         click.echo("[cache] ERROR: invalid or missing cache.host", err=True)
@@ -106,15 +228,6 @@ def validate_cache_config(config: Config) -> bool:
         return False
     if not config.cache.user or not re.match(r"^[A-Za-z0-9._-]+$", config.cache.user):
         click.echo("[cache] ERROR: invalid cache.user", err=True)
-        return False
-    if not config.cache.root or ".." in config.cache.root:
-        click.echo("[cache] ERROR: invalid cache.root", err=True)
-        return False
-    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", config.cache.session):
-        click.echo("[cache] ERROR: cache.session must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}", err=True)
-        return False
-    if config.cache.max_gb <= 0:
-        click.echo("[cache] ERROR: cache.max_gb must be positive", err=True)
         return False
     return True
 
