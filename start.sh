@@ -3,12 +3,12 @@ set -Eeuo pipefail
 
 umask 077
 
-QWEN_UNSECURE="${QWEN_UNSECURE:-0}"
-QWEN_TMPFS_BASE="${QWEN_TMPFS_BASE:-/dev/shm/qwen38}"
-QWEN_TMP_DIR="${QWEN_TMP_DIR:-$QWEN_TMPFS_BASE/tmp}"
-QWEN_LOG_DIR="${QWEN_LOG_DIR:-$QWEN_TMPFS_BASE/log}"
-QWEN_CERTS_DIR="${QWEN_CERTS_DIR:-$QWEN_TMPFS_BASE/certs}"
-QWEN_TLS_WAIT_TIMEOUT="${QWEN_TLS_WAIT_TIMEOUT:-600}"
+HOSTAI_UNSECURE="${HOSTAI_UNSECURE:-0}"
+HOSTAI_TMPFS_BASE="${HOSTAI_TMPFS_BASE:-/dev/shm/qwen38}"
+HOSTAI_TMP_DIR="${HOSTAI_TMP_DIR:-$HOSTAI_TMPFS_BASE/tmp}"
+HOSTAI_LOG_DIR="${HOSTAI_LOG_DIR:-$HOSTAI_TMPFS_BASE/log}"
+HOSTAI_CERTS_DIR="${HOSTAI_CERTS_DIR:-$HOSTAI_TMPFS_BASE/certs}"
+HOSTAI_TLS_WAIT_TIMEOUT="${HOSTAI_TLS_WAIT_TIMEOUT:-600}"
 
 HF_REPO="${HF_REPO:-HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF}"
 HF_REVISION="${HF_REVISION:-993a5971fda8f30dd1b7eb2654792ba4415c7460}"
@@ -21,7 +21,7 @@ BATCH_SIZE="${BATCH_SIZE:-2048}"
 UBATCH_SIZE="${UBATCH_SIZE:-512}"
 REASONING_EFFORT="${REASONING_EFFORT:-xhigh}"
 USE_FASTMTP="${USE_FASTMTP:-1}"
-QWEN_PROFILE="${QWEN_PROFILE:-custom}"
+HOSTAI_PROFILE="${HOSTAI_PROFILE:-custom}"
 SLOT_SAVE_PATH="${SLOT_SAVE_PATH:-/var/lib/qwen38/slots}"
 CACHE_TYPE_K="${CACHE_TYPE_K:-}"
 CACHE_TYPE_V="${CACHE_TYPE_V:-}"
@@ -31,33 +31,33 @@ if [[ -z "${LLAMA_API_KEY:-}" ]]; then
   exit 2
 fi
 
-if [[ "${QWEN_SLOT_CACHE_RCLONE:-0}" == "1" ]] && ! command -v rclone >/dev/null 2>&1; then
+if [[ "${HOSTAI_SLOT_CACHE_RCLONE:-0}" == "1" ]] && ! command -v rclone >/dev/null 2>&1; then
   echo "[rclone] installing rclone for slot-cache backend..."
   apt-get update -qq
   apt-get install -y --no-install-recommends rclone
 fi
 
-mkdir -p "$MODEL_DIR" "$SLOT_SAVE_PATH" "$QWEN_TMP_DIR" "$QWEN_LOG_DIR" "$QWEN_CERTS_DIR"
+mkdir -p "$MODEL_DIR" "$SLOT_SAVE_PATH" "$HOSTAI_TMP_DIR" "$HOSTAI_LOG_DIR" "$HOSTAI_CERTS_DIR"
 chmod 700 "$SLOT_SAVE_PATH"
 
-if [[ "$QWEN_UNSECURE" != "1" ]]; then
+if [[ "$HOSTAI_UNSECURE" != "1" ]]; then
   # Ensure the log/run paths used by other tools point to tmpfs as well.
-  mkdir -p "$QWEN_TMPFS_BASE" "$QWEN_TMPFS_BASE/log" "$QWEN_TMPFS_BASE/run" \
-           "$QWEN_TMPFS_BASE/ssh" "$QWEN_TMPFS_BASE/certs" "$QWEN_TMPFS_BASE/tmp"
+  mkdir -p "$HOSTAI_TMPFS_BASE" "$HOSTAI_TMPFS_BASE/log" "$HOSTAI_TMPFS_BASE/run" \
+           "$HOSTAI_TMPFS_BASE/ssh" "$HOSTAI_TMPFS_BASE/certs" "$HOSTAI_TMPFS_BASE/tmp"
   rm -rf /var/log/qwen38 /run/qwen38
-  ln -sfn "$QWEN_TMPFS_BASE/log" /var/log/qwen38
-  ln -sfn "$QWEN_TMPFS_BASE/run" /run/qwen38
+  ln -sfn "$HOSTAI_TMPFS_BASE/log" /var/log/qwen38
+  ln -sfn "$HOSTAI_TMPFS_BASE/run" /run/qwen38
   # Guard the socket and certs on tmpfs so only the container owner can reach
   # them, even though the parent /dev/shm is world-writable.
-  chmod 700 "$QWEN_TMPFS_BASE"
+  chmod 700 "$HOSTAI_TMPFS_BASE"
 fi
 
 # Validate the executable before downloading tens of GB. A missing runtime
 # library otherwise causes a crash only after model transfer and looks like an
 # intermittent SSH/tunnel problem from the client side.
 echo "[runtime] validating llama-server dependencies..."
-LLAMA_VERSION_OUT="$(mktemp -p "$QWEN_TMP_DIR")"
-LLAMA_VERSION_ERR="$(mktemp -p "$QWEN_TMP_DIR")"
+LLAMA_VERSION_OUT="$(mktemp -p "$HOSTAI_TMP_DIR")"
+LLAMA_VERSION_ERR="$(mktemp -p "$HOSTAI_TMP_DIR")"
 trap 'rm -f "$LLAMA_VERSION_OUT" "$LLAMA_VERSION_ERR"' EXIT
 
 if ! /usr/local/bin/llama-server --version >"$LLAMA_VERSION_OUT" 2>"$LLAMA_VERSION_ERR"; then
@@ -142,7 +142,7 @@ fi
 # Do not forward the Hugging Face credential into llama-server's environment.
 unset HF_TOKEN HUGGING_FACE_HUB_TOKEN || true
 
-if [[ "$QWEN_UNSECURE" == "1" ]]; then
+if [[ "$HOSTAI_UNSECURE" == "1" ]]; then
   # Legacy path: TCP on loopback. Cert handling is skipped.
   BIND_HOST="${BIND_HOST:-127.0.0.1}"
   PORT="${PORT:-8080}"
@@ -153,16 +153,16 @@ if [[ "$QWEN_UNSECURE" == "1" ]]; then
   llama_bind="$BIND_HOST:$PORT"
 else
   # Secure path: HTTPS over a Unix domain socket on tmpfs.
-  llama_socket="$QWEN_TMPFS_BASE/llama.sock"
-  cert_file="$QWEN_CERTS_DIR/server.crt"
-  key_file="$QWEN_CERTS_DIR/server.key"
+  llama_socket="$HOSTAI_TMPFS_BASE/llama.sock"
+  cert_file="$HOSTAI_CERTS_DIR/server.crt"
+  key_file="$HOSTAI_CERTS_DIR/server.key"
 
-  echo "[secure] waiting for TLS certificate delivery to tmpfs (timeout ${QWEN_TLS_WAIT_TIMEOUT}s)..."
+  echo "[secure] waiting for TLS certificate delivery to tmpfs (timeout ${HOSTAI_TLS_WAIT_TIMEOUT}s)..."
   waited=0
   while [[ ! -f "$cert_file" || ! -f "$key_file" ]]; do
-    if (( waited >= QWEN_TLS_WAIT_TIMEOUT )); then
-      echo >&2 "ERROR: TLS certificate/key did not arrive at $QWEN_CERTS_DIR within ${QWEN_TLS_WAIT_TIMEOUT}s."
-      echo >&2 "       Run qwen-up without --unsecure, or check the SSH delivery to the Vast host."
+    if (( waited >= HOSTAI_TLS_WAIT_TIMEOUT )); then
+      echo >&2 "ERROR: TLS certificate/key did not arrive at $HOSTAI_CERTS_DIR within ${HOSTAI_TLS_WAIT_TIMEOUT}s."
+      echo >&2 "       Run hostai up without --unsecure, or check the SSH delivery to the Vast host."
       exit 70
     fi
     sleep 1
@@ -171,7 +171,7 @@ else
 
   # Drop certificate material from the environment so it is not visible in
   # /proc/<pid>/environ after we have written it to tmpfs.
-  unset QWEN_TLS_CERT_B64 QWEN_TLS_KEY_B64 || true
+  unset HOSTAI_TLS_CERT_B64 HOSTAI_TLS_KEY_B64 || true
 
   # The llama-server treats any --host value ending in .sock as a Unix socket.
   server_args+=(
@@ -182,11 +182,11 @@ else
   llama_bind="unix://$llama_socket"
 fi
 
-echo "[serve] profile=$QWEN_PROFILE model=$MODEL revision=$HF_REVISION ctx=$CTX_SIZE fastmtp=$USE_FASTMTP bind=$llama_bind slot_save_path=$SLOT_SAVE_PATH"
+echo "[serve] profile=$HOSTAI_PROFILE model=$MODEL revision=$HF_REVISION ctx=$CTX_SIZE fastmtp=$USE_FASTMTP bind=$llama_bind slot_save_path=$SLOT_SAVE_PATH"
 echo "[runtime] GPU snapshot:"
 nvidia-smi --query-gpu=timestamp,index,name,driver_version,memory.total,power.limit --format=csv,noheader 2>&1 || nvidia-smi 2>&1 || true
 
-if [[ "$QWEN_UNSECURE" == "1" ]]; then
+if [[ "$HOSTAI_UNSECURE" == "1" ]]; then
   # Legacy: just run the server; no key to remove.
   exec /usr/local/bin/llama-server "${server_args[@]}"
 fi
@@ -198,7 +198,7 @@ fi
 /usr/local/bin/llama-server "${server_args[@]}" &
 llama_pid=$!
 
-QWEN_TLS_SOCKET_TIMEOUT="${QWEN_TLS_SOCKET_TIMEOUT:-1800}"
+HOSTAI_TLS_SOCKET_TIMEOUT="${HOSTAI_TLS_SOCKET_TIMEOUT:-1800}"
 socket_wait=0
 while [[ ! -S "$llama_socket" ]]; do
   if ! kill -0 "$llama_pid" >/dev/null 2>&1; then
@@ -206,8 +206,8 @@ while [[ ! -S "$llama_socket" ]]; do
     wait "$llama_pid" || true
     exit 70
   fi
-  if (( socket_wait >= QWEN_TLS_SOCKET_TIMEOUT )); then
-    echo >&2 "ERROR: llama-server did not create $llama_socket within ${QWEN_TLS_SOCKET_TIMEOUT}s."
+  if (( socket_wait >= HOSTAI_TLS_SOCKET_TIMEOUT )); then
+    echo >&2 "ERROR: llama-server did not create $llama_socket within ${HOSTAI_TLS_SOCKET_TIMEOUT}s."
     kill -TERM "$llama_pid" >/dev/null 2>&1 || true
     wait "$llama_pid" || true
     exit 70

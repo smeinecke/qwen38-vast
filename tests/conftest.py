@@ -37,7 +37,6 @@ def config(project_dir):
     cfg.hostai.profiles_file = "hostai.profiles.toml"
     cfg.market.max_dph = 1.0
     cfg.market.disk_gb = 100
-    cfg.market.allow_paid_traffic = False
     cfg.model.model = "model.gguf"
     cfg.model.hf_repo = "repo"
     cfg.model.hf_revision = "rev"

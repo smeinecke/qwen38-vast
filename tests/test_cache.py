@@ -178,7 +178,7 @@ def test_validate_cache_config_rclone_url(config):
 
 
 def test_rclone_remote_name_default(config):
-    assert rclone_remote_name(config) == "qwenwebdav"
+    assert rclone_remote_name(config) == "hostai"
 
 
 def test_rclone_remote_name_configured(config):
@@ -193,7 +193,7 @@ def test_rclone_prefetch_script_contains_rclone_copyto(config):
     script = rclone_prefetch_script(config, "/var/lib/qwen38/slots", "qwen-slot-cache/default/sig")
     assert "rclone copyto" in script
     assert '"$remote_name:$remote_dir/current.bin"' in script
-    assert "RCLONE_CONFIG_QWENWEBDAV_URL" in script
+    assert "RCLONE_CONFIG_HOSTAI_URL" in script
     assert "pass_plain=" in script
     assert "rclone obscure" in script
 
@@ -205,6 +205,6 @@ def test_rclone_upload_script_contains_rclone_copyto(config):
     script = rclone_upload_script(config, "/var/lib/qwen38/slots", "qwen-slot-cache/default/sig")
     assert "rclone copyto" in script
     assert '"$remote_name:$remote_dir/current.bin"' in script
-    assert "RCLONE_CONFIG_QWENWEBDAV_URL" in script
+    assert "RCLONE_CONFIG_HOSTAI_URL" in script
     assert "pass_plain=" in script
     assert "rclone obscure" in script

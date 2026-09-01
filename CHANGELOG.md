@@ -30,7 +30,6 @@
 - Applies the same traffic policy to `qwen-up` and `qwen-monitor`.
 - Centralizes traffic limits in `profiles.json -> market_policy`; no duplicated profile query edits.
 - Validates raw search results as a second guard and prints selected traffic prices before rental.
-- Adds `QWEN_ALLOW_PAID_TRAFFIC=1` as an explicit emergency override.
 - Persists selected upload/download traffic prices in local instance state.
 
 ## v9.3.1 - race-free, self-healing SSH tunnels
@@ -55,7 +54,7 @@
 - Fixed `qwen-down` hanging indefinitely at `Destroying Vast instance ...`: Vast CLI requires `-y` to skip its own irreversible-action confirmation. Because qwen-down captured CLI output, that second prompt was invisible.
 - Fixed the same missing `-y` in `qwen-up` failure cleanup.
 - Centralized destroy handling in `qwen_destroy_instance`.
-- Added `QWEN_DESTROY_TIMEOUT_SECONDS` (default 45s) so a genuine Vast CLI/API stall cannot block forever.
+- Added `HOSTAI_DESTROY_TIMEOUT_SECONDS` (default 45s) so a genuine Vast CLI/API stall cannot block forever.
 - HTTP/API-style 404 `not found` remains a successful shutdown outcome.
 - On timeout or real error, local state is retained for a safe retry instead of pretending the rental was destroyed.
 
@@ -76,16 +75,16 @@
 - Added exact/value profiles for 32k, 64k and 128k operation plus `monitor_group` metadata so only context-equivalent profiles are compared.
 - Added `qwen-monitor` with one-shot, foreground watch and background-daemon modes. It compares the running instance's live `dph_total` with current rentable offers and defaults to alerting at >=10% savings.
 - Market comparisons use the same Vast storage size and preserve the normal profile reliability/network/disk constraints. Alerts include profile, GPU, price, saving, location, network/disk speed, reliability and offer ID.
-- `qwen-status` shows monitor state and the latest qualifying alert; `qwen-down` stops a background monitor before cache save/destroy. Optional `QWEN_MONITOR_AUTO_START=1` starts it after a successful `qwen-up`.
+- `qwen-status` shows monitor state and the latest qualifying alert; `qwen-down` stops a background monitor before cache save/destroy. Optional `HOSTAI_MONITOR_AUTO_START=1` starts it after a successful `qwen-up`.
 - `qwen-up` now persists `disk_gb`, resolved `gpu_query` and `monitor_group` in run state/telemetry so market comparisons remain auditable.
 
 ## v8 - automatic cross-instance slot/KV persistence
 
 - Added `.qwen-cache-lib.sh` and `qwen-cache-setup` for a dedicated restricted SSH key and an external rsync-backed llama.cpp slot cache. Setup now verifies remote `rsync` before any GPU is rented.
-- Cache host is configured in `.env` via `QWEN_SLOT_CACHE_HOST`; cache user/root/session remain editable in `.env`. `qwen-up --session NAME` selects an independent persistent context without manual transfers.
+- Cache host is configured in `.env` via `HOSTAI_SLOT_CACHE_HOST`; cache user/root/session remain editable in `.env`. `qwen-up --session NAME` selects an independent persistent context without manual transfers.
 - `qwen-up` automatically prefetches a compatibility-scoped snapshot from the external server in parallel with model loading and restores slot 0 after llama-server becomes healthy.
 - `qwen-down` automatically saves slot 0, uploads `current.bin`/metadata atomically, prunes old snapshots above the configured size budget, and only then destroys the Vast instance.
-- Added `QWEN_SLOT_CACHE_REQUIRE_SAVE` and `--no-cache` shutdown policies.
+- Added `HOSTAI_SLOT_CACHE_REQUIRE_SAVE` and `--no-cache` shutdown policies.
 - Cache signatures include llama.cpp commit, model/revision, context size, FastMTP and KV precision to avoid restoring incompatible state.
 - `start.sh` enables `--slots` and `--slot-save-path`; runtime build metadata now records the llama.cpp commit.
 - `qwen-bench` records `cache_n`, evaluated prompt tokens and cache-hit percentage; `qwen-results` includes a `cache` column so hybrid-model restore effectiveness can be verified rather than inferred from the restore API response.

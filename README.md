@@ -15,8 +15,8 @@ Disposable Vast.ai deployment for:
 
 v8 automatically persists the single llama.cpp slot between disposable Vast
 instances. The cache server is configured in your `.env` file (see
-`.env.example`): either via SSH/rsync (`QWEN_SLOT_CACHE_HOST`) or via rclone
-(`QWEN_SLOT_CACHE_RCLONE=1`).
+`.env.example`): either via SSH/rsync (`HOSTAI_SLOT_CACHE_HOST`) or via rclone
+(`HOSTAI_SLOT_CACHE_RCLONE=1`).
 
 The remote server does **not** run llama.cpp. It only needs SSH and `rsync` and
 stores `current.bin` plus a small JSON metadata file. The default cache root is
@@ -27,7 +27,7 @@ committed. One-time setup:
 
 ```bash
 cp .env.example .env
-# If the existing remote user is not qwen-cache, edit QWEN_SLOT_CACHE_USER.
+# If the existing remote user is not qwen-cache, edit HOSTAI_SLOT_CACHE_USER.
 ./qwen-cache-setup
 ```
 
@@ -49,15 +49,15 @@ Instead of SSH/rsync, the cache can use any rclone-supported backend (WebDAV,
 S3, SFTP, etc.). Set in `.env`:
 
 ```dotenv
-QWEN_SLOT_CACHE_RCLONE=1
-QWEN_SLOT_CACHE_RCLONE_TYPE=webdav
-QWEN_SLOT_CACHE_RCLONE_URL=https://your-cache-server.example.com/
-QWEN_SLOT_CACHE_RCLONE_PASSWORD=your-webdav-password
+HOSTAI_SLOT_CACHE_RCLONE=1
+HOSTAI_SLOT_CACHE_RCLONE_TYPE=webdav
+HOSTAI_SLOT_CACHE_RCLONE_URL=https://your-cache-server.example.com/
+HOSTAI_SLOT_CACHE_RCLONE_PASSWORD=your-webdav-password
 ```
 
-`QWEN_SLOT_CACHE_HOST`, `PORT`, and `KEY` are ignored when `QWEN_SLOT_CACHE_RCLONE=1`.
-`QWEN_SLOT_CACHE_USER` still sets the default backend user unless you override it
-with `QWEN_SLOT_CACHE_RCLONE_USER`. Use `QWEN_SLOT_CACHE_RCLONE_REMOTE` to point
+`HOSTAI_SLOT_CACHE_HOST`, `PORT`, and `KEY` are ignored when `HOSTAI_SLOT_CACHE_RCLONE=1`.
+`HOSTAI_SLOT_CACHE_USER` still sets the default backend user unless you override it
+with `HOSTAI_SLOT_CACHE_RCLONE_USER`. Use `HOSTAI_SLOT_CACHE_RCLONE_REMOTE` to point
 to a preconfigured remote in the image instead of supplying a URL.
 
 For independent coding contexts, choose a logical session name when starting:
@@ -92,7 +92,7 @@ match; a 64k and 128k context intentionally do not share one.
 `qwen-down` now does this before destroying the paid host:
 
 ```text
-slot 0 -> llama.cpp save -> Vast NVMe current.bin -> rsync -> QWEN_SLOT_CACHE_HOST
+slot 0 -> llama.cpp save -> Vast NVMe current.bin -> rsync -> HOSTAI_SLOT_CACHE_HOST
         -> atomic current.bin replacement -> retention -> destroy Vast instance
 ```
 
@@ -112,12 +112,12 @@ By default a cache upload failure is logged but the instance is still destroyed
 so a storage outage cannot accidentally keep GPU billing running. Set:
 
 ```dotenv
-QWEN_SLOT_CACHE_REQUIRE_SAVE=1
+HOSTAI_SLOT_CACHE_REQUIRE_SAVE=1
 ```
 
 if losing the latest snapshot is worse than leaving the Vast instance running.
 
-The 100 GB cache server defaults to `QWEN_SLOT_CACHE_MAX_GB=80`. After a
+The 100 GB cache server defaults to `HOSTAI_SLOT_CACHE_MAX_GB=80`. After a
 successful upload, v8 deletes the oldest *other* session/signature snapshots
 until usage is below the budget. The snapshot just uploaded is never pruned.
 
@@ -221,9 +221,10 @@ All rental and monitor searches also apply the central `market_policy` from
 `profiles.json`. By default both `inet_down_cost` and `inet_up_cost` must be zero.
 Vast reports these fields in USD/GB. This is intentionally separate from the GPU
 profiles because downloading a ~20 GB container/model can otherwise cost more than
-the short GPU rental itself. `qwen-up` prints the selected offer's transfer prices
-before renting and also validates the raw offer response. Set
-`QWEN_ALLOW_PAID_TRAFFIC=1` only as an explicit emergency override.
+the short GPU rental itself. `hostai up` prints the selected offer's transfer prices
+before renting and also validates the raw offer response. Adjust
+`HOSTAI_MAX_INET_DOWN_COST` and `HOSTAI_MAX_INET_UP_COST` to allow paid traffic up
+to a specific price, or set them to `0` to require free traffic.
 
 ### Cumulative feature validation
 
@@ -301,13 +302,13 @@ For an organization repository or a different key, set one of these GitHub
 **repository variables**:
 
 ```text
-QWEN_SSH_GITHUB_USER = your-github-user
+HOSTAI_SSH_GITHUB_USER = your-github-user
 ```
 
 or:
 
 ```text
-QWEN_SSH_PUBLIC_KEY = ssh-ed25519 AAAA... user@host
+HOSTAI_SSH_PUBLIC_KEY = ssh-ed25519 AAAA... user@host
 ```
 
 You can also commit one or more public keys to `ssh/authorized_keys`. Public keys
@@ -366,7 +367,7 @@ At minimum set:
 
 ```dotenv
 GHCR_IMAGE_BASE=ghcr.io/YOUR_USER/YOUR_REPO
-QWEN_SLOT_CACHE_USER=qwen-cache   # change if your existing server user differs
+HOSTAI_SLOT_CACHE_USER=qwen-cache   # change if your existing server user differs
 ```
 
 Then prepare the external cache once. For SSH/rsync:
@@ -390,7 +391,7 @@ use `./qwen-cache-setup` to validate the configuration.
 ./qwen-up blackwell-128k
 ```
 
-Calling `./qwen-up` without an argument uses `QWEN_PROFILE` from `.env`, falling
+Calling `./qwen-up` without an argument uses `HOSTAI_PROFILE` from `.env`, falling
 back to `default_profile` from `profiles.json`.
 
 One-off context test:
@@ -578,10 +579,10 @@ Background daemon:
 Defaults in `.env`:
 
 ```dotenv
-QWEN_MONITOR_THRESHOLD_PCT=10
-QWEN_MONITOR_INTERVAL=180
-QWEN_MONITOR_MAX_RESULTS=5
-QWEN_MONITOR_AUTO_START=0
+HOSTAI_MONITOR_THRESHOLD_PCT=10
+HOSTAI_MONITOR_INTERVAL=180
+HOSTAI_MONITOR_MAX_RESULTS=5
+HOSTAI_MONITOR_AUTO_START=0
 ```
 
 When a qualifying offer appears, the monitor prints the profile, GPU, all-in
@@ -598,7 +599,7 @@ uv run ./qwen-up 5090-128k --session my-project
 ```
 
 `qwen-down` automatically stops a background monitor before saving the slot and
-destroying the instance. Set `QWEN_MONITOR_AUTO_START=1` if every successful
+destroying the instance. Set `HOSTAI_MONITOR_AUTO_START=1` if every successful
 `qwen-up` should start the monitor automatically.
 
 If `CTX_SIZE_OVERRIDE` uses a context size for which no explicit profile exists,

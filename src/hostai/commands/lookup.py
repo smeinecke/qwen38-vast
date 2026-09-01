@@ -18,7 +18,6 @@ def _resolve_query(
     profiles: Profiles,
     profile: Any,
     max_price: Optional[float],
-    allow_paid: bool,
     unverified: bool,
 ) -> tuple[str, float, int]:
     if max_price is not None and max_price < 0:
@@ -36,7 +35,7 @@ def _resolve_query(
         query = re.sub(r"\s+", " ", query).strip()
         query += ' verification in ["verified","unverified","deverified"]'
 
-    if require_free and not allow_paid:
+    if require_free:
         query += f" inet_down_cost<={max_down} inet_up_cost<={max_up}"
 
     if "dph" not in query:
@@ -46,14 +45,14 @@ def _resolve_query(
 
 
 def _filter_offers(
-    offers: List[Dict[str, Any]], max_dph: float, require_free: bool, allow_paid: bool, max_down: float, max_up: float
+    offers: List[Dict[str, Any]], max_dph: float, require_free: bool, max_down: float, max_up: float
 ) -> List[Dict[str, Any]]:
     out = []
     for o in offers:
         o["_effective_dph"] = o.get("dph_total", 999999)
         if o["_effective_dph"] > max_dph:
             continue
-        if require_free and not allow_paid:
+        if require_free:
             down = o.get("inet_down_cost")
             up = o.get("inet_up_cost")
             if (down is None or down > max_down) or (up is None or up > max_up):
@@ -121,15 +120,12 @@ def _resolve_profile(config: Config, profiles: Profiles, name: Optional[str]):
 @click.argument("profile", required=False)
 @click.option("-p", "--profile", "profile_opt", help="Profile to look up (alias for the positional argument).")
 @click.option("--max-price", type=float, default=None, help="Maximum all-in $/h.")
-@click.option("--allow-paid-traffic", is_flag=True, default=None, help="Allow paid traffic.")
 @click.option("--unverified", is_flag=True, default=None, help="Also consider unverified/unknown hosts.")
 @click.option("--max-results", type=int, default=10, show_default=True, help="Number of results to show.")
 @click.option("--json", "output_format", flag_value="json", help="Output raw JSON array.")
 @click.option("--csv", "output_format", flag_value="csv", help="Output CSV.")
 @click.pass_obj
-def cmd_lookup(
-    config: Config, profile, profile_opt, max_price, allow_paid_traffic, unverified, max_results, output_format
-):
+def cmd_lookup(config: Config, profile, profile_opt, max_price, unverified, max_results, output_format):
     if max_results <= 0:
         raise click.ClickException("--max-results must be a positive integer")
 
@@ -144,10 +140,9 @@ def cmd_lookup(
     if not image:
         raise click.ClickException(f"profile '{selected.name}' references unknown image '{selected.image}'")
 
-    allow_paid = allow_paid_traffic if allow_paid_traffic is not None else config.market.allow_paid_traffic
     unverified = unverified if unverified is not None else config.market.allow_unverified
 
-    query, max_dph, ctx_size = _resolve_query(config, profiles, selected, max_price, allow_paid, unverified)
+    query, max_dph, ctx_size = _resolve_query(config, profiles, selected, max_price, unverified)
 
     click.echo(f"[profile] {selected.name} | sm_{image.cuda_arch} | ctx={ctx_size} | image={selected.image}")
     click.echo(f"[search]  {query}")
@@ -167,7 +162,6 @@ def cmd_lookup(
         offers,
         max_dph,
         profiles.market_policy.require_free_traffic,
-        allow_paid,
         config.market.max_inet_down_cost,
         config.market.max_inet_up_cost,
     )

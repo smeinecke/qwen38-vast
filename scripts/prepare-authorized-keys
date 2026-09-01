@@ -8,15 +8,15 @@ TMP="$(mktemp)"
 trap 'rm -f "$TMP" "$TMP.keys"' EXIT
 mkdir -p "$SSH_DIR"
 
-# A public key is not a secret. An explicit QWEN_SSH_PUBLIC_KEY wins over the
+# A public key is not a secret. An explicit HOSTAI_SSH_PUBLIC_KEY wins over the
 # automatic GitHub-account lookup so a single deliberately chosen key can be
 # baked when desired.
-if [[ -n "${QWEN_SSH_PUBLIC_KEY:-}" ]]; then
-  printf '%s\n' "$QWEN_SSH_PUBLIC_KEY" >> "$TMP"
+if [[ -n "${HOSTAI_SSH_PUBLIC_KEY:-}" ]]; then
+  printf '%s\n' "$HOSTAI_SSH_PUBLIC_KEY" >> "$TMP"
 else
   # By default use the GitHub account that owns the repository. GitHub exposes
   # authentication public keys at https://github.com/<user>.keys.
-  GITHUB_USER="${QWEN_SSH_GITHUB_USER:-${QWEN_SSH_DEFAULT_GITHUB_USER:-${GITHUB_REPOSITORY_OWNER:-}}}"
+  GITHUB_USER="${HOSTAI_SSH_GITHUB_USER:-${HOSTAI_SSH_DEFAULT_GITHUB_USER:-${GITHUB_REPOSITORY_OWNER:-}}}"
   if [[ -n "$GITHUB_USER" ]]; then
     echo "[ssh-keys] fetching public SSH keys for GitHub user: $GITHUB_USER"
     curl -fsSL --retry 3 --connect-timeout 10 "https://github.com/${GITHUB_USER}.keys" >> "$TMP" || {
@@ -41,10 +41,10 @@ if [[ ! -s "$TMP.keys" ]]; then
   cat >&2 <<'MSG'
 ERROR: no SSH public key is available for the runtime image.
 Set one of:
-  - GitHub repository variable QWEN_SSH_PUBLIC_KEY
-  - GitHub repository variable QWEN_SSH_GITHUB_USER
+  - GitHub repository variable HOSTAI_SSH_PUBLIC_KEY
+  - GitHub repository variable HOSTAI_SSH_GITHUB_USER
   - ssh/authorized_keys in the repository
-For GitHub Actions, QWEN_SSH_GITHUB_USER defaults to the repository owner.
+For GitHub Actions, HOSTAI_SSH_GITHUB_USER defaults to the repository owner.
 MSG
   exit 3
 fi

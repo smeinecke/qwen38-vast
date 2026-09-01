@@ -20,7 +20,7 @@ ARG FASTMTP_PATCH_SHA256=981285400b59dc45cf99936b6ff66d4b3aa0f1b532f85fa51418cb4
 #   89  = Ada Lovelace (RTX 4090, RTX 6000 Ada, RTX 5880 Ada, L40/L40S)
 #   120 = Blackwell GeForce/RTX PRO (RTX 5090, RTX PRO 6000 Blackwell)
 ARG CUDA_ARCHITECTURES=86
-ARG QWEN_BUILD_PROFILE=custom
+ARG HOSTAI_BUILD_PROFILE=custom
 # Passed by CI from the compiler-cache key. Referencing this value in the
 # compile RUN deliberately invalidates only that layer when the compiler-cache
 # generation changes. This guarantees one real compile to populate an empty
@@ -81,9 +81,9 @@ FROM ${RUNTIME_BASE} AS runtime
 ARG HF_HUB_VERSION=1.28.0
 ARG LLAMA_CPP_COMMIT=4df29be4f4c3673f428170fda944a5b19f743bb8
 ARG CUDA_ARCHITECTURES=86
-ARG QWEN_BUILD_PROFILE=custom
+ARG HOSTAI_BUILD_PROFILE=custom
 
-LABEL io.qwen38.profile="${QWEN_BUILD_PROFILE}" \
+LABEL io.qwen38.profile="${HOSTAI_BUILD_PROFILE}" \
       io.qwen38.cuda-arch="${CUDA_ARCHITECTURES}" \
       io.qwen38.llama-cpp-commit="${LLAMA_CPP_COMMIT}"
 
@@ -143,7 +143,7 @@ RUN chmod 0755 /usr/local/bin/start.sh /usr/local/bin/entrypoint.sh /usr/local/b
          echo >&2 'ERROR: image build contains no SSH public key; run scripts/prepare-authorized-keys first'; exit 2; \
        fi \
     && printf '{"llama_cpp_commit":"%s","cuda_arch":"%s","build_profile":"%s"}\n' \
-         "$LLAMA_CPP_COMMIT" "$CUDA_ARCHITECTURES" "$QWEN_BUILD_PROFILE" > /etc/qwen38-build.json \
+         "$LLAMA_CPP_COMMIT" "$CUDA_ARCHITECTURES" "$HOSTAI_BUILD_PROFILE" > /etc/qwen38-build.json \
     && chmod 0444 /etc/qwen38-build.json \
     && printf '%s\n' \
          'PermitRootLogin prohibit-password' \

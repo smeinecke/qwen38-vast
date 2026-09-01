@@ -36,7 +36,7 @@ def test_resolve_query_basic(config):
     profiles = mock.Mock()
     profiles.market_policy.require_free_traffic = False
 
-    query, max_dph, ctx_size = _resolve_query(config, profiles, profile, None, False, False)
+    query, max_dph, ctx_size = _resolve_query(config, profiles, profile, None, False)
     assert "RTX 4090" in query
     assert max_dph == 1.0
     assert ctx_size == 32768
@@ -48,7 +48,7 @@ def test_resolve_query_negative_max_price(config):
     profile.ctx_size = 32768
     profiles = mock.Mock()
     with pytest.raises(click.ClickException, match="non-negative"):
-        _resolve_query(config, profiles, profile, -1.0, False, False)
+        _resolve_query(config, profiles, profile, -1.0, False)
 
 
 def test_resolve_query_ctx_fallback(config):
@@ -57,13 +57,13 @@ def test_resolve_query_ctx_fallback(config):
     profile.ctx_size = None
     profiles = mock.Mock()
     profiles.market_policy.require_free_traffic = False
-    _, _, ctx_size = _resolve_query(config, profiles, profile, None, False, False)
+    _, _, ctx_size = _resolve_query(config, profiles, profile, None, False)
     assert ctx_size == 0
 
 
 def test_filter_offers_respects_max_dph():
     offers = [make_offer({"dph_total": 0.4}), make_offer({"dph_total": 1.5})]
-    filtered = _filter_offers(offers, max_dph=1.0, require_free=False, allow_paid=False, max_down=0.001, max_up=0.001)
+    filtered = _filter_offers(offers, max_dph=1.0, require_free=False, max_down=0.001, max_up=0.001)
     assert len(filtered) == 1
     assert filtered[0]["dph_total"] == 0.4
 
@@ -73,7 +73,7 @@ def test_filter_offers_free_traffic():
         make_offer({"inet_down_cost": 0.0, "inet_up_cost": 0.0}),
         make_offer({"inet_down_cost": 0.01, "inet_up_cost": 0.0}),
     ]
-    filtered = _filter_offers(offers, max_dph=1.0, require_free=True, allow_paid=False, max_down=0.001, max_up=0.001)
+    filtered = _filter_offers(offers, max_dph=1.0, require_free=True, max_down=0.001, max_up=0.001)
     assert len(filtered) == 1
     assert filtered[0]["inet_down_cost"] == 0.0
 

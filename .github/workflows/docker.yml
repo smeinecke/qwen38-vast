@@ -62,9 +62,9 @@ jobs:
 
       - name: Prepare baked SSH public key
         env:
-          QWEN_SSH_PUBLIC_KEY: ${{ vars.QWEN_SSH_PUBLIC_KEY }}
-          QWEN_SSH_GITHUB_USER: ${{ vars.QWEN_SSH_GITHUB_USER }}
-          QWEN_SSH_DEFAULT_GITHUB_USER: ${{ github.repository_owner }}
+          HOSTAI_SSH_PUBLIC_KEY: ${{ vars.HOSTAI_SSH_PUBLIC_KEY }}
+          HOSTAI_SSH_GITHUB_USER: ${{ vars.HOSTAI_SSH_GITHUB_USER }}
+          HOSTAI_SSH_DEFAULT_GITHUB_USER: ${{ github.repository_owner }}
         run: ./scripts/prepare-authorized-keys
 
       - name: Set up Docker Buildx
@@ -128,7 +128,7 @@ jobs:
             BUILDER_BASE=${{ matrix.builder_base }}
             RUNTIME_BASE=${{ matrix.runtime_base }}
             CUDA_ARCHITECTURES=${{ matrix.cuda_arch }}
-            QWEN_BUILD_PROFILE=${{ matrix.profile }}
+            HOSTAI_BUILD_PROFILE=${{ matrix.profile }}
             CCACHE_SEED=${{ hashFiles('Dockerfile') }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

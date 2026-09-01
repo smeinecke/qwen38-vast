@@ -4,20 +4,20 @@ set -Eeuo pipefail
 umask 077
 install -d -m 0700 -o root -g root /root/.ssh
 
-QWEN_UNSECURE="${QWEN_UNSECURE:-0}"
-QWEN_TMPFS_BASE="${QWEN_TMPFS_BASE:-/dev/shm/qwen38}"
+HOSTAI_UNSECURE="${HOSTAI_UNSECURE:-0}"
+HOSTAI_TMPFS_BASE="${HOSTAI_TMPFS_BASE:-/dev/shm/qwen38}"
 
-if [[ "$QWEN_UNSECURE" != "1" ]]; then
+if [[ "$HOSTAI_UNSECURE" != "1" ]]; then
   # In secure mode host private keys, TLS certs, and the llama-server socket
   # live in tmpfs, but the authorized_keys file is kept in /root/.ssh because
   # sshd's auth_secure_path refuses paths under world-writable directories
   # (/dev/shm is 1777) even when the sticky bit is set. The public keys here
   # are not a secret.
-  install -d -m 0700 -o root -g root "$QWEN_TMPFS_BASE" "$QWEN_TMPFS_BASE/log" "$QWEN_TMPFS_BASE/run" "$QWEN_TMPFS_BASE/ssh" "$QWEN_TMPFS_BASE/certs" "$QWEN_TMPFS_BASE/tmp"
+  install -d -m 0700 -o root -g root "$HOSTAI_TMPFS_BASE" "$HOSTAI_TMPFS_BASE/log" "$HOSTAI_TMPFS_BASE/run" "$HOSTAI_TMPFS_BASE/ssh" "$HOSTAI_TMPFS_BASE/certs" "$HOSTAI_TMPFS_BASE/tmp"
 
   rm -rf /var/log/qwen38 /run/qwen38
-  ln -sfn "$QWEN_TMPFS_BASE/log" /var/log/qwen38
-  ln -sfn "$QWEN_TMPFS_BASE/run" /run/qwen38
+  ln -sfn "$HOSTAI_TMPFS_BASE/log" /var/log/qwen38
+  ln -sfn "$HOSTAI_TMPFS_BASE/run" /run/qwen38
 else
   # Legacy/unsecure mode: keep host keys on disk and use standard log/run paths.
   mkdir -p /var/log/qwen38 /run/qwen38
@@ -42,9 +42,9 @@ for f in /etc/qwen38/ssh/authorized_keys*; do
 done
 
 # Optional runtime fallback/override. This is deliberately base64 encoded by
-# qwen-up so Docker's -e parsing is not confused by spaces in an OpenSSH key.
-if [[ -n "${QWEN_SSH_PUBLIC_KEY_B64:-}" ]]; then
-  printf '%s' "$QWEN_SSH_PUBLIC_KEY_B64" | base64 -d >> "$TMP"
+# hostai up so Docker's -e parsing is not confused by spaces in an OpenSSH key.
+if [[ -n "${HOSTAI_SSH_PUBLIC_KEY_B64:-}" ]]; then
+  printf '%s' "$HOSTAI_SSH_PUBLIC_KEY_B64" | base64 -d >> "$TMP"
   printf '\n' >> "$TMP"
 fi
 
@@ -68,7 +68,7 @@ chmod 0700 /root/.ssh
 chown root:root "$TMP_AUTHORIZED_KEYS"
 chmod 0600 "$TMP_AUTHORIZED_KEYS"
 
-if [[ "$QWEN_UNSECURE" != "1" ]]; then
+if [[ "$HOSTAI_UNSECURE" != "1" ]]; then
   # Some base images do not include sshd_config.d by default, or the Include
   # line is missing. Make sure the drop-in directory is loaded.
   if ! grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config.d/\*\.conf' /etc/ssh/sshd_config; then
@@ -95,8 +95,8 @@ EOF
   # Generate host keys on tmpfs. Failures are non-fatal; sshd will pick the ones
   # it can use.
   for t in ed25519 rsa; do
-    if [[ ! -f "$QWEN_TMPFS_BASE/ssh/ssh_host_${t}_key" ]]; then
-      ssh-keygen -t "$t" -f "$QWEN_TMPFS_BASE/ssh/ssh_host_${t}_key" -N "" -C "qwen38" >/dev/null 2>&1 || true
+    if [[ ! -f "$HOSTAI_TMPFS_BASE/ssh/ssh_host_${t}_key" ]]; then
+      ssh-keygen -t "$t" -f "$HOSTAI_TMPFS_BASE/ssh/ssh_host_${t}_key" -N "" -C "qwen38" >/dev/null 2>&1 || true
     fi
   done
 else

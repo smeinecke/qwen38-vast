@@ -8,7 +8,6 @@ profiles_file = "profiles.json"
 [market]
 max_dph = 0.80
 disk_gb = 100
-allow_paid_traffic = false
 max_inet_down_cost = 0.001
 max_inet_up_cost = 0.001
 

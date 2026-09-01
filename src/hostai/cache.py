@@ -108,7 +108,7 @@ def rclone_remote_name(config: Config) -> str:
     """Return the configured rclone remote name, or the built-in default."""
     if config.cache.rclone_remote:
         return config.cache.rclone_remote
-    return "qwenwebdav"
+    return "hostai"
 
 
 def _rclone_type(config: Config) -> str:
@@ -147,7 +147,7 @@ def _rclone_env_script(config: Config) -> str:
         lines.extend(
             [
                 f"pass_plain={pass_quoted}",
-                f"export RCLONE_CONFIG_{name}_PASS=\"$(printf '%s\\n' \"$pass_plain\" | rclone obscure)\"",
+                f'export RCLONE_CONFIG_{name}_PASS="$(printf \'%s\\n\' "$pass_plain" | rclone obscure)"',
                 "unset pass_plain",
             ]
         )

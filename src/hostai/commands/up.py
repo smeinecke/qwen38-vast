@@ -36,7 +36,6 @@ from hostai.vast import (
 @click.option("-s", "--session", "cache_session", help="Slot-cache session name.")
 @click.option("-l", "--local-port", type=int, help="Local tunnel port.")
 @click.option("--max-price", type=float, help="Maximum all-in $/h.")
-@click.option("--allow-paid-traffic", is_flag=True, help="Allow paid traffic.")
 @click.option("--unverified", is_flag=True, help="Also consider unverified/unknown hosts.")
 @click.option("--unsecure", is_flag=True, help="Use legacy TCP/no-TLS mode.")
 @click.option("--no-cache", is_flag=True, help="Disable slot cache.")
@@ -51,7 +50,6 @@ def cmd_up(
     cache_session: Optional[str],
     local_port: Optional[int],
     max_price: Optional[float],
-    allow_paid_traffic: bool,
     unverified: bool,
     unsecure: bool,
     no_cache: bool,
@@ -76,7 +74,6 @@ def cmd_up(
             cache_session,
             local_port,
             max_price,
-            allow_paid_traffic,
             unverified,
             unsecure,
             no_cache,
@@ -162,7 +159,6 @@ def _build_query(
     profile: Any,
     gpu_query: str,
     max_price: Optional[float],
-    allow_paid: bool,
     unverified: bool,
     offer: Optional[int],
 ) -> Tuple[str, float]:
@@ -176,7 +172,7 @@ def _build_query(
         query = re.sub(r"\s+", " ", query).strip()
         query += ' verification in ["verified","unverified","deverified"]'
 
-    if profiles.market_policy.require_free_traffic and not allow_paid:
+    if profiles.market_policy.require_free_traffic:
         query += f" inet_down_cost<={config.market.max_inet_down_cost}"
         query += f" inet_up_cost<={config.market.max_inet_up_cost}"
 
@@ -190,7 +186,6 @@ def _select_offer(
     config: Config,
     query: str,
     max_dph: float,
-    allow_paid: bool,
     unverified: bool,
     offer: Optional[int],
 ) -> Dict[str, Any]:
@@ -241,14 +236,14 @@ def _env_dict(
 ) -> Dict[str, str]:
     slot_dir = cache._default_local_dir(config)
     env: Dict[str, str] = {
-        "QWEN_PROFILE": profile.name,
+        "HOSTAI_PROFILE": profile.name,
         "LLAMA_API_KEY": api_key,
         "MODEL": model,
         "CTX_SIZE": str(ctx_size),
         "USE_FASTMTP": str(int(config.model.use_fastmtp)),
         "REASONING_EFFORT": config.model.reasoning_effort,
         "HF_REVISION": config.model.hf_revision,
-        "QWEN_UNSECURE": "1" if unsecure else "0",
+        "HOSTAI_UNSECURE": "1" if unsecure else "0",
         "SLOT_SAVE_PATH": slot_dir,
     }
     hf_token = config.secrets.get("HF_TOKEN") or config.secrets.get("HUGGING_FACE_HUB_TOKEN")
@@ -266,7 +261,7 @@ def _env_dict(
 
     ssh_public_key = config.secrets.get("SSH_PUBLIC_KEY")
     if ssh_public_key:
-        env["QWEN_SSH_PUBLIC_KEY_B64"] = base64.b64encode(ssh_public_key.encode()).decode()
+        env["HOSTAI_SSH_PUBLIC_KEY_B64"] = base64.b64encode(ssh_public_key.encode()).decode()
 
     if config.model.cache_type_k and config.model.cache_type_k != "default":
         env["CACHE_TYPE_K"] = config.model.cache_type_k
@@ -274,27 +269,27 @@ def _env_dict(
         env["CACHE_TYPE_V"] = config.model.cache_type_v
     cache_configured = config.cache.host or config.cache.rclone_url or config.cache.rclone_remote
     if not no_cache and config.cache.enabled and cache_configured:
-        env["QWEN_SLOT_CACHE_ENABLED"] = "1"
-        env["QWEN_SLOT_CACHE_HOST"] = config.cache.host
-        env["QWEN_SLOT_CACHE_PORT"] = str(config.cache.port)
-        env["QWEN_SLOT_CACHE_USER"] = config.cache.user
-        env["QWEN_SLOT_CACHE_ROOT"] = config.cache.root
-        env["QWEN_SLOT_CACHE_SESSION"] = session
-        env["QWEN_SLOT_CACHE_MAX_GB"] = str(config.cache.max_gb)
-        env["QWEN_SLOT_CACHE_USE_SHM"] = "1" if config.cache.use_shm else "0"
-        env["QWEN_SLOT_CACHE_LOCAL_DIR"] = slot_dir
+        env["HOSTAI_SLOT_CACHE_ENABLED"] = "1"
+        env["HOSTAI_SLOT_CACHE_HOST"] = config.cache.host
+        env["HOSTAI_SLOT_CACHE_PORT"] = str(config.cache.port)
+        env["HOSTAI_SLOT_CACHE_USER"] = config.cache.user
+        env["HOSTAI_SLOT_CACHE_ROOT"] = config.cache.root
+        env["HOSTAI_SLOT_CACHE_SESSION"] = session
+        env["HOSTAI_SLOT_CACHE_MAX_GB"] = str(config.cache.max_gb)
+        env["HOSTAI_SLOT_CACHE_USE_SHM"] = "1" if config.cache.use_shm else "0"
+        env["HOSTAI_SLOT_CACHE_LOCAL_DIR"] = slot_dir
         if config.cache.rclone:
-            env["QWEN_SLOT_CACHE_RCLONE"] = "1"
+            env["HOSTAI_SLOT_CACHE_RCLONE"] = "1"
             if config.cache.rclone_remote:
-                env["QWEN_SLOT_CACHE_RCLONE_REMOTE"] = config.cache.rclone_remote
+                env["HOSTAI_SLOT_CACHE_RCLONE_REMOTE"] = config.cache.rclone_remote
             if config.cache.rclone_type:
-                env["QWEN_SLOT_CACHE_RCLONE_TYPE"] = config.cache.rclone_type
+                env["HOSTAI_SLOT_CACHE_RCLONE_TYPE"] = config.cache.rclone_type
             if config.cache.rclone_url:
-                env["QWEN_SLOT_CACHE_RCLONE_URL"] = config.cache.rclone_url
+                env["HOSTAI_SLOT_CACHE_RCLONE_URL"] = config.cache.rclone_url
             if config.cache.rclone_user:
-                env["QWEN_SLOT_CACHE_RCLONE_USER"] = config.cache.rclone_user
+                env["HOSTAI_SLOT_CACHE_RCLONE_USER"] = config.cache.rclone_user
             if config.cache.rclone_password:
-                env["QWEN_SLOT_CACHE_RCLONE_PASSWORD"] = config.cache.rclone_password
+                env["HOSTAI_SLOT_CACHE_RCLONE_PASSWORD"] = config.cache.rclone_password
     return env
 
 
@@ -375,16 +370,16 @@ def _write_env_file(config: Config, state: State, api_url: str, base_url: str) -
         f"export OPENAI_BASE_URL='{base_url}'",
         f"export OPENAI_API_BASE='{base_url}'",
         f"export OPENAI_API_KEY='{state.api_key}'",
-        f"export QWEN_MODEL='{state.data.get('model')}'",
-        f"export QWEN_PROFILE='{state.data.get('profile')}'",
-        f"export QWEN_VAST_INSTANCE_ID='{state.instance_id}'",
-        f"export QWEN_BASE_URL='{base_url}'",
-        f"export QWEN_API_URL='{api_url}'",
+        f"export HOSTAI_MODEL='{state.data.get('model')}'",
+        f"export HOSTAI_PROFILE='{state.data.get('profile')}'",
+        f"export HOSTAI_VAST_INSTANCE_ID='{state.instance_id}'",
+        f"export HOSTAI_BASE_URL='{base_url}'",
+        f"export HOSTAI_API_URL='{api_url}'",
     ]
     if not state.unsecure and state.tls_ca:
         ca = str(state.tls_ca)
         lines += [
-            f"export QWEN_CA_CERT='{ca}'",
+            f"export HOSTAI_CA_CERT='{ca}'",
             f"export SSL_CERT_FILE='{ca}'",
             f"export CURL_CA_BUNDLE='{ca}'",
             f"export REQUESTS_CA_BUNDLE='{ca}'",
@@ -443,7 +438,6 @@ def _do_fresh(
     cache_session: Optional[str],
     local_port: Optional[int],
     max_price: Optional[float],
-    allow_paid_traffic: bool,
     unverified: bool,
     unsecure: bool,
     no_cache: bool,
@@ -470,12 +464,11 @@ def _do_fresh(
     model = config.model.model
     selected_image = image_for_profile(config, image.image_tag)
 
-    allow_paid = allow_paid_traffic or config.market.allow_paid_traffic
-    query, max_dph = _build_query(config, profiles, profile, gpu_query, max_price, allow_paid, unverified, offer)
+    query, max_dph = _build_query(config, profiles, profile, gpu_query, max_price, unverified, offer)
     click.echo(f"[profile] {profile.name} | sm_{image.cuda_arch} | ctx={ctx_size} | image={selected_image}")
     click.echo(f"[search]  {query}")
 
-    offer_data = _select_offer(config, query, max_dph, allow_paid, unverified, offer)
+    offer_data = _select_offer(config, query, max_dph, unverified, offer)
     offer_id_raw = offer_data.get("id") or offer_data.get("ask_contract_id")
     if offer_id_raw is None:
         raise click.ClickException("selected offer has no id")
