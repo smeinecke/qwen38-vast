@@ -8,7 +8,7 @@ Disposable Vast.ai deployment for:
 - editable runtime profiles in `profiles.json`
 - self-managed SSH with a public key baked into the image
 - local SSH tunnel for the OpenAI-compatible API
-- persistent benchmark/telemetry history in `.qwen-runs/`
+- persistent benchmark/telemetry history in `.hostai-runs/`
 - automatic cross-instance llama.cpp slot/KV snapshots on the external cache server
 
 ## v8 persistent slot/KV cache
@@ -28,13 +28,13 @@ committed. One-time setup:
 ```bash
 cp .env.example .env
 # If the existing remote user is not qwen-cache, edit HOSTAI_SLOT_CACHE_USER.
-./qwen-cache-setup
+uv run hostai cache setup
 ```
 
 If the cache account has another name or host:
 
 ```bash
-./qwen-cache-setup youruser@your-cache-host.example.com
+uv run hostai cache setup youruser@your-cache-host.example.com
 ```
 
 The setup command uses your existing SSH access once, adds a dedicated
@@ -63,15 +63,15 @@ to a preconfigured remote in the image instead of supplying a URL.
 For independent coding contexts, choose a logical session name when starting:
 
 ```bash
-./qwen-up a6000-128k --session my-project
+uv run hostai up a6000-128k --session my-project
 ```
 
-The session name is persisted in the Vast run state, so `qwen-down` automatically
+The session name is persisted in the Vast run state, so `hostai down` automatically
 uploads back into the same namespace. No download/upload command is needed.
 
 ### Automatic startup
 
-`qwen-up`:
+`hostai up`:
 
 1. checks that the dedicated cache key exists before renting;
 2. copies that limited cache key to the new ephemeral Vast host;
@@ -81,7 +81,7 @@ uploads back into the same namespace. No download/upload command is needed.
    parallel with model loading**;
 5. after `/health` is ready, calls llama.cpp
    `POST /slots/0?action=restore` automatically;
-6. records `n_restored`, bytes read and restore state in `.qwen-runs/`.
+6. records `n_restored`, bytes read and restore state in `.hostai-runs/`.
 
 No cache file for the exact signature simply means a normal cold context.
 A6000-128k and Ada/Blackwell-128k can share a snapshot when all signature inputs
@@ -89,7 +89,7 @@ match; a 64k and 128k context intentionally do not share one.
 
 ### Automatic shutdown
 
-`qwen-down` now does this before destroying the paid host:
+`hostai down` now does this before destroying the paid host:
 
 ```text
 slot 0 -> llama.cpp save -> Vast NVMe current.bin -> rsync -> HOSTAI_SLOT_CACHE_HOST
@@ -99,13 +99,13 @@ slot 0 -> llama.cpp save -> Vast NVMe current.bin -> rsync -> HOSTAI_SLOT_CACHE_
 Normal use is unchanged; the slot save and upload happen automatically:
 
 ```bash
-./qwen-down --yes
+uv run hostai down --yes
 ```
 
 Emergency opt-out:
 
 ```bash
-./qwen-down --yes --no-cache
+uv run hostai down --yes --no-cache
 ```
 
 By default a cache upload failure is logged but the instance is still destroyed
@@ -129,13 +129,13 @@ issue where slot restore on hybrid/recurrent models can report `n_restored`
 successfully but still re-prefill the next request. The pinned FastMTP commit in
 this repo is different, so v8 does not assume either outcome.
 
-`qwen-bench` now records the actual llama.cpp `cache_n` value and displays cache
+`hostai bench` now records the actual llama.cpp `cache_n` value and displays cache
 hit percentage. After the first save/restart/restore, run the same long-prefix
 request again and trust the cache only if `cache_n` is non-zero/high:
 
 ```bash
-./qwen-bench --label restored-context --prompt-file /tmp/same-long-prefix.txt
-./qwen-results
+uv run hostai bench --label restored-context --prompt-file /tmp/same-long-prefix.txt
+uv run hostai results
 ```
 
 The table now contains a `cache` column. This distinguishes "restore API said
@@ -150,7 +150,7 @@ work and non-deterministic `/root/.ssh/authorized_keys` permissions.
 
 The image now contains `openssh-server`, all utility packages and your public key
 already. Vast runs the image in normal `args`/entrypoint mode and only maps
-container port 22 to a random public port. `qwen-up` discovers that mapping from
+container port 22 to a random public port. `hostai up` discovers that mapping from
 the instance JSON and creates the same local API tunnel as before.
 
 The runtime image also runs `apt-get upgrade` during the CI image build. No
@@ -207,13 +207,13 @@ avoid duplicate Vast API searches.
 Testing 64k, 128k and 256k on an A6000 does **not** require another Docker build:
 
 ```bash
-./qwen-up a6000
-./qwen-up a6000-128k
-./qwen-up a6000-256k
+uv run hostai up a6000
+uv run hostai up a6000-128k
+uv run hostai up a6000-256k
 ```
 
 Edit `profiles.json` to tune GPU ordering, add another context profile or tighten a region/GPU query.
-`qwen-up` no longer contains hard-coded profile cases.
+`hostai up` no longer contains hard-coded profile cases.
 
 ### Free-traffic market policy
 
@@ -332,199 +332,16 @@ As an emergency runtime override you may also put a quoted public key in local
 SSH_PUBLIC_KEY='ssh-ed25519 AAAA... user@host'
 ```
 
-`qwen-up` base64-encodes and injects that public key into the disposable
+`hostai up` base64-encodes and injects that public key into the disposable
 container. Normally this is unnecessary because the CI image already contains
 the key.
 
-## 1. Local dependencies
+## Quickstart
 
-Linux/macOS/WSL:
-
-```bash
-python3 -m pip install --upgrade vastai
-sudo apt-get install -y jq curl openssh-client openssl rsync
-```
-
-Authenticate Vast with either:
-
-```bash
-vastai set api-key YOUR_VAST_API_KEY
-```
-
-or `VAST_API_KEY` in `.env`.
-
-A Vast account SSH key is no longer required for this deployment path; SSH is
-provided by the container itself.
-
-## 2. Configure
-
-```bash
-cp .env.example .env
-chmod 600 .env
-```
-
-At minimum set:
-
-```dotenv
-GHCR_IMAGE_BASE=ghcr.io/YOUR_USER/YOUR_REPO
-HOSTAI_SLOT_CACHE_USER=qwen-cache   # change if your existing server user differs
-```
-
-Then prepare the external cache once. For SSH/rsync:
-
-```bash
-./qwen-cache-setup
-```
-
-For rclone, no key setup is needed; just set the rclone variables in `.env` and
-use `./qwen-cache-setup` to validate the configuration.
-
-`HF_TOKEN` is optional because the current model repository is public.
-
-## 3. Start
-
-```bash
-./qwen-up a6000
-./qwen-up ampere-value-128k
-./qwen-up ada-128k
-./qwen-up 5090-128k
-./qwen-up blackwell-128k
-```
-
-Calling `./qwen-up` without an argument uses `HOSTAI_PROFILE` from `.env`, falling
-back to `default_profile` from `profiles.json`.
-
-One-off context test:
-
-```bash
-CTX_SIZE_OVERRIDE=98304 ./qwen-up a6000
-```
-
-The script:
-
-1. resolves the runtime profile from `profiles.json`;
-2. selects the corresponding architecture image/tag;
-3. finds the cheapest matching Vast offer below `MAX_DPH`;
-4. creates the instance in normal entrypoint/args mode with `-p 22:22`;
-5. waits for Vast's public port-22 mapping;
-6. connects to the image's own `sshd`;
-7. installs the dedicated external-cache key on the disposable host;
-8. prefetches a compatible persistent slot snapshot from the cache server while the model loads;
-9. creates a local `localhost:18080 -> instance:127.0.0.1:8080` tunnel;
-10. waits while `hf_xet` downloads the GGUF/FastMTP sidecar and llama.cpp loads;
-11. waits for `/health` and restores slot 0 on a cache hit;
-12. stores local state and telemetry.
-
-Load the generated client environment:
-
-```bash
-source .qwen-vast/env
-```
-
-Then:
-
-```bash
-curl "$OPENAI_BASE_URL/models" \
-  -H "Authorization: Bearer $OPENAI_API_KEY"
-```
-
-The inference API itself is still bound only to `127.0.0.1` inside the Vast
-container. Only SSH port 22 is public.
-
-### Local tunnel port and concurrent commands
-
-`LOCAL_PORT=18080` is only the preferred local port. With the default
-`LOCAL_PORT_AUTO=1`, qwen scripts automatically select the next free localhost
-port if 18080 is occupied and store the actual port in `.qwen-vast/state.json`.
-Tunnel creation is serialized, so running `qwen-status` while `qwen-up` is still
-provisioning can no longer race `qwen-up` for the same `ssh -L` listener.
-
-A transient SSH disconnect while the model is loading is retried until the
-overall `START_TIMEOUT`; it no longer causes immediate instance destruction.
-Set `LOCAL_PORT_AUTO=0` only if a fixed local port is a hard requirement.
-
-## 4. Logs and status
-
-```bash
-./qwen-status
-./qwen-logs
-```
-
-`qwen-status` discovers either:
-
-- v7 custom port mapping: `.public_ipaddr` + `.ports["22/tcp"].HostPort`, or
-- legacy v6 Vast SSH fields: `.ssh_host` + `.ssh_port`.
-
-It recreates a missing local tunnel automatically.
-
-`qwen-logs` tails:
-
-```text
-/var/log/qwen38/server.log
-```
-
-and saves a local live copy under the current `.qwen-runs/<session>/` directory.
-The container entrypoint also mirrors the same log to Vast's normal container
-stdout so the web UI remains useful.
-
-## 5. Telemetry and benchmarks
-
-Every run receives a local directory such as:
-
-```text
-.qwen-runs/
-└── 20260827T101530Z-a6000-12345/
-    ├── metadata.json
-    ├── client.log
-    ├── gpu-start.txt
-    ├── metrics-ready.prom
-    └── benchmarks/
-```
-
-Run the built-in coding benchmark:
-
-```bash
-./qwen-bench
-```
-
-Or a real prompt/context:
-
-```bash
-./qwen-bench \
-  --label repo-analysis \
-  --prompt-file /tmp/repo-context.txt \
-  --max-tokens 1024
-```
-
-The benchmark records prompt/decode throughput, TTFT, latency, MTP draft and
-acceptance counts, GPU utilization, peak VRAM, power and estimated request cost.
-The prompt is not copied by default; add `--save-prompt` if desired.
-
-Compare runs:
-
-```bash
-./qwen-results
-./qwen-results --csv > qwen-benchmarks.csv
-./qwen-results --json > qwen-benchmarks.json
-```
-
-## 6. Stop billing
-
-```bash
-./qwen-down --yes
-```
-
-Before destroy, the script best-effort archives remote server logs, final
-`/metrics`, Vast metadata and a final GPU snapshot. `404 / instance not found` is
-treated as a successful already-absent end state.
-
-If startup fails, the paid instance is destroyed automatically unless:
-
-```dotenv
-KEEP_ON_FAILURE=1
-```
-
-is explicitly set.
+A step-by-step getting-started guide is in [QUICKSTART.md](QUICKSTART.md). It
+covers dependencies, `.env` setup, SSH/rsync and rclone cache backends, starting
+an instance, the OpenAI-compatible API, logs, benchmarks, the price monitor and
+stopping billing.
 
 ## Cost/search controls
 
@@ -545,7 +362,7 @@ GPU_QUERY_OVERRIDE='num_gpus=1 gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_dow
 
 ## Live Vast price monitor
 
-`qwen-monitor` compares the **hourly Vast rental price of the currently running
+`hostai monitor` compares the **hourly Vast rental price of the currently running
 instance** (`dph_total`) with currently rentable Vast offers. A candidate must
 use the **same context size** and its concrete GPU must have an equal-or-higher
 rank in `profiles.json -> monitor_hardware.gpu_ranks`. Search uses the same
@@ -558,22 +375,22 @@ GPU is never treated as an upgrade automatically.
 One-shot check:
 
 ```bash
-./qwen-monitor once
+uv run hostai monitor once
 ```
 
 Foreground watch:
 
 ```bash
-./qwen-monitor watch --threshold 10 --interval 180
+uv run hostai monitor watch --threshold 10 --interval 180
 ```
 
 Background daemon:
 
 ```bash
-./qwen-monitor start
-./qwen-monitor status
-./qwen-monitor logs
-./qwen-monitor stop
+uv run hostai monitor start
+uv run hostai monitor status
+uv run hostai monitor logs
+uv run hostai monitor stop
 ```
 
 Defaults in `.env`:
@@ -588,19 +405,19 @@ HOSTAI_MONITOR_AUTO_START=0
 When a qualifying offer appears, the monitor prints the profile, GPU, all-in
 `$/h`, percentage saving, location, download speed, disk speed, reliability and
 Vast offer ID. It also stores the best alert in
-`.qwen-vast/monitor-alert.json`; `qwen-status` surfaces that alert. If a desktop
+`.hostai-vast/monitor-alert.json`; `hostai status` surfaces that alert. If a desktop
 notification service is available, `notify-send` is used best-effort.
 
 For a compatible profile switch, preserve the external slot cache normally:
 
 ```bash
-uv run ./qwen-down --yes
-uv run ./qwen-up 5090-128k --session my-project
+uv run hostai down --yes
+uv run hostai up 5090-128k --session my-project
 ```
 
-`qwen-down` automatically stops a background monitor before saving the slot and
+`hostai down` automatically stops a background monitor before saving the slot and
 destroying the instance. Set `HOSTAI_MONITOR_AUTO_START=1` if every successful
-`qwen-up` should start the monitor automatically.
+`hostai up` should start the monitor automatically.
 
 If `CTX_SIZE_OVERRIDE` uses a context size for which no explicit profile exists,
 the monitor falls back to the running profile. Any suggested restart preserves
@@ -706,8 +523,8 @@ ccache archive remains a recovery/portability layer.
 
 ### Runtime failure behavior (v9.6.1)
 
-The slim runtime explicitly installs `libgomp1`, which provides `libgomp.so.1` required by the compiled llama-server. The image build validates that dependency, `start.sh` validates the binary before downloading model files, and `qwen-up` performs a remote preflight as soon as SSH is available.
+The slim runtime explicitly installs `libgomp1`, which provides `libgomp.so.1` required by the compiled llama-server. The image build validates that dependency, `start.sh` validates the binary before downloading model files, and `hostai up` performs a remote preflight as soon as SSH is available.
 
 The container PID 1 now supervises `sshd -D` and `start.sh` as separate child processes. If `start.sh` or `llama-server` exits, the container stays alive, writes the exit code to `/run/qwen38/start.exitcode`, and leaves SSH running. If `sshd` itself exits unexpectedly, PID 1 restarts only sshd after `SSH_RESTART_DELAY_SECONDS` (default `2`) rather than restarting the whole container. A Vast `TERM`/`INT` is forwarded cleanly to both children.
 
-`qwen-up` notices the model exit marker, prints the server log, and performs normal failure cleanup. Set `KEEP_ON_FAILURE=1` when intentionally debugging a failed instance and you want `qwen-up` to leave it running and SSH-accessible. SSH daemon diagnostics are available in `/var/log/qwen38/sshd.log`.
+`hostai up` notices the model exit marker, prints the server log, and performs normal failure cleanup. Set `KEEP_ON_FAILURE=1` when intentionally debugging a failed instance and you want `hostai up` to leave it running and SSH-accessible. SSH daemon diagnostics are available in `/var/log/qwen38/sshd.log`.
