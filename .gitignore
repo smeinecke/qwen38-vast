@@ -2,6 +2,11 @@
 *.log
 .DS_Store
 .env
+__pycache__/
+*.py[cod]
+*.so
+.coverage
+htmlcov/
 .qwen-runs/
 .qwen-vast/
 .qwen-cache/

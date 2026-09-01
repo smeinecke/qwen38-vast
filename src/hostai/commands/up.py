@@ -1,0 +1,840 @@
+"""Start a Vast instance for a profile."""
+
+from __future__ import annotations
+
+import base64
+import json
+import re
+import secrets
+import shlex
+import time
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
+import click
+
+from hostai import cache, ssh, tls, utils
+from hostai.api import LlamaClient, wait_for_api
+from hostai.commands import _common
+from hostai.config import Config, image_for_profile
+from hostai.profiles import Profiles
+from hostai.state import State, init_run_dir, runs_dir, state_dir
+from hostai.vast import (
+    create_instance_from_offer,
+    destroy,
+    get_instance,
+    search_instance_offers,
+)
+from hostai.vast import (
+    start as start_instance,
+)
+
+
+@click.command("up", help="Start a Vast instance for a profile.")
+@click.argument("profile", required=False)
+@click.option("-p", "--profile", "profile_opt", help="Profile to run.")
+@click.option("-s", "--session", "cache_session", help="Slot-cache session name.")
+@click.option("-l", "--local-port", type=int, help="Local tunnel port.")
+@click.option("--max-price", type=float, help="Maximum all-in $/h.")
+@click.option("--allow-paid-traffic", is_flag=True, help="Allow paid traffic.")
+@click.option("--unverified", is_flag=True, help="Also consider unverified/unknown hosts.")
+@click.option("--unsecure", is_flag=True, help="Use legacy TCP/no-TLS mode.")
+@click.option("--no-cache", is_flag=True, help="Disable slot cache.")
+@click.option("--abort-if-shm-too-small", is_flag=True, help="Fail if /dev/shm is too small.")
+@click.option("--offer", type=int, help="Use a specific offer ID.")
+@click.option("--restart", is_flag=True, help="Restart an existing paused instance.")
+@click.pass_obj
+def cmd_up(
+    config: Config,
+    profile: Optional[str],
+    profile_opt: Optional[str],
+    cache_session: Optional[str],
+    local_port: Optional[int],
+    max_price: Optional[float],
+    allow_paid_traffic: bool,
+    unverified: bool,
+    unsecure: bool,
+    no_cache: bool,
+    abort_if_shm_too_small: bool,
+    offer: Optional[int],
+    restart: bool,
+):
+    chosen_profile = profile or profile_opt or config.hostai.default_profile
+    if not chosen_profile:
+        raise click.ClickException("no profile specified and no default profile configured")
+    if local_port is not None and not (1 <= local_port <= 65535):
+        raise click.ClickException("--local-port must be between 1 and 65535")
+    if max_price is not None and max_price < 0:
+        raise click.ClickException("--max-price must be non-negative")
+
+    if restart:
+        _do_restart(config, chosen_profile, local_port, unsecure, no_cache)
+    else:
+        _do_fresh(
+            config,
+            chosen_profile,
+            cache_session,
+            local_port,
+            max_price,
+            allow_paid_traffic,
+            unverified,
+            unsecure,
+            no_cache,
+            abort_if_shm_too_small,
+            offer,
+        )
+
+
+def _now_rfc() -> str:
+    return utils.now_rfc3339()
+
+
+def _now_epoch() -> int:
+    return int(time.time())
+
+
+def _cleanup_instance(config: Config, state: State, reason: str) -> None:
+    """Destroy the instance if something went wrong during provisioning."""
+    if not state.instance_id:
+        return
+    if config.vast.keep_on_failure:
+        click.echo(f"[cleanup] {reason}; keep_on_failure is set, not destroying {state.instance_id}", err=True)
+        state.status = "failed"
+        state.set("failure_reason", reason)
+        state.save()
+        return
+    click.echo(f"[cleanup] {reason}; destroying instance {state.instance_id}...", err=True)
+    try:
+        destroy(config, state.instance_id, timeout=config.vast.destroy_timeout_seconds)
+        click.echo(f"[cleanup] instance {state.instance_id} destroyed", err=True)
+    except Exception as exc:
+        click.echo(f"[cleanup] destroy failed: {exc}; please remove it manually", err=True)
+    state.status = "failed"
+    state.set("failure_reason", reason)
+    state.save()
+
+
+def _shm_preflight(
+    ssh_url: Optional[str],
+    config: Config,
+    known_hosts: Path,
+    min_gb: int,
+) -> int:
+    """Check /dev/shm on the Vast host. Returns 0=ok, 1=too-small, 2=error."""
+    if not ssh_url:
+        return 2
+    if not config.cache.use_shm:
+        return 0
+    min_bytes = min_gb * 1024 * 1024 * 1024
+    if min_bytes == 0:
+        return 0
+    res = ssh.run_remote(
+        ssh_url,
+        "df -P -B1 /dev/shm | awk 'NR==2 {print $4}'",
+        known_hosts=known_hosts,
+        timeout=30,
+    )
+    if res.returncode != 0:
+        return 2
+    try:
+        free = int((res.stdout or "").strip() or 0)
+    except (TypeError, ValueError):
+        return 2
+    if free < min_bytes:
+        return 1
+    return 0
+
+
+def _resolve_profile(config: Config, name: str) -> Tuple[Profiles, Any, Any]:
+    profiles = Profiles.from_file(config.root_dir / config.hostai.profiles_file)
+    p = profiles.resolve_profile(name)
+    if not p:
+        raise click.ClickException(f"unknown profile '{name}'")
+    image = profiles.image_by_name(p.image)
+    if not image:
+        raise click.ClickException(f"profile '{p.name}' references unknown image '{p.image}'")
+    return profiles, p, image
+
+
+def _build_query(
+    config: Config,
+    profiles: Profiles,
+    profile: Any,
+    gpu_query: str,
+    max_price: Optional[float],
+    allow_paid: bool,
+    unverified: bool,
+    offer: Optional[int],
+) -> Tuple[str, float]:
+    if max_price is not None and max_price < 0:
+        raise click.ClickException("--max-price must be non-negative")
+    max_dph = max_price if max_price is not None else config.market.max_dph
+    query = gpu_query
+
+    if unverified:
+        query = re.sub(r"\s*reliability\s*(>=?|<=?|=)\s*[^\s]+", "", query)
+        query = re.sub(r"\s+", " ", query).strip()
+        query += ' verification in ["verified","unverified","deverified"]'
+
+    if profiles.market_policy.require_free_traffic and not allow_paid:
+        query += f" inet_down_cost<={config.market.max_inet_down_cost}"
+        query += f" inet_up_cost<={config.market.max_inet_up_cost}"
+
+    if offer is None and "dph" not in query:
+        query += f" dph_total <= {max_dph}"
+
+    return query, max_dph
+
+
+def _select_offer(
+    config: Config,
+    query: str,
+    max_dph: float,
+    allow_paid: bool,
+    unverified: bool,
+    offer: Optional[int],
+) -> Dict[str, Any]:
+    limit = 100 if offer is not None else 25
+    try:
+        offers = search_instance_offers(
+            config,
+            query,
+            limit=limit,
+            order="dph_total",
+            storage=config.market.disk_gb,
+        )
+    except Exception as exc:
+        raise click.ClickException(f"search failed: {exc}")
+
+    for o in offers:
+        o["_effective_dph"] = o.get("dph_total", 999999)
+
+    matches = []
+    for o in offers:
+        if offer is not None:
+            if str(o.get("id")) != str(offer) and str(o.get("ask_contract_id")) != str(offer):
+                continue
+        else:
+            if o["_effective_dph"] > max_dph:
+                continue
+        matches.append(o)
+
+    if not matches:
+        raise click.ClickException(
+            f"no matching offer{' for id ' + str(offer) if offer is not None else ''} at or below ${max_dph:.2f}/h"
+        )
+
+    matches.sort(key=lambda x: x["_effective_dph"])
+    return matches[0]
+
+
+def _env_dict(
+    config: Config,
+    profile: Any,
+    image: Any,
+    model: str,
+    ctx_size: int,
+    api_key: str,
+    unsecure: bool,
+    no_cache: bool,
+    session: str,
+) -> Dict[str, str]:
+    slot_dir = cache._default_local_dir(config)
+    env: Dict[str, str] = {
+        "QWEN_PROFILE": profile.name,
+        "LLAMA_API_KEY": api_key,
+        "MODEL": model,
+        "CTX_SIZE": str(ctx_size),
+        "USE_FASTMTP": str(int(config.model.use_fastmtp)),
+        "REASONING_EFFORT": config.model.reasoning_effort,
+        "HF_REVISION": config.model.hf_revision,
+        "QWEN_UNSECURE": "1" if unsecure else "0",
+        "SLOT_SAVE_PATH": slot_dir,
+    }
+    hf_token = config.secrets.get("HF_TOKEN") or config.secrets.get("HUGGING_FACE_HUB_TOKEN")
+    if hf_token:
+        env["HF_TOKEN"] = hf_token
+
+    cache_ram = config.model.cache_ram if config.model.cache_ram is not None else profile.cache_ram
+    ctx_checkpoints = (
+        config.model.ctx_checkpoints if config.model.ctx_checkpoints is not None else profile.ctx_checkpoints
+    )
+    if cache_ram:
+        env["CACHE_RAM"] = str(cache_ram)
+    if ctx_checkpoints:
+        env["CTX_CHECKPOINTS"] = str(ctx_checkpoints)
+
+    ssh_public_key = config.secrets.get("SSH_PUBLIC_KEY")
+    if ssh_public_key:
+        env["QWEN_SSH_PUBLIC_KEY_B64"] = base64.b64encode(ssh_public_key.encode()).decode()
+
+    if config.model.cache_type_k and config.model.cache_type_k != "default":
+        env["CACHE_TYPE_K"] = config.model.cache_type_k
+    if config.model.cache_type_v and config.model.cache_type_v != "default":
+        env["CACHE_TYPE_V"] = config.model.cache_type_v
+    if not no_cache and config.cache.enabled and config.cache.host:
+        env["QWEN_SLOT_CACHE_ENABLED"] = "1"
+        env["QWEN_SLOT_CACHE_HOST"] = config.cache.host
+        env["QWEN_SLOT_CACHE_PORT"] = str(config.cache.port)
+        env["QWEN_SLOT_CACHE_USER"] = config.cache.user
+        env["QWEN_SLOT_CACHE_ROOT"] = config.cache.root
+        env["QWEN_SLOT_CACHE_SESSION"] = session
+        env["QWEN_SLOT_CACHE_MAX_GB"] = str(config.cache.max_gb)
+        env["QWEN_SLOT_CACHE_USE_SHM"] = "1" if config.cache.use_shm else "0"
+        env["QWEN_SLOT_CACHE_LOCAL_DIR"] = slot_dir
+    return env
+
+
+def _extra_args(config: Config) -> str:
+    parts = ["-p 22:22"]
+    if config.vast.shm_size_gb:
+        parts.append(f"--shm-size={config.vast.shm_size_gb}g")
+    return " ".join(parts)
+
+
+def _wait_for_ssh_endpoint(config: Config, state: State, timeout: int) -> None:
+    if not state.instance_id:
+        raise click.ClickException("no instance id in state")
+    start = _now_epoch()
+    last_log = 0
+    while True:
+        now = _now_epoch()
+        if now - start > timeout:
+            raise click.ClickException("timeout waiting for SSH endpoint")
+        inst = get_instance(config, state.instance_id)
+        if not inst:
+            click.echo("[boot] waiting for instance to appear...")
+            time.sleep(5)
+            continue
+        status = inst.get("actual_status") or inst.get("status") or "loading"
+        if status in ("exited", "offline", "unknown"):
+            raise click.ClickException(f"instance entered status '{status}'")
+        endpoint = ssh.resolve_ssh_endpoint(inst)
+        if endpoint:
+            state.ssh_url = endpoint["ssh_url"]
+            state.status = "ssh-ready"
+            state.save()
+            click.echo(f"[ssh] endpoint discovered: {state.ssh_url}")
+            return
+        if now - last_log >= 15:
+            last_log = now
+            host = inst.get("public_ipaddr") or inst.get("public_ip") or "?"
+            ports = inst.get("ports") or {}
+            tcp = ports.get("22/tcp") or [{}]
+            port = tcp[0].get("HostPort") if tcp else "?"
+            click.echo(f"[boot] status={status} | ssh={host}:{port} | waiting...")
+        time.sleep(5)
+
+
+def _wait_for_api(config: Config, state: State, timeout: int, client: LlamaClient) -> None:
+    start = _now_epoch()
+    interval = 1.0
+    last_log = start
+    known_hosts = state.state_file.parent / "known_hosts"
+    while True:
+        now = _now_epoch()
+        if now - start > timeout:
+            raise click.ClickException("timeout waiting for llama-server /health")
+        if client.health():
+            return
+        if now - last_log >= 15:
+            last_log = now
+            click.echo(f"[api] waiting for llama-server ({now - start}s / {timeout}s)")
+            # best-effort log tail
+            try:
+                result = ssh.run_remote(
+                    state.ssh_url,
+                    "tail -n 20 /var/log/qwen38/server.log 2>/dev/null || true",
+                    known_hosts=known_hosts,
+                    timeout=10,
+                )
+                if result.stdout:
+                    click.echo(result.stdout)
+            except Exception:
+                pass
+        time.sleep(interval)
+        interval = min(interval * 2, 5.0)
+
+
+def _write_env_file(config: Config, state: State, api_url: str, base_url: str) -> None:
+    env_path = state_dir(config.root_dir) / "env"
+    lines = [
+        f"export OPENAI_BASE_URL='{base_url}'",
+        f"export OPENAI_API_BASE='{base_url}'",
+        f"export OPENAI_API_KEY='{state.api_key}'",
+        f"export QWEN_MODEL='{state.data.get('model')}'",
+        f"export QWEN_PROFILE='{state.data.get('profile')}'",
+        f"export QWEN_VAST_INSTANCE_ID='{state.instance_id}'",
+        f"export QWEN_BASE_URL='{base_url}'",
+        f"export QWEN_API_URL='{api_url}'",
+    ]
+    if not state.unsecure and state.tls_ca:
+        ca = str(state.tls_ca)
+        lines += [
+            f"export QWEN_CA_CERT='{ca}'",
+            f"export SSL_CERT_FILE='{ca}'",
+            f"export CURL_CA_BUNDLE='{ca}'",
+            f"export REQUESTS_CA_BUNDLE='{ca}'",
+        ]
+    env_path.write_text("\n".join(lines) + "\n")
+    env_path.chmod(0o600)
+
+
+def _prefetch_slot_cache_to_vast(
+    ssh_url: Optional[str],
+    config: Config,
+    slot_dir: str,
+    remote_dir: str,
+    known_hosts: Path,
+) -> bool:
+    """Run rsync on the Vast host to pull current.bin/json from the cache server."""
+    if not ssh_url:
+        return False
+    if not config.cache.host:
+        return False
+
+    script = """set -Eeuo pipefail
+umask 077
+cache_host="$1"; cache_port="$2"; cache_user="$3"; remote_dir="$4"; slot_dir="$5"; cache_root="$6"
+key=/root/.ssh/qwen-slot-cache
+known=/root/.ssh/qwen-slot-cache-known_hosts
+mkdir -p /root/.ssh
+touch "$known"
+chmod 600 "$known"
+ssh_base="ssh -n -i $key -p $cache_port -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$known"
+$ssh_base "${cache_user}@${cache_host}" "mkdir -p '$remote_dir' && chmod 700 '$cache_root' '$cache_root/'* 2>/dev/null || true; mkdir -p '$remote_dir'"
+mkdir -p "$slot_dir"
+chmod 700 "$slot_dir"
+rsync -av -e "ssh -i $key -p $cache_port -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$known" "${cache_user}@${cache_host}:${remote_dir}/current.bin" "$slot_dir/.current.bin.part" < /dev/null
+rsync -av -e "ssh -i $key -p $cache_port -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$known" "${cache_user}@${cache_host}:${remote_dir}/current.json" "$slot_dir/.current.json.part" < /dev/null
+mv -f "$slot_dir/.current.bin.part" "$slot_dir/current.bin"
+mv -f "$slot_dir/.current.json.part" "$slot_dir/current.json"
+chmod 600 "$slot_dir/current.bin" "$slot_dir/current.json"
+echo "ok"
+"""
+    args = [config.cache.host, str(config.cache.port), config.cache.user, remote_dir, slot_dir, config.cache.root]
+    arg_str = " ".join(shlex.quote(str(a)) for a in args)
+    res = ssh.run_remote(ssh_url, f"bash -s {arg_str}", input_data=script, known_hosts=known_hosts, timeout=1800)
+    return res.returncode == 0 and "ok" in (res.stdout or "")
+
+
+def _do_fresh(
+    config: Config,
+    profile_name: str,
+    cache_session: Optional[str],
+    local_port: Optional[int],
+    max_price: Optional[float],
+    allow_paid_traffic: bool,
+    unverified: bool,
+    unsecure: bool,
+    no_cache: bool,
+    abort_if_shm_too_small: bool,
+    offer: Optional[int],
+) -> None:
+    sdir = state_dir(config.root_dir)
+    existing = sdir / "state.json"
+    if existing.exists():
+        old = State.load(existing)
+        if old.instance_id:
+            try:
+                inst = get_instance(config, old.instance_id)
+                if inst and (inst.get("actual_status") or inst.get("status")) not in ("exited", "offline"):
+                    raise click.ClickException(
+                        f"state file already references instance {old.instance_id}; run hostai down first"
+                    )
+            except Exception:
+                pass
+
+    profiles, profile, image = _resolve_profile(config, profile_name)
+    ctx_size = config.hostai.ctx_size_override if config.hostai.ctx_size_override else profile.ctx_size
+    gpu_query = config.hostai.gpu_query_override or profile.gpu_query
+    model = config.model.model
+    selected_image = image_for_profile(config, image.image_tag)
+
+    allow_paid = allow_paid_traffic or config.market.allow_paid_traffic
+    query, max_dph = _build_query(config, profiles, profile, gpu_query, max_price, allow_paid, unverified, offer)
+    click.echo(f"[profile] {profile.name} | sm_{image.cuda_arch} | ctx={ctx_size} | image={selected_image}")
+    click.echo(f"[search]  {query}")
+
+    offer_data = _select_offer(config, query, max_dph, allow_paid, unverified, offer)
+    offer_id_raw = offer_data.get("id") or offer_data.get("ask_contract_id")
+    if offer_id_raw is None:
+        raise click.ClickException("selected offer has no id")
+    offer_id = int(offer_id_raw)
+    gpu_name = offer_data.get("gpu_name", "unknown")
+    dph = offer_data.get("dph_total", 0.0)
+    click.echo(
+        f"[rent] {gpu_name} | ${dph:.4f}/h | "
+        f"down={offer_data.get('inet_down', '?')} | "
+        f"up={offer_data.get('inet_up', '?')} | offer={offer_id}"
+    )
+
+    run_id = utils.make_run_id(profile.name)
+    run_dir = init_run_dir(runs_dir(config.root_dir), profile.name, run_id)
+    run_started = _now_rfc()
+    run_epoch = _now_epoch()
+
+    api_key = "sk-local-" + secrets.token_hex(24)
+    session = cache_session or config.cache.session
+
+    # metadata
+    metadata = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "status": "provisioning",
+        "started_at": _now_rfc(),
+        "profile": profile.name,
+        "monitor_group": profile.monitor_group or "",
+        "gpu_query": query,
+        "disk_gb": config.market.disk_gb,
+        "cuda_arch": image.cuda_arch,
+        "image": selected_image,
+        "ctx_size": ctx_size,
+        "model": model,
+        "hf_revision": config.model.hf_revision,
+        "use_fastmtp": config.model.use_fastmtp,
+        "cache_type_k": config.model.cache_type_k or "default",
+        "cache_type_v": config.model.cache_type_v or "default",
+        "slot_cache_enabled": config.cache.enabled and not no_cache,
+        "slot_cache_host": config.cache.host,
+        "slot_cache_port": config.cache.port,
+        "slot_cache_user": config.cache.user,
+        "slot_cache_root": config.cache.root,
+        "slot_cache_session": session,
+        "slot_cache_max_gb": config.cache.max_gb,
+        "slot_cache_local_dir": cache._default_local_dir(config),
+        "slot_cache_use_shm": config.cache.use_shm,
+        "unsecure": unsecure,
+    }
+    (run_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, default=str))
+    (run_dir / "metadata.json").chmod(0o600)
+
+    env = _env_dict(config, profile, image, model, ctx_size, api_key, unsecure, no_cache, session)
+    extra = _extra_args(config)
+    label = f"hostai-{profile.name}-{_now_epoch()}"
+
+    volume_info = None
+    if config.vast.volume_id and config.vast.volume_mount_path:
+        try:
+            volume_info = {"volume_id": int(config.vast.volume_id), "mount_path": config.vast.volume_mount_path}
+        except ValueError:
+            volume_info = None
+
+    try:
+        create_raw = create_instance_from_offer(
+            config,
+            offer_id,
+            image=selected_image,
+            disk=config.market.disk_gb,
+            env=env,
+            label=label,
+            extra=extra,
+            runtype=None,
+            args="qwen38",
+            volume_info=volume_info,
+        )
+    except Exception as exc:
+        raise click.ClickException(f"Vast create instance failed: {exc}")
+
+    instance_id = create_raw.get("new_contract") or create_raw.get("instance_id") or create_raw.get("id")
+    if not instance_id:
+        raise click.ClickException(f"Vast create response did not contain an instance ID: {create_raw}")
+
+    started_at = _now_rfc()
+    started_epoch = _now_epoch()
+
+    state = State.load(sdir / "state.json")
+    state.instance_id = int(instance_id)
+    state.status = "provisioning"
+    state.offer_id = offer_id
+    state.gpu = gpu_name
+    state.dph = float(dph)
+    state.local_port = local_port if local_port is not None else config.ssh.local_port
+    state.location = offer_data.get("geolocation", "") or offer_data.get("location", "")
+    state.inet_down = offer_data.get("inet_down", 0.0)
+    state.inet_down_cost = offer_data.get("inet_down_cost", 0.0)
+    state.inet_up = offer_data.get("inet_up", 0.0)
+    state.inet_up_cost = offer_data.get("inet_up_cost", 0.0)
+    state.disk_bw = offer_data.get("disk_bw", 0.0)
+    state.reliability = offer_data.get("reliability", 0.0)
+    state.model = model
+    state.hf_revision = config.model.hf_revision
+    state.ctx_size = ctx_size
+    state.api_key = api_key
+    state.image = selected_image
+    state.label = label
+    state.profile = profile.name
+    state.monitor_group = profile.monitor_group or ""
+    state.run_id = run_id
+    state.run_dir = run_dir
+    state.started_at = started_at
+    state.started_epoch = started_epoch
+    state.run_started_at = run_started
+    state.run_started_epoch = run_epoch
+    state.unsecure = unsecure
+    state.slot_cache_enabled = config.cache.enabled and not no_cache
+    state.slot_cache_host = config.cache.host
+    state.slot_cache_port = config.cache.port
+    state.slot_cache_user = config.cache.user
+    state.slot_cache_root = config.cache.root
+    state.slot_cache_session = session
+    state.slot_cache_max_gb = config.cache.max_gb
+    state.slot_cache_local_dir = cache._default_local_dir(config)
+    state.slot_cache_use_shm = config.cache.use_shm
+    state.save()
+    state.save_metadata(run_dir, status="provisioning")
+
+    try:
+        _do_fresh_core(config, state, image, no_cache, abort_if_shm_too_small)
+    except click.ClickException:
+        _cleanup_instance(config, state, "provisioning failed")
+        raise
+    except Exception as exc:
+        _cleanup_instance(config, state, f"provisioning error: {exc}")
+        raise click.ClickException(str(exc)) from exc
+
+
+def _do_fresh_core(
+    config: Config,
+    state: State,
+    image: Any,
+    no_cache: bool,
+    abort_if_shm_too_small: bool,
+) -> None:
+    """Provision a freshly created Vast instance (SSH, cache, tunnel, TLS, API)."""
+    click.echo(f"[boot] Vast instance {state.instance_id} created; waiting for SSH...")
+    _wait_for_ssh_endpoint(config, state, config.ssh.start_timeout)
+
+    known_hosts = state.state_file.parent / "known_hosts"
+    if not ssh.wait_for_ssh(state.ssh_url, known_hosts=known_hosts, timeout=120):
+        raise click.ClickException("SSH daemon did not become reachable")
+    click.echo("[ssh] connection ready")
+
+    # runtime preflight
+    result = ssh.run_remote(
+        state.ssh_url,
+        "/usr/local/bin/llama-server --version",
+        known_hosts=known_hosts,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise click.ClickException(f"remote llama-server preflight failed: {result.stderr}")
+
+    # cache setup
+    cache_enabled = state.slot_cache_enabled
+    if cache_enabled and not cache.validate_cache_config(config):
+        click.echo("[cache] WARNING: cache config invalid; continuing cold", err=True)
+        cache_enabled = False
+        state.slot_cache_enabled = False
+
+    if cache_enabled and not cache.install_cache_key_on_vast(state, config):
+        click.echo("[cache] WARNING: could not install cache private key; continuing cold", err=True)
+        cache_enabled = False
+        state.slot_cache_enabled = False
+
+    # slot cache restore (best effort)
+    cache_remote = ""
+    session = state.slot_cache_session
+    llama_commit = "unknown"
+    if cache_enabled:
+        llama_commit = _common.fetch_llama_commit(state.ssh_url, known_hosts)
+        state.data["llama_cpp_commit"] = llama_commit
+
+        if config.cache.use_shm:
+            shm_rc = _shm_preflight(
+                state.ssh_url,
+                config,
+                known_hosts,
+                config.cache.shm_min_gb,
+            )
+            if shm_rc == 1:
+                if abort_if_shm_too_small or config.cache.shm_require:
+                    raise click.ClickException("[cache] /dev/shm is too small and abort-if-shm-too-small is set")
+                click.echo("[cache] /dev/shm is too small; disabling slot cache for this host", err=True)
+                cache_enabled = False
+                state.slot_cache_enabled = False
+            elif shm_rc == 2:
+                raise click.ClickException("[cache] slot cache /dev/shm preflight failed")
+
+    if cache_enabled:
+        remote_local_dir = state.slot_cache_local_dir
+        signature = cache._signature_for_state(config, state, llama_commit)
+        cache_remote = cache.remote_cache_dir(config, signature, session)
+        state.data["cuda_arch"] = image.cuda_arch
+        state.data["slot_cache_signature"] = signature
+        state.data["slot_cache_remote_dir"] = cache_remote
+        state.data["slot_cache_restore"] = "pending"
+        state.save()
+
+        if _prefetch_slot_cache_to_vast(state.ssh_url, config, remote_local_dir, cache_remote, known_hosts):
+            click.echo("[cache] prefetched slot from cache server")
+            state.data["slot_cache_prefetch"] = "ok"
+        else:
+            click.echo("[cache] no slot cache on server; will start cold", err=True)
+            state.data["slot_cache_prefetch"] = "empty"
+        state.save()
+
+    # tunnel
+    local_port = ssh.ensure_tunnel(config, state)
+    click.echo(f"[tunnel] localhost:{local_port}")
+
+    # TLS
+    if not state.unsecure:
+        tls_dir = tls.ensure_local_tls_dir(config.root_dir)
+        tls.generate_cert(tls_dir)
+        if not tls.deliver_cert(state.ssh_url, tls_dir, known_hosts=known_hosts):
+            raise click.ClickException("TLS certificate delivery failed")
+        state.tls_ca = tls_dir / "ca.crt"
+        state.save()
+        api_scheme = "https"
+    else:
+        api_scheme = "http"
+
+    api_url = f"{api_scheme}://127.0.0.1:{local_port}"
+    base_url = f"{api_url}/v1"
+    _write_env_file(config, state, api_url, base_url)
+
+    # wait for API
+    client = LlamaClient(config, state)
+    if not wait_for_api(config, state, config.ssh.start_timeout):
+        raise click.ClickException("llama-server did not become healthy")
+
+    # restore slot cache
+    if cache_enabled:
+        if client.slot_restore(config.cache.slot_id):
+            click.echo("[cache] slot restore requested")
+            state.data["slot_cache_restore"] = "restored"
+        else:
+            click.echo("[cache] WARNING: slot restore failed; continuing cold", err=True)
+            state.data["slot_cache_restore"] = "failed"
+        state.save()
+
+    ready_at = _now_rfc()
+    ready_epoch = _now_epoch()
+    state.status = "running"
+    state.data["ready_at"] = ready_at
+    state.data["ready_epoch"] = ready_epoch
+    state.data["startup_seconds"] = ready_epoch - (state.started_epoch or 0)
+    state.save()
+    run_dir = state.run_dir
+    if run_dir:
+        state.save_metadata(run_dir, status="ready")
+
+    click.echo("\nREADY")
+    click.echo(f"  Profile:   {state.profile} (sm_{image.cuda_arch})")
+    click.echo(f"  Image:     {state.image}")
+    click.echo(f"  GPU:       {state.gpu}")
+    click.echo(f"  Cost:      ${float(state.dph):.4f}/h")
+    click.echo(f"  Context:   {state.ctx_size}")
+    click.echo(f"  API:       {base_url}")
+    click.echo(f"  Instance:  {state.instance_id}")
+    click.echo(f"  Run log:   {run_dir}")
+    if cache_enabled:
+        click.echo(f"  Slot cache: session={session} remote={cache_remote}")
+    click.echo("\nRun: source .hostai-vast/env")
+    click.echo("Stop: hostai down")
+
+
+def _do_restart(
+    config: Config,
+    profile_name: str,
+    local_port: Optional[int],
+    unsecure: bool,
+    no_cache: bool,
+) -> None:
+    sdir = state_dir(config.root_dir)
+    state = State.load(sdir / "state.json")
+    if not state.instance_id:
+        raise click.ClickException("no state to restart; run hostai up first")
+
+    state.unsecure = unsecure
+    if local_port is not None:
+        state.local_port = local_port
+
+    inst = get_instance(config, state.instance_id)
+    status = inst.get("actual_status") or inst.get("status") if inst else None
+    if status != "running":
+        try:
+            start_instance(config, state.instance_id)
+            click.echo(f"[restart] started instance {state.instance_id}")
+        except Exception as exc:
+            raise click.ClickException(f"failed to start instance: {exc}")
+
+    _wait_for_ssh_endpoint(config, state, config.ssh.start_timeout)
+    known_hosts = state.state_file.parent / "known_hosts"
+    if not ssh.wait_for_ssh(state.ssh_url, known_hosts=known_hosts, timeout=120):
+        raise click.ClickException("SSH daemon did not become reachable")
+
+    # cache setup for restart
+    cache_enabled = state.slot_cache_enabled and not no_cache
+    if cache_enabled and not cache.validate_cache_config(config):
+        click.echo("[cache] WARNING: cache config invalid; continuing cold", err=True)
+        cache_enabled = False
+        state.slot_cache_enabled = False
+
+    if cache_enabled:
+        if not cache.install_cache_key_on_vast(state, config):
+            click.echo("[cache] WARNING: could not install cache key; continuing cold", err=True)
+            cache_enabled = False
+            state.slot_cache_enabled = False
+        else:
+            llama_commit = state.data.get("llama_cpp_commit") or _common.fetch_llama_commit(state.ssh_url, known_hosts)
+            state.data["llama_cpp_commit"] = llama_commit
+            signature = cache._signature_for_state(config, state, llama_commit)
+            remote_local_dir = state.slot_cache_local_dir
+            cache_remote = cache.remote_cache_dir(config, signature, state.slot_cache_session)
+            state.data["slot_cache_signature"] = signature
+            state.data["slot_cache_remote_dir"] = cache_remote
+            state.data["slot_cache_restore"] = "pending"
+            if _prefetch_slot_cache_to_vast(state.ssh_url, config, remote_local_dir, cache_remote, known_hosts):
+                click.echo("[cache] prefetched slot from cache server")
+                state.data["slot_cache_prefetch"] = "ok"
+            else:
+                click.echo("[cache] no slot cache on server; will start cold", err=True)
+                state.data["slot_cache_prefetch"] = "empty"
+            state.save()
+
+    local_port = ssh.ensure_tunnel(config, state)
+    click.echo(f"[tunnel] localhost:{local_port}")
+
+    if not state.unsecure:
+        tls_dir = tls.ensure_local_tls_dir(config.root_dir)
+        if not (tls_dir / "server.crt").exists():
+            tls.generate_cert(tls_dir)
+        if not tls.deliver_cert(state.ssh_url, tls_dir, known_hosts=known_hosts):
+            raise click.ClickException("TLS certificate delivery failed")
+        state.tls_ca = tls_dir / "ca.crt"
+        api_scheme = "https"
+    else:
+        api_scheme = "http"
+
+    state.save()
+    api_url = f"{api_scheme}://127.0.0.1:{local_port}"
+    base_url = f"{api_url}/v1"
+    _write_env_file(config, state, api_url, base_url)
+
+    client = LlamaClient(config, state)
+    if not wait_for_api(config, state, config.ssh.start_timeout):
+        raise click.ClickException("llama-server did not become healthy")
+
+    # restore slot cache on restart
+    if cache_enabled:
+        if client.slot_restore(config.cache.slot_id):
+            click.echo("[cache] slot restored")
+            state.data["slot_cache_restore"] = "restored"
+        else:
+            click.echo("[cache] WARNING: slot restore failed; continuing cold", err=True)
+            state.data["slot_cache_restore"] = "failed"
+        state.save()
+
+    state.status = "running"
+    state.data["ready_at"] = _now_rfc()
+    state.data["ready_epoch"] = _now_epoch()
+    state.save()
+    if state.run_dir:
+        state.save_metadata(state.run_dir, status="restarted")
+
+    click.echo("\nREADY")
+    click.echo(f"  Profile:   {state.profile}")
+    click.echo(f"  API:       {base_url}")
+    click.echo(f"  Instance:  {state.instance_id}")
