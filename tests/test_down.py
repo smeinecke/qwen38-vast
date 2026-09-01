@@ -1,0 +1,119 @@
+"""Tests for hostai.commands.down with mocked Vast/SSH APIs."""
+
+import json
+from unittest import mock
+
+import click
+import requests
+from click.testing import CliRunner
+
+from hostai.commands.down import (
+    _pause_or_destroy,
+    _save_and_upload_slot_cache,
+    _slot_save,
+    cmd_down,
+)
+
+
+def fake_completed(returncode=0, stdout="", stderr=""):
+    return mock.Mock(returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+def test_slot_save_parses_payload(config, running_state):
+    payload = {"n_saved": 100, "n_written": 1024, "timings": {"save_ms": 50}}
+    with mock.patch("requests.post", return_value=mock.Mock(status_code=200, text=json.dumps(payload), json=lambda: payload)) as post:
+        result = _slot_save(config, running_state)
+    assert result["n_saved"] == 100
+    assert result["n_written"] == 1024
+    assert post.call_args.args[0] == "https://127.0.0.1:18080/slots/0?action=save"
+    assert post.call_args.kwargs["json"] == {"filename": "current.bin"}
+
+
+def test_slot_save_empty_slot(config, running_state):
+    payload = {"n_saved": 0}
+    with mock.patch("requests.post", return_value=mock.Mock(status_code=200, text=json.dumps(payload), json=lambda: payload)):
+        result = _slot_save(config, running_state)
+    assert result is None
+
+
+def test_slot_save_api_error(config, running_state):
+    with mock.patch("requests.post", side_effect=requests.RequestException("boom")):
+        result = _slot_save(config, running_state)
+    assert result is None
+
+
+def test_save_and_upload_slot_cache_happy_path(config, running_state, tmp_path):
+    payload = {"n_saved": 100, "n_written": 1024, "timings": {"save_ms": 50}}
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    with mock.patch("requests.post", return_value=mock.Mock(status_code=200, text=json.dumps(payload), json=lambda: payload)):
+        with mock.patch("hostai.commands.down._install_cache_key_on_vast", return_value=True):
+            with mock.patch("hostai.commands.down._fetch_llama_commit", return_value="abc123"):
+                with mock.patch("hostai.commands.down.ssh.run_remote", return_value=fake_completed()) as run:
+                    with mock.patch("hostai.commands.down.ssh.scp_to", return_value=fake_completed()):
+                        with mock.patch("hostai.commands.down._upload_slot_cache_from_vast", return_value=True):
+                            ok = _save_and_upload_slot_cache(
+                                config,
+                                running_state,
+                                run_dir,
+                                no_cache=False,
+                                known_hosts=tmp_path / "known_hosts",
+                            )
+
+    assert ok is True
+    assert running_state.data["slot_cache_save"] == "uploaded"
+    assert running_state.data["slot_cache_n_saved"] == 100
+    assert (run_dir / "cache-save.json").exists()
+
+
+def test_save_and_upload_slot_cache_disabled(config, running_state, tmp_path):
+    running_state.slot_cache_enabled = False
+    ok = _save_and_upload_slot_cache(
+        config,
+        running_state,
+        tmp_path / "run",
+        no_cache=False,
+        known_hosts=tmp_path / "known_hosts",
+    )
+    assert ok is True
+
+
+def test_save_and_upload_slot_cache_no_ssh(config, running_state, tmp_path):
+    running_state.ssh_url = None
+    config.cache.require_save = False
+    ok = _save_and_upload_slot_cache(
+        config,
+        running_state,
+        tmp_path / "run",
+        no_cache=False,
+        known_hosts=tmp_path / "known_hosts",
+    )
+    assert ok is False
+
+
+def test_pause_or_destroy_destroy(config, running_state, tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    running_state.started_epoch = 0
+    running_state.dph = 1.0
+    running_state.status = "running"
+
+    with mock.patch("hostai.commands.down.vast.destroy", return_value=None):
+        msg = _pause_or_destroy(config, running_state, pause=False, run_dir=run_dir)
+
+    assert "destroyed" in msg or "Session duration" in msg
+    assert running_state.status == "destroyed"
+
+
+def test_pause_or_destroy_404_becomes_already_absent(config, running_state, tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    running_state.started_epoch = 0
+    running_state.dph = 1.0
+
+    err = requests.exceptions.HTTPError(response=mock.Mock(status_code=404))
+    with mock.patch("hostai.commands.down.vast.destroy", side_effect=err):
+        msg = _pause_or_destroy(config, running_state, pause=False, run_dir=run_dir)
+
+    assert "already_absent" in msg
