@@ -7,9 +7,6 @@ __pycache__/
 *.so
 .coverage
 htmlcov/
-.qwen-runs/
-.qwen-vast/
-.qwen-cache/
 .hostai-runs/
 .hostai-vast/
 .hostai-cache/
