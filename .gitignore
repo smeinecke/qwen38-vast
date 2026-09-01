@@ -4,5 +4,9 @@
 .env
 .qwen-runs/
 .qwen-vast/
-ssh/authorized_keys.generated
 .qwen-cache/
+.hostai-runs/
+.hostai-vast/
+.hostai-cache/
+hostai.toml
+ssh/authorized_keys.generated
