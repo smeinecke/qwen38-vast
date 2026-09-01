@@ -315,7 +315,7 @@ You can also commit one or more public keys to `ssh/authorized_keys`. Public key
 are not credentials/secrets, but remember that every private key matching a key
 baked into the image receives root SSH access to instances created from it.
 
-At container startup `qwen-init-ssh.sh` merges the baked keys, forces:
+At container startup `hostai-init-ssh.sh` merges the baked keys, forces:
 
 ```text
 /root/.ssh                 0700 root:root

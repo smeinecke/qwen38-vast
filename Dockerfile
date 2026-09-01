@@ -118,7 +118,7 @@ RUN export DEBIAN_FRONTEND=noninteractive \
     && rm -f /etc/ssh/ssh_host_*
 
 COPY --from=builder /src/llama.cpp/build/bin/llama-server /usr/local/bin/llama-server
-COPY start.sh entrypoint.sh qwen-init-ssh.sh /usr/local/bin/
+COPY start.sh entrypoint.sh hostai-init-ssh.sh /usr/local/bin/
 COPY ssh/ /etc/qwen38/ssh/
 
 # llama-server is mostly statically linked, but GCC OpenMP and OpenSSL remain
@@ -136,7 +136,7 @@ RUN ldconfig \
 
 # Fail CI rather than publishing an entrypoint-mode image that nobody can SSH
 # into. Workflows create ssh/authorized_keys.generated before docker build.
-RUN chmod 0755 /usr/local/bin/start.sh /usr/local/bin/entrypoint.sh /usr/local/bin/qwen-init-ssh.sh \
+RUN chmod 0755 /usr/local/bin/start.sh /usr/local/bin/entrypoint.sh /usr/local/bin/hostai-init-ssh.sh \
     && mkdir -p /models /run/sshd /root/.ssh /etc/ssh/sshd_config.d \
     && chmod 0700 /root/.ssh \
     && if ! grep -hE '^[[:space:]]*(ssh-|ecdsa-|sk-)[^[:space:]]+[[:space:]]+[^[:space:]]+' /etc/qwen38/ssh/authorized_keys* >/dev/null 2>&1; then \

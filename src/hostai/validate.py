@@ -14,7 +14,7 @@ REQUIRED_FILES = (
     "Dockerfile",
     "start.sh",
     "entrypoint.sh",
-    "qwen-init-ssh.sh",
+    "hostai-init-ssh.sh",
 )
 
 DOCKERFILE_MARKERS = (

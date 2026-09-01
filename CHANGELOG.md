@@ -93,7 +93,7 @@
 ## v7 - self-managed SSH, external profiles and manual 56-core builds
 
 - Switched Vast creation from injected SSH launch mode to normal args/entrypoint mode with a regular `-p 22:22` mapping. The image now starts its own `sshd`, so Vast no longer builds a runtime `.../ssh` child image or mutates `authorized_keys`.
-- Added `qwen-init-ssh.sh` with deterministic `0700`/`0600` ownership/modes and fresh per-instance host keys.
+- Added `hostai-init-ssh.sh` with deterministic `0700`/`0600` ownership/modes and fresh per-instance host keys.
 - CI bakes the repository owner's GitHub public SSH keys into the image by default; repository-variable and committed-key overrides are supported.
 - Moved `apt-get upgrade` plus SSH/runtime utility installation into the Docker image build, off paid GPU startup time.
 - Changed the final stage from the full Vast CUDA/cuDNN devel base to `nvidia/cuda:12.8.1-runtime-ubuntu24.04`; the builder remains on the devel image. This substantially reduces the image pulled by each disposable host.

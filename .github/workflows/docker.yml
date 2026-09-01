@@ -27,7 +27,7 @@ jobs:
       - name: Validate config and shell scripts
         run: |
           jq -e '.schema_version == 1 and (.images|length > 0) and (.profiles|length > 0)' profiles.json >/dev/null
-          bash -n start.sh entrypoint.sh qwen-init-ssh.sh scripts/prepare-authorized-keys
+          bash -n start.sh entrypoint.sh hostai-init-ssh.sh scripts/prepare-authorized-keys
 
       - name: Build matrix from profiles.json
         id: matrix

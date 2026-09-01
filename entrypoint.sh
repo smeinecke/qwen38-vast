@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-/usr/local/bin/qwen-init-ssh.sh
+/usr/local/bin/hostai-init-ssh.sh
 
 # Keep SSH infrastructure independent from the inference process. Both sshd and
 # start.sh are children of this PID 1 supervisor. A model/server failure must
