@@ -390,31 +390,7 @@ ghcr.io/YOUR_USER/YOUR_REPO:ada-128k
 ghcr.io/YOUR_USER/YOUR_REPO:blackwell-128k
 ```
 
-### Manual 56-core self-hosted workflow
-
-`.github/workflows/docker-self-hosted.yml` is **workflow_dispatch only**. It
-never runs on a push automatically. In the Actions UI select:
-
-```text
-Manual CUDA build on local runner
-```
-
-and choose one of:
-
-```text
-a6000
-ada
-blackwell
-all
-```
-
-For a single selected architecture the Docker build sees all CPUs exposed by
-your local runner and llama.cpp builds with `-j$(nproc)`. With one registered
-self-hosted runner, choosing `all` queues the three matrix jobs serially; choose
-a single target when you want the full 56 cores focused on one rebuild.
-
-The workflows use Node-24 Docker Actions. Keep the self-hosted GitHub
-Actions runner updated.
+The workflow uses Node-24 Docker Actions.
 
 ### Cumulative feature validation
 
@@ -448,11 +424,6 @@ first build with a new compiler-cache generation executes the compile layer once
 to seed the cache. On the next build with unchanged build inputs expect an exact
 `actions/cache` v4 hit; BuildKit may also report the compile layer itself as `CACHED`,
 which is even faster.
-
-For the manual self-hosted workflow, Buildx additionally uses a persistent named
-`qwen38-local-builder` (`keep-state: true`, `cleanup: false`). On the 56-core
-runner this makes the local BuildKit state the fastest first-level cache; the GHA
-ccache archive remains a recovery/portability layer.
 
 ## Cost/search controls
 
