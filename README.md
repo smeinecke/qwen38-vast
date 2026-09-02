@@ -164,13 +164,14 @@ said success" from real avoided prompt processing.
 `profiles.json` is the single editable configuration file for architectures,
 context defaults and Vast search queries.
 
-There are three compiled CUDA images:
+There are four compiled CUDA images:
 
 | Image name | CUDA | Stable GHCR tag | GPUs |
 |---|---|---:|---|
 | `a6000` | SM86 | `:a6000` | RTX A6000, A40 |
 | `ada` | SM89 | `:ada-128k` | RTX 4090, RTX 6000 Ada, L40/L40S, RTX 5880 Ada |
 | `blackwell` | SM120 | `:blackwell-128k` | RTX 5090, RTX PRO 6000 Blackwell |
+| `v100` | SM70 | `:v100` | Tesla V100 |
 
 Runtime profiles can reuse one compiled image. The included profiles are:
 
@@ -189,14 +190,17 @@ Runtime profiles can reuse one compiled image. The included profiles are:
 | `5090-64k` | `:blackwell-128k` | 65,536 | exact RTX 5090 |
 | `5090-128k` | `:blackwell-128k` | 131,072 | exact RTX 5090 |
 | `blackwell-128k` | `:blackwell-128k` | 131,072 | RTX 5090 or RTX PRO 6000 |
-| `blackwell-256k` | `:blackwell-128k` | 262,144 | RTX PRO 6000 96 GB only |
+| `blackwell-256k` | `:blackwell-128k` | 262,144 | exact RTX PRO 6000, 96 GB |
+| `pro6000-256k` | `:blackwell-128k` | 262,144 | RTX PRO 6000 family (WS/S), 96 GB |
+| `v100-128k` | `:v100` | 131,072 | Tesla V100 |
 
-`256k` means the model's full 262,144-token native context. These are runtime
-profiles only; they reuse the existing SM86/SM89/SM120 images and therefore do
-not add CUDA builds. The 48 GB 256k profiles are deliberately explicit test
-profiles: actual headroom still depends on the selected model, KV-cache type and
-FastMTP configuration. The 96 GB RTX PRO 6000 profile is the conservative 256k
-Blackwell choice.
+`256k` means the model's full 262,144-token native context. The 256k runtime
+profiles reuse the existing SM86/SM89/SM120 images and therefore do not add
+CUDA builds; `v100-128k` uses the dedicated `:v100` image. The 48 GB 256k
+profiles are deliberately explicit test profiles: actual headroom still depends
+on the selected model, KV-cache type and FastMTP configuration. The exact
+`blackwell-256k` profile is the conservative 256k Blackwell choice; the broader
+`pro6000-256k` profile also matches RTX PRO 6000 WS/S variants.
 
 Edit `profiles.json` to tune GPU ordering, add another context profile or
 tighten a region/GPU query.
@@ -333,19 +337,26 @@ key.
 
 ## Docker build details
 
-Builder base:
+Builder base (Ampere/Ada/Blackwell):
 
 ```text
 vastai/base-image:cuda-12.8.1-cudnn-devel-ubuntu24.04-py312
 ```
 
-Runtime base:
+Runtime base (Ampere/Ada/Blackwell):
 
 ```text
 nvidia/cuda:12.8.1-runtime-ubuntu24.04
 ```
 
-The runtime image uses the much smaller NVIDIA CUDA 12.8 runtime base to avoid
+The `v100` image uses older Volta-compatible bases:
+
+```text
+nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04
+nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
+```
+
+The runtime image uses the much smaller NVIDIA CUDA runtime base to avoid
 shipping the compiler/toolkit/cuDNN development stack to every disposable Vast
 host. We do **not** squash the final image into one giant layer: squashing
 destroys layer reuse and makes retries/cache hits worse. The image also runs
@@ -388,6 +399,7 @@ ghcr.io/YOUR_USER/YOUR_REPO:a6000
 ghcr.io/YOUR_USER/YOUR_REPO:a6000-sha-abc1234
 ghcr.io/YOUR_USER/YOUR_REPO:ada-128k
 ghcr.io/YOUR_USER/YOUR_REPO:blackwell-128k
+ghcr.io/YOUR_USER/YOUR_REPO:v100
 ```
 
 The workflow uses Node-24 Docker Actions.
