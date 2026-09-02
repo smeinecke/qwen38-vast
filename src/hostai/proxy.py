@@ -125,18 +125,9 @@ class TokenizedProxy:
         except TokenizerError as exc:
             raise web.HTTPBadRequest(reason=f"tokenization failed: {exc}") from exc
 
-        payload: Dict[str, Any] = {
-            "prompt": token_ids,
-            "n_predict": max_tokens,
-            "temperature": temperature,
-            "stream": stream,
-        }
-        if "top_p" in body:
-            payload["top_p"] = body["top_p"]
-        if "top_k" in body:
-            payload["top_k"] = body["top_k"]
-        if "stop" in body:
-            payload["stop"] = body["stop"]
+        payload = self.build_completion_payload(
+            token_ids, max_tokens, temperature, stream, body
+        )
 
         upstream_response = await self.session.post(
             f"{self.upstream}/completion",
@@ -152,6 +143,50 @@ class TokenizedProxy:
         if stream:
             return await self._stream_chat(request, upstream_response)
         return await self._complete_chat(upstream_response, len(token_ids))
+
+    @staticmethod
+    def build_completion_payload(
+        token_ids: List[int],
+        max_tokens: int,
+        temperature: float,
+        stream: bool,
+        body: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Build a native /completion payload from an OpenAI chat request."""
+        payload: Dict[str, Any] = {
+            "prompt": token_ids,
+            "n_predict": max_tokens,
+            "temperature": temperature,
+            "stream": stream,
+        }
+
+        # Forward common OpenAI/llama-server sampling parameters.
+        optional_params = {
+            "top_p",
+            "top_k",
+            "min_p",
+            "stop",
+            "frequency_penalty",
+            "presence_penalty",
+            "repeat_penalty",
+            "seed",
+            "logit_bias",
+            "dynatemp_range",
+            "dynatemp_exponent",
+            "typical_p",
+            "tfs_z",
+            "mirostat",
+            "mirostat_tau",
+            "mirostat_eta",
+            "n_probs",
+            "grammar",
+            "json_schema",
+        }
+        for key in optional_params:
+            if key in body and body[key] is not None:
+                payload[key] = body[key]
+
+        return payload
 
     async def _complete_chat(
         self,
