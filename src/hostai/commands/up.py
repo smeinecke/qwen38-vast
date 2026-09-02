@@ -244,6 +244,7 @@ def _env_dict(
         "REASONING_EFFORT": config.model.reasoning_effort,
         "HF_REVISION": config.model.hf_revision,
         "HOSTAI_UNSECURE": "1" if unsecure else "0",
+        "HOSTAI_TOKENIZED_ONLY": "1" if config.proxy.tokenized_only else "0",
         "SLOT_SAVE_PATH": slot_dir,
     }
     hf_token = config.secrets.get("HF_TOKEN") or config.secrets.get("HUGGING_FACE_HUB_TOKEN")
@@ -366,9 +367,15 @@ def _wait_for_api(config: Config, state: State, timeout: int, client: LlamaClien
 
 def _write_env_file(config: Config, state: State, api_url: str, base_url: str) -> None:
     env_path = state_dir(config.root_dir) / "env"
+
+    client_base: Optional[str]
+    if config.proxy.tokenized_only and config.proxy.port:
+        # The proxy is the OpenAI-compatible endpoint for clients.
+        client_base = f"http://127.0.0.1:{config.proxy.port}/v1"
+    else:
+        client_base = base_url
+
     lines = [
-        f"export OPENAI_BASE_URL='{base_url}'",
-        f"export OPENAI_API_BASE='{base_url}'",
         f"export OPENAI_API_KEY='{state.api_key}'",
         f"export HOSTAI_MODEL='{state.data.get('model')}'",
         f"export HOSTAI_PROFILE='{state.data.get('profile')}'",
@@ -376,6 +383,28 @@ def _write_env_file(config: Config, state: State, api_url: str, base_url: str) -
         f"export HOSTAI_BASE_URL='{base_url}'",
         f"export HOSTAI_API_URL='{api_url}'",
     ]
+    if client_base:
+        lines += [
+            f"export OPENAI_BASE_URL='{client_base}'",
+            f"export OPENAI_API_BASE='{client_base}'",
+        ]
+
+    if config.proxy.tokenized_only:
+        socket_path = Path(config.proxy.socket_path) if config.proxy.socket_path else _default_proxy_socket(config)
+        lines += [
+            f"export HOSTAI_PROXY_SOCKET='{socket_path}'",
+            "export HOSTAI_TOKENIZED_ONLY=1",
+        ]
+        if not config.proxy.port:
+            lines += [
+                "# tokenized-only is enabled; run 'hostai proxy' and connect your OpenAI client to HOSTAI_PROXY_SOCKET",
+                "# or set HOSTAI_PROXY_PORT to expose the proxy on a local TCP port as well.",
+            ]
+        lines += [
+            "# In tokenized-only mode the raw HOSTAI_API_URL is for diagnostics only.",
+            "# All chat traffic must go through the hostai proxy so prompts are tokenized locally.",
+        ]
+
     if not state.unsecure and state.tls_ca:
         ca = str(state.tls_ca)
         lines += [
@@ -386,6 +415,10 @@ def _write_env_file(config: Config, state: State, api_url: str, base_url: str) -
         ]
     env_path.write_text("\n".join(lines) + "\n")
     env_path.chmod(0o600)
+
+
+def _default_proxy_socket(config: Config) -> Path:
+    return state_dir(config.root_dir) / "proxy.sock"
 
 
 def _prefetch_slot_cache_to_vast(

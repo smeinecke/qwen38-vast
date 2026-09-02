@@ -113,12 +113,13 @@ RUN export DEBIAN_FRONTEND=noninteractive \
          python3-venv \
     && python3 -m venv /venv/main \
     && /venv/main/bin/pip install --no-cache-dir --upgrade pip \
-    && /venv/main/bin/pip install --no-cache-dir "huggingface_hub[hf-xet]==${HF_HUB_VERSION}" \
+    && /venv/main/bin/pip install --no-cache-dir "huggingface_hub[hf-xet]==${HF_HUB_VERSION}" aiohttp \
     && rm -rf /var/lib/apt/lists/* \
     && rm -f /etc/ssh/ssh_host_*
 
 COPY --from=builder /src/llama.cpp/build/bin/llama-server /usr/local/bin/llama-server
 COPY start.sh entrypoint.sh hostai-init-ssh.sh /usr/local/bin/
+COPY src/hostai/remote_guard.py /usr/local/bin/hostai-guard
 COPY ssh/ /etc/qwen38/ssh/
 
 # llama-server is mostly statically linked, but GCC OpenMP and OpenSSL remain
@@ -136,7 +137,7 @@ RUN ldconfig \
 
 # Fail CI rather than publishing an entrypoint-mode image that nobody can SSH
 # into. Workflows create ssh/authorized_keys.generated before docker build.
-RUN chmod 0755 /usr/local/bin/start.sh /usr/local/bin/entrypoint.sh /usr/local/bin/hostai-init-ssh.sh \
+RUN chmod 0755 /usr/local/bin/start.sh /usr/local/bin/entrypoint.sh /usr/local/bin/hostai-init-ssh.sh /usr/local/bin/hostai-guard \
     && mkdir -p /models /run/sshd /root/.ssh /etc/ssh/sshd_config.d \
     && chmod 0700 /root/.ssh \
     && if ! grep -hE '^[[:space:]]*(ssh-|ecdsa-|sk-)[^[:space:]]+[[:space:]]+[^[:space:]]+' /etc/qwen38/ssh/authorized_keys* >/dev/null 2>&1; then \

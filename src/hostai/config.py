@@ -194,6 +194,15 @@ class BenchSection:
 
 
 @dataclass
+class ProxySection:
+    tokenized_only: bool = False
+    socket_path: str = ""
+    port: int = 0
+    tokenizer_model: str = "Qwen/Qwen3.8-27B"
+    cache_dir: str = ""
+
+
+@dataclass
 class Config:
     hostai: HostaiSection = field(default_factory=HostaiSection)
     market: MarketSection = field(default_factory=MarketSection)
@@ -204,6 +213,7 @@ class Config:
     monitor: MonitorSection = field(default_factory=MonitorSection)
     ssh: SSHSection = field(default_factory=SSHSection)
     bench: BenchSection = field(default_factory=BenchSection)
+    proxy: ProxySection = field(default_factory=ProxySection)
 
     # Filled by loader
     root_dir: Path = field(default_factory=Path)
@@ -273,6 +283,11 @@ ENV_MAP: Dict[str, tuple[str, str, Optional[Type[Any]]]] = {
     "START_TIMEOUT": ("ssh", "start_timeout", int),
     "BENCH_MAX_TOKENS": ("bench", "max_tokens", int),
     "BENCH_TIMEOUT": ("bench", "timeout", int),
+    "HOSTAI_TOKENIZED_ONLY": ("proxy", "tokenized_only", bool),
+    "HOSTAI_PROXY_SOCKET": ("proxy", "socket_path", str),
+    "HOSTAI_PROXY_PORT": ("proxy", "port", int),
+    "HOSTAI_PROXY_TOKENIZER_MODEL": ("proxy", "tokenizer_model", str),
+    "HOSTAI_PROXY_CACHE_DIR": ("proxy", "cache_dir", str),
 }
 
 SECRETS = {"VAST_API_KEY", "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "SSH_PUBLIC_KEY"}

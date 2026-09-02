@@ -14,6 +14,7 @@ from hostai.commands.monitor import (
     cmd_monitor_stop,
     cmd_monitor_watch,
 )
+from hostai.commands.proxy import cmd_proxy
 from hostai.commands.results import cmd_results
 from hostai.commands.ssh_cmd import cmd_ssh_prepare
 from hostai.commands.status import cmd_status
@@ -43,6 +44,7 @@ cli.add_command(cmd_up, name="up")
 cli.add_command(cmd_down, name="down")
 cli.add_command(cmd_status, name="status")
 cli.add_command(cmd_bench, name="bench")
+cli.add_command(cmd_proxy, name="proxy")
 
 
 @cli.group("cache", help="Manage the persistent llama.cpp slot/KV cache.")

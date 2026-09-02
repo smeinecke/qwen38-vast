@@ -180,6 +180,12 @@ def cmd_bench(
     if not state.exists or not state.instance_id:
         raise click.ClickException("no running instance; run hostai up first")
 
+    if config.proxy.tokenized_only:
+        raise click.ClickException(
+            "bench does not support tokenized-only mode; "
+            "run 'hostai proxy' and use an OpenAI client, or disable HOSTAI_TOKENIZED_ONLY."
+        )
+
     if not ssh.is_tunnel_healthy(config, state, timeout=3):
         ssh.ensure_tunnel(config, state)
 

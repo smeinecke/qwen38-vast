@@ -4,6 +4,7 @@ set -Eeuo pipefail
 umask 077
 
 HOSTAI_UNSECURE="${HOSTAI_UNSECURE:-0}"
+HOSTAI_TOKENIZED_ONLY="${HOSTAI_TOKENIZED_ONLY:-0}"
 HOSTAI_TMPFS_BASE="${HOSTAI_TMPFS_BASE:-/dev/shm/qwen38}"
 HOSTAI_TMP_DIR="${HOSTAI_TMP_DIR:-$HOSTAI_TMPFS_BASE/tmp}"
 HOSTAI_LOG_DIR="${HOSTAI_LOG_DIR:-$HOSTAI_TMPFS_BASE/log}"
@@ -28,6 +29,11 @@ CACHE_TYPE_V="${CACHE_TYPE_V:-}"
 
 if [[ -z "${LLAMA_API_KEY:-}" ]]; then
   echo >&2 "ERROR: LLAMA_API_KEY is required."
+  exit 2
+fi
+
+if [[ "$HOSTAI_UNSECURE" == "1" && "$HOSTAI_TOKENIZED_ONLY" == "1" ]]; then
+  echo >&2 "ERROR: HOSTAI_TOKENIZED_ONLY cannot be combined with HOSTAI_UNSECURE."
   exit 2
 fi
 
@@ -173,13 +179,22 @@ else
   # /proc/<pid>/environ after we have written it to tmpfs.
   unset HOSTAI_TLS_CERT_B64 HOSTAI_TLS_KEY_B64 || true
 
-  # The llama-server treats any --host value ending in .sock as a Unix socket.
-  server_args+=(
-    --host "$llama_socket"
-    --ssl-cert-file "$cert_file"
-    --ssl-key-file "$key_file"
-  )
-  llama_bind="unix://$llama_socket"
+  if [[ "$HOSTAI_TOKENIZED_ONLY" == "1" ]]; then
+    # In tokenized-only mode llama-server listens on an internal socket with
+    # plain HTTP. The hostai-guard binds the public socket, does TLS, and
+    # refuses any prompt that is not an array of token IDs.
+    llama_internal_socket="$HOSTAI_TMPFS_BASE/llama-internal.sock"
+    llama_bind="unix://$llama_internal_socket"
+    server_args+=(--host "$llama_internal_socket")
+  else
+    # The llama-server treats any --host value ending in .sock as a Unix socket.
+    server_args+=(
+      --host "$llama_socket"
+      --ssl-cert-file "$cert_file"
+      --ssl-key-file "$key_file"
+    )
+    llama_bind="unix://$llama_socket"
+  fi
 fi
 
 echo "[serve] profile=$HOSTAI_PROFILE model=$MODEL revision=$HF_REVISION ctx=$CTX_SIZE fastmtp=$USE_FASTMTP bind=$llama_bind slot_save_path=$SLOT_SAVE_PATH"
@@ -191,8 +206,8 @@ if [[ "$HOSTAI_UNSECURE" == "1" ]]; then
   exec /usr/local/bin/llama-server "${server_args[@]}"
 fi
 
-# In secure mode the TLS private key is only needed while llama-server builds
-# its SSL context. Start the server, wait for the Unix socket to appear, then
+# In secure mode the TLS private key is only needed while the TLS endpoint
+# builds its SSL context. Start the server, wait for its socket to appear, then
 # remove the key file from tmpfs so it is no longer reachable from the
 # filesystem even if /dev/shm itself is readable.
 /usr/local/bin/llama-server "${server_args[@]}" &
@@ -200,14 +215,16 @@ llama_pid=$!
 
 HOSTAI_TLS_SOCKET_TIMEOUT="${HOSTAI_TLS_SOCKET_TIMEOUT:-1800}"
 socket_wait=0
-while [[ ! -S "$llama_socket" ]]; do
+target_socket="$llama_socket"
+[[ "$HOSTAI_TOKENIZED_ONLY" == "1" ]] && target_socket="$llama_internal_socket"
+while [[ ! -S "$target_socket" ]]; do
   if ! kill -0 "$llama_pid" >/dev/null 2>&1; then
     echo >&2 "ERROR: llama-server exited before the Unix socket appeared."
     wait "$llama_pid" || true
     exit 70
   fi
   if (( socket_wait >= HOSTAI_TLS_SOCKET_TIMEOUT )); then
-    echo >&2 "ERROR: llama-server did not create $llama_socket within ${HOSTAI_TLS_SOCKET_TIMEOUT}s."
+    echo >&2 "ERROR: llama-server did not create $target_socket within ${HOSTAI_TLS_SOCKET_TIMEOUT}s."
     kill -TERM "$llama_pid" >/dev/null 2>&1 || true
     wait "$llama_pid" || true
     exit 70
@@ -216,9 +233,61 @@ while [[ ! -S "$llama_socket" ]]; do
   socket_wait=$((socket_wait + 1))
 done
 
+if [[ "$HOSTAI_TOKENIZED_ONLY" == "1" ]]; then
+  # Start the tokenizing guard in front of the plain HTTP internal socket.
+  # It owns the public TLS socket ($llama_socket) and only accepts token IDs.
+  HOSTAI_GUARD_LISTEN="$llama_socket" \
+  HOSTAI_GUARD_BACKEND="$llama_internal_socket" \
+  HOSTAI_GUARD_CERT="$cert_file" \
+  HOSTAI_GUARD_KEY="$key_file" \
+    /venv/main/bin/python3 /usr/local/bin/hostai-guard &
+  guard_pid=$!
+
+  guard_wait=0
+  while [[ ! -S "$llama_socket" ]]; do
+    if ! kill -0 "$guard_pid" >/dev/null 2>&1; then
+      echo >&2 "ERROR: hostai-guard exited before the public Unix socket appeared."
+      wait "$guard_pid" || true
+      kill -TERM "$llama_pid" >/dev/null 2>&1 || true
+      wait "$llama_pid" || true
+      exit 70
+    fi
+    if (( guard_wait >= HOSTAI_TLS_SOCKET_TIMEOUT )); then
+      echo >&2 "ERROR: hostai-guard did not create $llama_socket within ${HOSTAI_TLS_SOCKET_TIMEOUT}s."
+      kill -TERM "$guard_pid" >/dev/null 2>&1 || true
+      wait "$guard_pid" || true
+      kill -TERM "$llama_pid" >/dev/null 2>&1 || true
+      wait "$llama_pid" || true
+      exit 70
+    fi
+    sleep 1
+    guard_wait=$((guard_wait + 1))
+  done
+fi
+
 if [[ -f "$key_file" ]]; then
   rm -f "$key_file"
   echo "[secure] TLS private key removed from tmpfs after socket bind"
+fi
+
+if [[ "$HOSTAI_TOKENIZED_ONLY" == "1" ]]; then
+  # Wait for either llama-server or guard and forward the exit code.
+  while kill -0 "$llama_pid" >/dev/null 2>&1 && kill -0 "$guard_pid" >/dev/null 2>&1; do
+    sleep 1
+  done
+  if ! kill -0 "$llama_pid" >/dev/null 2>&1; then
+    wait "$llama_pid" || true
+    rc=$?
+    kill -TERM "$guard_pid" >/dev/null 2>&1 || true
+    wait "$guard_pid" || true
+    exit "$rc"
+  else
+    wait "$guard_pid" || true
+    rc=$?
+    kill -TERM "$llama_pid" >/dev/null 2>&1 || true
+    wait "$llama_pid" || true
+    exit "$rc"
+  fi
 fi
 
 # Forward the real exit code to the entrypoint supervisor.
