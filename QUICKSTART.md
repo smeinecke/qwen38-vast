@@ -278,6 +278,40 @@ uv run hostai up 5090-128k --session my-project
 The `--session` value is persisted with the run, so `hostai down` uploads back
 to the same cache namespace.
 
+## 11. Client-side tokenization (optional)
+
+Set `HOSTAI_TOKENIZED_ONLY=1` to keep raw user prompts off the remote Vast
+instance. In this mode the remote `hostai-guard` only accepts token IDs, and a
+local `hostai proxy` tokenizes the prompt before sending it.
+
+```dotenv
+HOSTAI_TOKENIZED_ONLY=1
+HOSTAI_PROXY_PORT=18081
+```
+
+If `HOSTAI_PROXY_PORT` is not set, the proxy listens on a Unix socket
+(`$HOSTAI_PROXY_SOCKET` in `.hostai-vast/env`) and `OPENAI_BASE_URL` is omitted
+from the generated env file until the proxy is running.
+
+With the instance up, start the proxy in one terminal:
+
+```bash
+uv run hostai proxy
+```
+
+Then source the environment and use the OpenAI-compatible endpoint in another:
+
+```bash
+source .hostai-vast/env
+curl "$OPENAI_BASE_URL/chat/completions" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"local","messages":[{"role":"user","content":"hello"}]}'
+```
+
+`hostai bench` does not support tokenized-only mode yet; disable the toggle to
+run benchmarks.
+
 ## Common `.env` overrides
 
 ```dotenv
@@ -287,6 +321,8 @@ HOSTAI_MAX_INET_UP_COST=0.001
 HOSTAI_SLOT_CACHE_REQUIRE_SAVE=1
 HOSTAI_SLOT_CACHE_USE_SHM=1
 HOSTAI_MONITOR_AUTO_START=1
+HOSTAI_TOKENIZED_ONLY=1
+HOSTAI_PROXY_PORT=18081
 ```
 
 Traffic costs are controlled purely by `HOSTAI_MAX_INET_DOWN_COST` and

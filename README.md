@@ -29,6 +29,60 @@ backend so the next deployment reuses the previous context.
 The model weights are downloaded at instance startup, not baked into the image.
 `HF_XET_HIGH_PERFORMANCE=1` is enabled to speed up transfers.
 
+## Tokenized-only mode
+
+`hostai` supports client-side tokenization as a defense-in-depth option. When
+`HOSTAI_TOKENIZED_ONLY=1` is enabled:
+
+- `hostai up` launches the remote `hostai-guard` in front of `llama-server`.
+- The guard blocks all text-bearing endpoints (`/v1/chat/completions`,
+  `/tokenize`, `/apply-template`, `/detokenize`, `/infill`, etc.).
+- Only the native `/completion` endpoint is allowed, and only when the request
+  `prompt` is a JSON array of integer token IDs.
+- You run `hostai proxy` locally. It listens on a Unix socket, applies the model
+  chat template with `transformers`, and forwards token IDs to the remote
+  `llama-server` through the SSH tunnel.
+- The generated text is then decoded and streamed back as an OpenAI-compatible
+  response.
+
+This makes prompt extraction from the remote VM more difficult because the
+remote never sees the raw user text. The feature is **not** absolute protection:
+a root-level attacker with the tokenizer can still reverse token IDs.
+
+Enable it in `hostai.toml` or as a shell environment variable:
+
+```dotenv
+HOSTAI_TOKENIZED_ONLY=1
+```
+
+By default the proxy uses a Unix socket. Clients that cannot use Unix sockets
+can request a local TCP port as well:
+
+```dotenv
+HOSTAI_PROXY_PORT=18081
+```
+
+After `hostai up`:
+
+```bash
+# In one terminal
+uv run hostai proxy
+
+# In another terminal
+source .hostai-vast/env
+curl "$OPENAI_BASE_URL/chat/completions" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"local","messages":[{"role":"user","content":"hello"}]}'
+```
+
+If `HOSTAI_PROXY_PORT` is not set, `OPENAI_BASE_URL` is omitted from the
+`.hostai-vast/env` file and the comment explains how to use
+`$HOSTAI_PROXY_SOCKET` or set `HOSTAI_PROXY_PORT`.
+
+`hostai bench` does not support tokenized-only mode yet. Disable the toggle to
+use benchmarks.
+
 ## Slot/KV cache
 
 The cache persists the llama.cpp slot between disposable Vast instances. The
