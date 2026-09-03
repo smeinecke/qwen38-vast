@@ -472,23 +472,28 @@ The workflow uses Node-24 Docker Actions.
 ### Cumulative feature validation
 
 The `hostai validate` command checks the repository layout and records a
-`validation.json` digest.  With `--production`, it also requires Docker, the
-integration image, and passes `tests/test_local_integration.py`, exercising:
-`start.sh`, `entrypoint.sh`, SSH/tunnel setup, `llama-server` health, slot/KV
-cache handling, and `hostai down` cleanup.  On success, `validation-last-success.json`
-is updated with the immutable Docker image ID, git commit, `profiles.json` hash,
-and validation level.  `hostai validate --compare` compares the current state
-against that last *successful* record.
+`validation.json` digest.  With `--production`, it requires a clean Git tree,
+builds the integration image from the current source, and passes
+`tests/test_local_integration.py`, exercising: `start.sh`, `entrypoint.sh`,
+SSH/tunnel setup, `llama-server` health, slot/KV cache handling, and `hostai down`
+cleanup.  On success, `validation-last-success.json` is updated with the
+immutable Docker image ID, git commit, `profiles.json` hash, and validation level.
+`hostai validate --compare` compares the current state against that last
+*successful* record.
 
 Set `[vast].require_production_validation = true` or
-`HOSTAI_REQUIRE_PRODUCTION_VALIDATION=1` to make `hostai up` refuse real Vast
-rentals until the current state matches the last successful production
-validation.  Use `hostai up ... --allow-unvalidated` to bypass the gate.
+`HOSTAI_REQUIRE_PRODUCTION_VALIDATION=1` to make `hostai up` (including
+`hostai up --restart`) refuse real Vast rentals until the current state matches
+the last successful production validation.  When enabled, `hostai up` selects the
+immutable SHA-tagged production image
+`ghcr.io/OWNER/REPO:<profile>-sha-<validated-commit>` instead of the mutable
+profile tag, completing the provenance chain from Git commit -> integration test
+-> CI-built runtime image -> Vast rental.  Use `hostai up ... --allow-unvalidated`
+to bypass the gate explicitly.
 
-Build the integration image and run it locally with:
+Run a local production validation with:
 
 ```bash
-docker build -f tests/integration/Dockerfile.test -t hostai-test:latest .
 uv run hostai validate --production
 ```
 

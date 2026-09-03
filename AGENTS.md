@@ -50,8 +50,9 @@
 ## Validation gate
 
 - Run `hostai validate` to check the repository layout and record a `.hostai-vast/validation.json` digest.
-- Run `hostai validate --production` to also require Docker, the integration image, and pass `tests/test_local_integration.py`.
+- Run `hostai validate --production` to require a clean Git tree, build the integration image from the current source, and pass `tests/test_local_integration.py`.
 - Run `hostai validate --compare` to compare the current state against the last *successful* validation and warn about drift (git commit, image ID, `profiles.json`, validation level).
 - On success, a production validation is also written to `.hostai-vast/validation-last-success.json`.
-- Set `HOSTAI_REQUIRE_PRODUCTION_VALIDATION=1` or `[vast].require_production_validation = true` to make `hostai up` refuse any paid Vast `create_instance` until the current git/image/profiles match the last successful production validation. Use `--allow-unvalidated` to bypass the gate explicitly.
+- Set `HOSTAI_REQUIRE_PRODUCTION_VALIDATION=1` or `[vast].require_production_validation = true` to make `hostai up` and `hostai up --restart` refuse any paid Vast `create_instance`/`start_instance` until the current git/image/profiles match the last successful production validation. Use `--allow-unvalidated` to bypass the gate explicitly.
+- When the gate is enabled, `hostai up` selects the immutable production image tag `<profile>-sha-<validated-commit>` instead of the mutable profile tag, creating a complete provenance chain from Git commit -> integration test -> CI-built runtime image -> Vast rental.
 - Use this gate before a real Vast rental to confirm the local integration image still boots cleanly and the working tree matches the last validated state.
