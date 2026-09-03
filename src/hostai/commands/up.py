@@ -105,7 +105,7 @@ def cmd_up(
         session_seconds = config.vast.expected_session_seconds
 
     if restart:
-        _do_restart(config, chosen_profile, local_port, unsecure, no_cache)
+        _do_restart(config, chosen_profile, local_port, unsecure, no_cache, allow_unvalidated=allow_unvalidated)
     else:
         _do_fresh(
             config,
@@ -125,7 +125,7 @@ def cmd_up(
         )
 
 
-def _check_production_validation(config: Config, allow_unvalidated: bool) -> None:
+def _check_production_validation(config: Config, allow_unvalidated: bool) -> Optional[ValidationRecord]:
     """Block a Vast launch unless a current production validation exists.
 
     When `[vast].require_production_validation` is true, this compares the
@@ -142,7 +142,7 @@ def _check_production_validation(config: Config, allow_unvalidated: bool) -> Non
         return
 
     previous = load_last_validation(config.root_dir, success=True)
-    if previous is None:
+    if previous is None or previous.result != "ok":
         raise click.ClickException(
             "[validation] no successful production validation on record. "
             "Run 'hostai validate --production' before a real Vast rental, "
@@ -179,6 +179,7 @@ def _check_production_validation(config: Config, allow_unvalidated: bool) -> Non
         )
 
     click.echo("[validation] production validation gate passed")
+    return previous
 
 
 def _now_rfc() -> str:
@@ -653,7 +654,13 @@ def _do_fresh(
         click.echo(f"[search]  mode={offer_type} max_dph=${configured_max_dph:.4f}/h")
     provider = _provider(config)
     click.echo(f"[provider] {provider.name}")
-    _check_production_validation(config, allow_unvalidated)
+    previous = _check_production_validation(config, allow_unvalidated)
+    if config.vast.require_production_validation and previous is not None and not allow_unvalidated:
+        # Use the immutable SHA-tagged image that the CI published for the
+        # validated Git commit instead of the mutable profile tag.
+        commit = previous.git_commit[:7]
+        selected_image = image_for_profile(config, f"{image.image_tag}-sha-{commit}")
+        click.echo(f"[image] gated to validated image: {selected_image}")
 
     offer_data = market.select_offer(
         config,
@@ -978,7 +985,10 @@ def _do_restart(
     local_port: Optional[int],
     unsecure: bool,
     no_cache: bool,
+    *,
+    allow_unvalidated: bool = False,
 ) -> None:
+    _check_production_validation(config, allow_unvalidated)
     sdir = state_dir(config.root_dir)
     state = State.load(sdir / "state.json")
     if not state.instance_id:

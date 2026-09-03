@@ -268,12 +268,14 @@ def record_validation(
 def load_last_validation(root_dir: Path, *, success: bool = False) -> Optional[ValidationRecord]:
     path = _validation_path(root_dir, success=success)
     if not path.exists():
-        # Fall back to the current record if no success record exists.
-        if success:
-            return load_last_validation(root_dir, success=False)
         return None
     try:
-        return ValidationRecord.from_dict(json.loads(path.read_text()))
+        record = ValidationRecord.from_dict(json.loads(path.read_text()))
+        # Defensive: callers asking for the last successful record must not
+        # receive a failed one even if the file was somehow corrupted.
+        if success and record.result != "ok":
+            return None
+        return record
     except Exception:
         return None
 

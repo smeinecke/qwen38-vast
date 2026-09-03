@@ -270,13 +270,14 @@ tighten a region/GPU query.
 ### Free-traffic market policy
 
 All rental and monitor searches also apply the central `market_policy` from
-`profiles.json`. By default both `inet_down_cost` and `inet_up_cost` must be zero.
-Vast reports these fields in USD/GB. This is intentionally separate from the GPU
-profiles because downloading a ~20 GB container/model can otherwise cost more
-than the short GPU rental itself. `hostai up` prints the selected offer's
-transfer prices before renting and also validates the raw offer response. Adjust
-`HOSTAI_MAX_INET_DOWN_COST` and `HOSTAI_MAX_INET_UP_COST` to allow paid traffic
-up to a specific price, or set them to `0` to require free traffic.
+`profiles.json`. By default `inet_down_cost` and `inet_up_cost` must be at or
+below $0.001/GB. Vast reports these fields in USD/GB. This is intentionally
+separate from the GPU profiles because downloading a ~20 GB container/model can
+otherwise cost more than the short GPU rental itself. `hostai up` prints the
+selected offer's transfer prices before renting and also validates the raw offer
+response. Adjust `HOSTAI_MAX_INET_DOWN_COST` and `HOSTAI_MAX_INET_UP_COST` to
+allow paid traffic up to a specific price, or set them to `0.0` to require
+actually free traffic.
 
 ### Market monitoring
 

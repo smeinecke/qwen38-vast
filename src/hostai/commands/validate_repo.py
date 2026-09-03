@@ -7,6 +7,7 @@ import time
 
 import click
 
+from hostai import utils
 from hostai.config import Config
 from hostai.validate import (
     compare_validations,
@@ -20,17 +21,18 @@ from hostai.validate import (
 @click.command("validate")
 @click.option("--production", is_flag=True, help="Run full local checks before a real Vast rental.")
 @click.option("--compare", is_flag=True, help="Compare current state with the last successful validation.")
-@click.option("--image", default="hostai-test:latest", help="Local integration image to require.")
+@click.option("--image", default="hostai-test:latest", help="Local integration image to require/build.")
+@click.option("--no-build", is_flag=True, help="Do not rebuild the integration image before production tests.")
 @click.pass_obj
-def cmd_validate(config: Config, production: bool, compare: bool, image: str):
+def cmd_validate(config: Config, production: bool, compare: bool, image: str, no_build: bool):
     """Validate the repository layout and configuration.
 
-    With --production, also verify the local Docker integration image and run
-    the integration acceptance tests.  A record of the validation is written to
-    .hostai-vast/validation.json; on success, .hostai-vast/validation-last-success.json
-    is also written.  With --compare, the current state is compared against the
-    last *successful* record so you can detect unvalidated changes before
-    spending money on Vast.
+    With --production, also build and verify the local Docker integration image
+    and run the integration acceptance tests.  A record of the validation is
+    written to .hostai-vast/validation.json; on success,
+    .hostai-vast/validation-last-success.json is also written.
+    With --compare, the current state is compared against the last *successful*
+    record so you can detect unvalidated changes before spending money on Vast.
     """
     start = time.monotonic()
     errors = validate_repo(config.root_dir, config)
@@ -39,23 +41,65 @@ def cmd_validate(config: Config, production: bool, compare: bool, image: str):
 
     if production:
         level = "production"
+        checks_run.append("clean-tree")
+        if utils.is_dirty_tree(config.root_dir):
+            errors.append(
+                "working tree is dirty; commit or stash before production validation, "
+                "or use 'hostai up ... --allow-unvalidated' to bypass the gate"
+            )
+
         checks_run.append("docker")
         if not shutil.which("docker"):
             errors.append("docker not found; cannot run production checks")
-        else:
-            try:
-                subprocess.run(
-                    ["docker", "image", "inspect", image],
-                    capture_output=True,
-                    check=True,
-                    timeout=30,
-                )
-                checks_run.append("image-exists")
-            except subprocess.CalledProcessError:
-                errors.append(
-                    f"integration image {image} not built; run "
-                    f"'docker build -f tests/integration/Dockerfile.test -t {image} .'"
-                )
+
+        if not errors:
+            if not no_build:
+                click.echo(f"[validate] building integration image {image}...")
+                checks_run.append("image-build")
+                build_env = dict(os.environ)
+                build_env["DOCKER_BUILDKIT"] = "1"
+                try:
+                    proc = subprocess.run(
+                        [
+                            "docker",
+                            "build",
+                            "-f",
+                            "tests/integration/Dockerfile.test",
+                            "-t",
+                            image,
+                            ".",
+                        ],
+                        cwd=config.root_dir,
+                        env=build_env,
+                        capture_output=True,
+                        text=True,
+                        timeout=300,
+                    )
+                    if proc.returncode != 0:
+                        errors.append(f"failed to build integration image {image}")
+                        if proc.stdout:
+                            click.echo(proc.stdout, err=True)
+                        if proc.stderr:
+                            click.echo(proc.stderr, err=True)
+                except subprocess.TimeoutExpired:
+                    errors.append("integration image build timed out")
+                except Exception as exc:
+                    errors.append(f"could not build integration image: {exc}")
+
+            if not errors:
+                try:
+                    subprocess.run(
+                        ["docker", "image", "inspect", image],
+                        capture_output=True,
+                        check=True,
+                        timeout=30,
+                    )
+                    checks_run.append("image-exists")
+                except subprocess.CalledProcessError:
+                    errors.append(
+                        f"integration image {image} not built; run "
+                        f"'docker build -f tests/integration/Dockerfile.test -t {image} .'"
+                    )
 
         if not errors:
             click.echo("[validate] running integration acceptance tests...")
