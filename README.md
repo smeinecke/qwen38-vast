@@ -499,6 +499,17 @@ which is even faster.
 MAX_DPH=0.55
 ```
 
+Additional search and scoring controls live in `hostai.toml` under `[market]`
+and `[vast]`:
+
+- `disk_gb` — default disk allocation; can also be set per-profile with `disk_gb`
+- `max_inet_down_cost` / `max_inet_up_cost` — reject paid traffic beyond these
+  USD/GB limits; set to `0.0` to require free traffic
+- `scoring_mode` — `dph` (default), `perf`, or `session`
+- `scoring_prompt_weight` / `scoring_decode_weight` — balance prompt vs decode
+  TPS when scoring in `perf` or `session` mode
+- `allow_unverified` — include unverified hosts in the search
+
 The normal GPU queries are in `profiles.json`, not in shell code. For a one-off
 query use `GPU_QUERY_OVERRIDE`.
 
@@ -537,6 +548,71 @@ Embedded-MTP fallback:
 ```dotenv
 USE_FASTMTP=0
 ```
+
+## Idle and maximum-runtime safeguards
+
+`hostai up` can start a background watchdog when `watchdog_auto_start = true` is
+set in the `[vast]` section.  The watchdog polls `llama-server` metrics and the
+`/slots` endpoint to detect active requests.
+
+| option | meaning |
+|--------|---------|
+| `idle_timeout_seconds` | destroy if no request has been active for this long |
+| `max_runtime_seconds` | destroy once this lifetime is reached and the current request finishes |
+| `idle_poll_interval_seconds` | seconds between watchdog checks |
+
+Both safeguards always wait for the current request to finish before invoking
+`hostai down`, so they reuse the normal cache-save/telemetry-archive path.
+Manual `hostai down` also stops the watchdog automatically.
+
+## Interruptible / bid instances
+
+`hostai up` accepts `--interruptible` and `--bid <dph>` to rent Vast.ai
+interruptible (bid) instances.  You can also set `interruptible = true` and a
+`bid_price` in `[vast]`.  The bid price is used both as the search `price <=`
+constraint and as the actual bid submitted to Vast.
+
+```bash
+uv run hostai up a6000-64k --interruptible --bid 0.35
+```
+
+## Cost-efficiency scoring
+
+The market layer supports three scoring modes configured with
+`market.scoring_mode` or `--scoring-mode`:
+
+- `dph`: hourly price (legacy default)
+- `perf`: cost per token from historical prompt/decode tokens-per-second
+- `session`: estimated total cost for the expected session, including startup
+  time and transfer cost
+
+Historical data comes from `.hostai-runs/*/benchmarks/*/metrics.json` and is
+aggregated per GPU.  You can tune the prompt/decode weights and the minimum
+number of historical samples in `[market]`.
+
+## Persistent model volume break-even
+
+`hostai cost volume-break-even` estimates whether a persistent model volume is
+cheaper than re-downloading the model and image on every start.  It uses the
+current (or configured) `dph`, bandwidth, and the number of recent starts from
+`.hostai-runs`.
+
+```bash
+uv run hostai cost volume-break-even --volume-gb 100 --volume-cost-month 5.00
+```
+
+## Shutdown observability
+
+`hostai down` and the watchdog now write `shutdown-tail.json` into the run
+directory, including:
+
+- shutdown tail duration and estimated cost
+- slot cache save/upload duration and bytes
+- telemetry archive duration
+- the shutdown reason (`manual`, `idle-timeout`, `max-runtime`)
+
+The rsync cache upload also attempts to delta-seed the remote
+`.current.bin.part` from an existing `current.bin` before sending changed blocks.
 
 ## Upstream
 

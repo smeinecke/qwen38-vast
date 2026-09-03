@@ -15,7 +15,34 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    outputs:
+      docker: ${{ steps.filter.outputs.docker }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Detect Docker-related changes
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            docker:
+              - 'Dockerfile'
+              - 'start.sh'
+              - 'entrypoint.sh'
+              - 'hostai-init-ssh.sh'
+              - 'scripts/prepare-authorized-keys'
+              - 'src/hostai/remote_guard.py'
+              - 'src/hostai/profiles.py'
+              - 'profiles.json'
+              - '.github/workflows/docker.yml'
+
   validate:
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || needs.changes.outputs.docker == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -48,7 +75,8 @@ jobs:
           echo "$matrix" | jq .
 
   build:
-    needs: validate
+    needs: [changes, validate]
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || needs.changes.outputs.docker == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 330
     strategy:

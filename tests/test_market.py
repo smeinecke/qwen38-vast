@@ -1,0 +1,183 @@
+"""Tests for hostai.market: query, filtering, scoring, and hardware rank."""
+
+import json
+from unittest import mock
+
+import pytest
+from click.testing import CliRunner
+
+from hostai import market, utils
+from hostai.profiles import (
+    HardwareRank,
+    MarketPolicy,
+    MonitorHardware,
+    Profile,
+    Profiles,
+)
+
+
+def make_profile(disk_gb=None, query="gpu_name == RTX_4090"):
+    return Profile(
+        name="test",
+        image="a",
+        ctx_size=32768,
+        gpu_query=query,
+        disk_gb=disk_gb,
+    )
+
+
+def test_build_search_query_includes_zero_traffic_costs(config):
+    """A zero max transfer cost must still be written into the query."""
+    config.market.max_inet_down_cost = 0.0
+    config.market.max_inet_up_cost = 0.0
+    profiles = Profiles(
+        schema_version=1,
+        images=[],
+        profiles=[make_profile()],
+        monitor_hardware=MonitorHardware(),
+        market_policy=MarketPolicy(require_free_traffic=True),
+    )
+    query, _ = market.build_search_query(config, profiles, make_profile())
+    assert "inet_down_cost<=0.0" in query
+    assert "inet_up_cost<=0.0" in query
+
+
+def test_build_search_query_appends_max_dph_when_offer_not_given(config):
+    profiles = Profiles(
+        schema_version=1,
+        images=[],
+        profiles=[make_profile()],
+        monitor_hardware=MonitorHardware(),
+        market_policy=MarketPolicy(require_free_traffic=False),
+    )
+    query, max_dph = market.build_search_query(config, profiles, make_profile(), max_price=0.4)
+    assert "dph_total <= 0.4" in query
+    assert max_dph == 0.4
+
+
+def test_resolved_disk_gb_uses_profile_override(config):
+    profile = make_profile(disk_gb=175)
+    assert market.resolved_disk_gb(profile, config) == 175
+
+
+def test_resolved_disk_gb_falls_back_to_market(config):
+    config.market.disk_gb = 80
+    assert market.resolved_disk_gb(make_profile(), config) == 80
+
+
+def test_is_same_or_better_gpu_rejects_worse_rank():
+    profiles = Profiles(
+        schema_version=1,
+        images=[],
+        profiles=[],
+        monitor_hardware=MonitorHardware(
+            policy="same_or_better",
+            gpu_ranks=[
+                HardwareRank(gpu="A40", aliases=["A40"], rank=100),
+                HardwareRank(gpu="RTX 4090", aliases=["RTX_4090"], rank=200),
+            ],
+        ),
+        market_policy=MarketPolicy(),
+    )
+    assert market.is_same_or_better_gpu(profiles, "RTX 4090", "A40") is False
+    assert market.is_same_or_better_gpu(profiles, "A40", "RTX 4090") is True
+    assert market.is_same_or_better_gpu(profiles, "RTX 4090", "RTX 4090") is True
+
+
+def test_filter_eligible_offers_respects_max_dph_and_gpu_rank(config):
+    profiles = Profiles(
+        schema_version=1,
+        images=[],
+        profiles=[],
+        monitor_hardware=MonitorHardware(
+            policy="same_or_better",
+            gpu_ranks=[
+                HardwareRank(gpu="A40", aliases=["A40"], rank=100),
+                HardwareRank(gpu="RTX 4090", aliases=["RTX_4090"], rank=200),
+            ],
+        ),
+        market_policy=MarketPolicy(),
+    )
+    offers = [
+        {"id": 1, "gpu_name": "A40", "dph_total": 0.3},
+        {"id": 2, "gpu_name": "RTX 4090", "dph_total": 0.5},
+        {"id": 3, "gpu_name": "RTX 4090", "dph_total": 0.9},
+    ]
+    matches = market.filter_eligible_offers(offers, max_dph=0.8, current_gpu="RTX 4090", profiles=profiles)
+    assert [o["id"] for o in matches] == [2]
+
+
+def test_filter_eligible_offers_zero_max_dph():
+    """max_dph=0 must still filter out positive prices."""
+    offers = [
+        {"id": 1, "gpu_name": "RTX 4090", "dph_total": 0.0},
+        {"id": 2, "gpu_name": "RTX 4090", "dph_total": 0.01},
+    ]
+    matches = market.filter_eligible_offers(offers, max_dph=0.0)
+    assert [o["id"] for o in matches] == [1]
+
+
+def test_score_offers_dph_mode_sorts_by_price(config):
+    config.market.scoring_mode = "dph"
+    offers = [
+        {"id": 1, "dph_total": 0.5},
+        {"id": 2, "dph_total": 0.3},
+        {"id": 3, "dph_total": 0.7},
+    ]
+    scored = market.score_offers(offers, config, {})
+    assert [o["id"] for o in scored] == [2, 1, 3]
+
+
+def test_score_offers_perf_mode_with_history(config):
+    """With historical TPS, cheaper-per-token offer should win."""
+    config.market.scoring_mode = "perf"
+    config.market.scoring_prompt_weight = 0.0
+    config.market.scoring_decode_weight = 1.0
+    config.market.min_historical_samples = 1
+    offers = [
+        {"id": 1, "gpu_name": "RTX 4090", "dph_total": 0.5, "inet_down": 1000},
+        {"id": 2, "gpu_name": "RTX 3090", "dph_total": 0.3, "inet_down": 1000},
+    ]
+    stats = {
+        "rtx4090": {"prompt_tps": 1000, "prompt_samples": 1, "decode_tps": 2000, "decode_samples": 1},
+        "rtx3090": {"prompt_tps": 1000, "prompt_samples": 1, "decode_tps": 1000, "decode_samples": 1},
+    }
+    scored = market.score_offers(offers, config, stats)
+    # At 0.5 $/h and 2000 tps vs 0.3 $/h and 1000 tps: cost/token = 0.5/2000=0.00025 vs 0.3/1000=0.0003
+    assert scored[0]["id"] == 1
+
+
+def test_score_offers_session_mode_prefers_short_startup(config):
+    """A faster expected startup should give a lower total session cost."""
+    config.market.scoring_mode = "session"
+    config.market.scoring_prompt_weight = 0.0
+    config.market.scoring_decode_weight = 1.0
+    config.market.min_historical_samples = 1
+    config.market.model_download_gb = 5.0
+    config.market.image_size_gb = 0.0
+    offers = [
+        {"id": 1, "gpu_name": "RTX 4090", "dph_total": 0.5, "inet_down": 100, "inet_down_cost": 0.0},
+        {"id": 2, "gpu_name": "RTX 4090", "dph_total": 0.5, "inet_down": 1000, "inet_down_cost": 0.0},
+    ]
+    stats = {
+        "rtx4090": {"prompt_tps": 1000, "prompt_samples": 1, "decode_tps": 1000, "decode_samples": 1},
+    }
+    scored = market.score_offers(offers, config, stats, session_seconds=300)
+    # Offer 2 has faster download (same dph), so lower total cost / tokens.
+    assert scored[0]["id"] == 2
+
+
+def test_offer_download_estimate_prefers_network_bandwidth(config):
+    offer = {"inet_down": 1000, "disk_bw": 200}
+    size, seconds, _ = market.offer_download_estimate(offer, config)
+    # 25 GB model + 5 GB image at 1000 Mbps ~ (30*8*1000)/1000 = 240s plus extraction slower
+    assert size == 30.0
+    assert seconds > 0
+
+
+def test_parse_duration_to_seconds():
+    assert utils.parse_duration_to_seconds("30m") == 1800
+    assert utils.parse_duration_to_seconds("2h") == 7200
+    assert utils.parse_duration_to_seconds("") is None
+    with pytest.raises(ValueError):
+        utils.parse_duration_to_seconds("abc")

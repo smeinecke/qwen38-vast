@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -88,6 +89,9 @@ touch "$known"
 chmod 600 "$known"
 ssh_base="ssh -n -i $key -p $cache_port -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$known"
 $ssh_base "${cache_user}@${cache_host}" "mkdir -p '$remote_dir' && chmod 700 '$cache_root' '$cache_root/'* 2>/dev/null || true; mkdir -p '$remote_dir'"
+# Delta-seed: if a previous current.bin exists, copy it to .current.bin.part so
+# rsync only has to ship the changed blocks.  cp --reflink=auto is best-effort.
+$ssh_base "${cache_user}@${cache_host}" "if [ -f '$remote_dir/current.bin' ]; then cp --reflink=auto '$remote_dir/current.bin' '$remote_dir/.current.bin.part' 2>/dev/null || cp '$remote_dir/current.bin' '$remote_dir/.current.bin.part' 2>/dev/null || true; fi"
 for attempt in 1 2 3; do
   if rsync -a --inplace --partial --info=progress2,stats2 -e "ssh -i $key -p $cache_port -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$known" "$slot_dir/current.bin" "${cache_user}@${cache_host}:${remote_dir}/.current.bin.part" < /dev/null; then
     break
@@ -125,23 +129,29 @@ def _save_and_upload_slot_cache(
     no_cache: bool,
     known_hosts: Path,
     slot_id: Optional[int] = None,
-) -> bool:
-    """Save slot, create metadata and upload to the cache server."""
+) -> Optional[Dict[str, Any]]:
+    """Save slot, create metadata and upload to the cache server.
+
+    Returns the slot-save details (including ``save_ms``, ``n_written``,
+    ``upload_duration_s``, and ``uploaded``) when a cache is saved.  Returns
+    ``None`` when the slot is empty, cache is disabled, or the upload fails
+    without ``require_save``.
+    """
     cache_configured = config.cache.host or config.cache.rclone_url or config.cache.rclone_remote
     if no_cache or not state.slot_cache_enabled or not config.cache.enabled or not cache_configured:
-        return True
+        return None
 
     if not state.ssh_url:
         click.echo("[slot-cache] WARNING: no SSH endpoint; cannot save slot", err=True)
         if config.cache.require_save:
             raise click.ClickException("slot cache save failed and require_save is set")
-        return False
+        return None
 
     if not config.cache.rclone and not _install_cache_key_on_vast(state, config):
         click.echo("[slot-cache] WARNING: could not install cache key on Vast", err=True)
         if config.cache.require_save:
             raise click.ClickException("slot cache key install failed and require_save is set")
-        return False
+        return None
 
     llama_commit = state.data.get("llama_cpp_commit")
     if not llama_commit or not re.match(r"^[a-f0-9]+$", str(llama_commit)):
@@ -157,7 +167,7 @@ def _save_and_upload_slot_cache(
     if not details:
         state.set("slot_cache_save", "empty")
         state.save()
-        return True
+        return None
 
     (run_dir / "cache-save.json").write_text(
         json.dumps(details.get("payload", {}), indent=2, ensure_ascii=False) + "\n"
@@ -208,7 +218,13 @@ def _save_and_upload_slot_cache(
     remote_dir = cache.remote_cache_dir(config, signature, state.slot_cache_session)
 
     upload_log = run_dir / "cache-upload.log"
+    upload_start = time.monotonic()
     ok = _upload_slot_cache_from_vast(state.ssh_url, config, slot_dir, remote_dir, known_hosts, upload_log)
+    details["uploaded"] = ok
+    details["upload_duration_s"] = time.monotonic() - upload_start
+    details["n_saved"] = n_saved
+    details["n_written"] = n_written
+    details["save_ms"] = save_ms
     if ok:
         click.echo("[slot-cache] uploaded to cache server")
         state.set("slot_cache_save", "uploaded")
@@ -221,7 +237,7 @@ def _save_and_upload_slot_cache(
             state.save()
             raise click.ClickException("slot cache upload failed and require_save is set; instance not destroyed")
     state.save()
-    return ok
+    return details if ok else None
 
 
 def _archive_session(config: Config, state: State, run_dir: Path, no_archive: bool) -> None:
@@ -352,32 +368,31 @@ def _pause_or_destroy(config: Config, state: State, pause: bool, run_dir: Path) 
     return f"{destroy_outcome}. Session duration: {duration}s | estimated compute: ${cost:.4f}"
 
 
-@click.command("down", help="Stop, save cache, and destroy/pause the current instance.")
-@click.option("--yes", is_flag=True, help="Skip confirmation.")
-@click.option("--no-archive", is_flag=True, help="Skip telemetry archive.")
-@click.option("--no-cache", is_flag=True, help="Do not save/upload the slot cache.")
-@click.option("--pause", is_flag=True, help="Pause the instance instead of destroying it.")
-@click.pass_obj
-def cmd_down(config: Config, yes: bool, no_archive: bool, no_cache: bool, pause: bool) -> None:
-    sd = state_dir(config.root_dir)
-    state_file = sd / "state.json"
+def down_instance(
+    config: Config,
+    state: State,
+    *,
+    pause: bool = False,
+    no_archive: bool = False,
+    no_cache: bool = False,
+    reason: Optional[str] = None,
+    skip_confirm: bool = False,
+) -> str:
+    """Stop, persist cache, archive telemetry, and destroy/pause an instance.
 
-    if not state_file.exists():
-        click.echo("No local hostai Vast state found.")
-        return
-
-    state = State.load(state_file)
+    This is the shared lifecycle path used by ``hostai down`` and the watchdog
+    daemon.  It records a shutdown reason and shutdown-tail metrics.
+    """
     if not state.instance_id:
-        click.echo("No Vast instance id in local state.")
-        return
+        raise click.ClickException("state missing instance_id")
 
+    action = "Pause" if pause else "Destroy"
     gpu = state.gpu
     dph = state.dph
-    if not yes:
-        action = "Pause" if pause else "Destroy"
+    if not skip_confirm:
         if not click.confirm(f"{action} Vast instance {state.instance_id} ({gpu}, ${dph:.4f}/h)?"):
             click.echo("Cancelled.")
-            return
+            return "cancelled"
 
     # Ensure a run directory exists (legacy states may be missing it).
     run_dir = state.run_dir
@@ -390,6 +405,14 @@ def cmd_down(config: Config, yes: bool, no_archive: bool, no_cache: bool, pause:
         state.run_dir = run_dir
         state.save()
 
+    run_dir = Path(run_dir)
+    down_start_epoch = utils.now_epoch()
+    state.set("down_reason", reason or "manual")
+    state.set("down_started_epoch", down_start_epoch)
+    state.set("down_started_at", utils.now_rfc3339())
+    state.save()
+    _client_log(run_dir, f"{action} initiated for instance {state.instance_id}: reason={reason or 'manual'}")
+
     known_hosts = state.state_file.parent / "known_hosts"
 
     _refresh_ssh_state(config, state)
@@ -399,16 +422,78 @@ def cmd_down(config: Config, yes: bool, no_archive: bool, no_cache: bool, pause:
         except Exception as exc:
             click.echo(f"[down] WARNING: tunnel not available: {exc}", err=True)
 
-    _save_and_upload_slot_cache(config, state, run_dir, no_cache, known_hosts)
+    slot_details = _save_and_upload_slot_cache(config, state, run_dir, no_cache, known_hosts)
+
+    archive_start = time.monotonic()
     _archive_session(config, state, run_dir, no_archive)
+    archive_duration = time.monotonic() - archive_start
 
     if state.ssh_url:
         _stop_remote_model(state.ssh_url, known_hosts)
 
     ssh.stop_tunnel(state)
 
+    pause_or_destroy_start = time.monotonic()
     outcome = _pause_or_destroy(config, state, pause, run_dir)
-    click.echo(outcome)
+    pause_or_destroy_duration = time.monotonic() - pause_or_destroy_start
 
+    shutdown_tail_seconds = max(0, utils.now_epoch() - down_start_epoch)
+    shutdown_cost = (state.dph or 0.0) * shutdown_tail_seconds / 3600.0
+
+    tail = {
+        "down_started_epoch": down_start_epoch,
+        "down_ended_epoch": utils.now_epoch(),
+        "shutdown_tail_seconds": shutdown_tail_seconds,
+        "estimated_shutdown_tail_cost_usd": round(shutdown_cost, 6),
+        "cache_save_ms": slot_details.get("save_ms", 0) if slot_details else 0,
+        "cache_bytes_uploaded": slot_details.get("n_written", 0) if slot_details else 0,
+        "telemetry_archive_duration_s": round(archive_duration, 3),
+        "pause_or_destroy_duration_s": round(pause_or_destroy_duration, 3),
+        "reason": reason or "manual",
+    }
+    if slot_details and "upload_duration_s" in slot_details:
+        tail["cache_upload_duration_s"] = round(slot_details["upload_duration_s"], 3)
+
+    (run_dir / "shutdown-tail.json").write_text(json.dumps(tail, indent=2, ensure_ascii=False) + "\n")
+    state.set("shutdown_tail", tail)
+    state.save()
+
+    _client_log(run_dir, f"{outcome} | tail={shutdown_tail_seconds}s cost=${shutdown_cost:.6f} reason={reason or 'manual'}")
+
+    click.echo(outcome)
     if run_dir and not no_archive:
         click.echo(f"Archived run: {run_dir}")
+    return outcome
+
+
+@click.command("down", help="Stop, save cache, and destroy/pause the current instance.")
+@click.option("--yes", is_flag=True, help="Skip confirmation.")
+@click.option("--no-archive", is_flag=True, help="Skip telemetry archive.")
+@click.option("--no-cache", is_flag=True, help="Do not save/upload the slot cache.")
+@click.option("--pause", is_flag=True, help="Pause the instance instead of destroying it.")
+@click.option("--reason", help="Shutdown reason (used by watchdog).")
+@click.pass_obj
+def cmd_down(config: Config, yes: bool, no_archive: bool, no_cache: bool, pause: bool, reason: Optional[str]) -> None:
+    sd = state_dir(config.root_dir)
+    state_file = sd / "state.json"
+
+    if not state_file.exists():
+        click.echo("No local hostai Vast state found.")
+        return
+
+    state = State.load(state_file)
+    if not state.instance_id:
+        click.echo("No Vast instance id in local state.")
+        return
+
+    down_instance(
+        config,
+        state,
+        pause=pause,
+        no_archive=no_archive,
+        no_cache=no_cache,
+        reason=reason,
+        skip_confirm=yes,
+    )
+    from hostai.commands.watchdog import stop_watchdog
+    stop_watchdog(config)

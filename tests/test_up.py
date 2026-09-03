@@ -1,5 +1,6 @@
 """Tests for hostai.commands.up helpers and CLI validation."""
 
+import json
 from types import SimpleNamespace
 from unittest import mock
 
@@ -7,14 +8,7 @@ import click
 import pytest
 from click.testing import CliRunner
 
-from hostai.commands.up import (
-    _build_query,
-    _do_fresh,
-    _emit_instance_logs,
-    _prefetch_slot_cache_to_vast,
-    _select_offer,
-    cmd_up,
-)
+from hostai.commands.up import _do_fresh, cmd_up
 
 
 def make_offer(**overrides):
@@ -26,85 +20,11 @@ def make_offer(**overrides):
         "dph_base": 0.5,
         "inet_down": 1000,
         "inet_up": 1000,
+        "inet_down_cost": 0.0,
+        "inet_up_cost": 0.0,
     }
     base.update(overrides)
     return base
-
-
-def test_build_query_basic(config):
-    profile = mock.Mock()
-    profiles = mock.Mock()
-    profiles.market_policy.require_free_traffic = False
-    query, max_dph = _build_query(config, profiles, profile, "gpu_name == RTX 4090", None, False, None)
-    assert "RTX 4090" in query
-    assert "dph_total" in query
-    assert max_dph == config.market.max_dph
-
-
-def test_build_query_with_offer_id_skips_dph(config):
-    profile = mock.Mock()
-    profiles = mock.Mock()
-    profiles.market_policy.require_free_traffic = False
-    query, max_dph = _build_query(config, profiles, profile, "gpu_name == RTX 4090", None, False, 123)
-    assert "dph_total" not in query
-
-
-def test_build_query_negative_max_price(config):
-    profile = mock.Mock()
-    profiles = mock.Mock()
-    with pytest.raises(click.ClickException, match="non-negative"):
-        _build_query(config, profiles, profile, "gpu_name == RTX 4090", -1.0, False, None)
-
-
-def test_select_offer_chooses_cheapest(config):
-    offers = [make_offer(dph_total=0.6), make_offer(dph_total=0.4)]
-    with mock.patch("hostai.commands.up.search_instance_offers", return_value=offers) as search:
-        selected = _select_offer(config, "gpu_name == RTX 4090", 1.0, False, None)
-    assert selected["dph_total"] == 0.4
-    assert search.call_args.args[1] == "gpu_name == RTX 4090"
-    assert search.call_args.kwargs == {"limit": 25, "order": "dph_total", "storage": 100}
-
-
-def test_select_offer_specific_id(config):
-    offers = [make_offer(id=1), make_offer(id=2)]
-    with mock.patch("hostai.commands.up.search_instance_offers", return_value=offers):
-        selected = _select_offer(config, "gpu_name == RTX 4090", 1.0, False, 2)
-    assert selected["id"] == 2
-
-
-def test_select_offer_no_matches(config):
-    with mock.patch("hostai.commands.up.search_instance_offers", return_value=[]):
-        with pytest.raises(click.ClickException, match="no matching offer"):
-            _select_offer(config, "gpu_name == RTX 4090", 1.0, False, None)
-
-
-def test_fresh_instance_uses_custom_entrypoint_and_publishes_ssh(config):
-    profiles = mock.Mock()
-    profiles.market_policy.require_free_traffic = False
-    profile = SimpleNamespace(
-        name="test",
-        ctx_size=32768,
-        gpu_query="gpu_name == RTX 4090",
-        cache_ram=None,
-        ctx_checkpoints=None,
-        monitor_group="",
-    )
-    image = SimpleNamespace(image_tag="test", cuda_arch="86")
-    offer = make_offer(id=42)
-
-    with (
-        mock.patch("hostai.commands.up._resolve_profile", return_value=(profiles, profile, image)),
-        mock.patch("hostai.commands.up.image_for_profile", return_value="example/image:test"),
-        mock.patch("hostai.commands.up._select_offer", return_value=offer),
-        mock.patch("hostai.commands.up.create_instance_from_offer", return_value={"new_contract": 123}) as create,
-        mock.patch("hostai.commands.up._do_fresh_core"),
-    ):
-        _do_fresh(config, "test", None, None, None, False, False, False, False, None)
-
-    launch = create.call_args.kwargs
-    assert launch["env"]["-p 22:22"] == "1"
-    assert launch["runtype"] == "args"
-    assert launch["args"] is None
 
 
 def test_cmd_up_rejects_invalid_port(config):
@@ -121,31 +41,121 @@ def test_cmd_up_rejects_negative_max_price(config):
     assert "non-negative" in result.output
 
 
-def test_prefetch_slot_cache_uses_timeout_and_script(config, tmp_path):
-    """_prefetch_slot_cache_to_vast runs the generated script with the 330s timeout."""
-    calls = []
+def test_cmd_up_rejects_non_positive_bid(config):
+    runner = CliRunner()
+    result = runner.invoke(cmd_up, ["--bid", "0"], obj=config)
+    assert result.exit_code != 0
+    assert "positive" in result.output
 
-    def fake_run_remote(ssh_url, command, *, input_data, known_hosts, timeout=None):
-        calls.append((ssh_url, command, timeout, input_data))
-        return mock.Mock(returncode=0, stdout="ok", stderr="")
 
-    with mock.patch("hostai.commands.up.ssh.run_remote", side_effect=fake_run_remote):
-        result = _prefetch_slot_cache_to_vast(
-            "ssh://root@1.2.3.4:22",
+def test_cmd_up_rejects_bad_expected_session(config):
+    runner = CliRunner()
+    result = runner.invoke(cmd_up, ["--expected-session", "abc"], obj=config)
+    assert result.exit_code != 0
+    assert "invalid duration" in result.output
+
+
+def test_cmd_up_rejects_bad_scoring_mode(config):
+    runner = CliRunner()
+    result = runner.invoke(cmd_up, ["--scoring-mode", "foo"], obj=config)
+    assert result.exit_code != 0
+    assert "dph, perf, or session" in result.output
+
+
+def _write_test_profiles(project_dir, with_disk_gb=None):
+    profile = {
+        "name": "test",
+        "image": "a",
+        "ctx_size": 32768,
+        "gpu_query": "gpu_name == RTX_4090",
+        "monitor_group": "",
+    }
+    if with_disk_gb is not None:
+        profile["disk_gb"] = with_disk_gb
+    profiles = {
+        "schema_version": 1,
+        "default_profile": "test",
+        "images": [{"name": "a", "cuda_arch": "86", "image_tag": "test", "description": ""}],
+        "profiles": [profile],
+        "monitor_hardware": {"policy": "same_or_better", "gpu_ranks": []},
+        "market_policy": {"require_free_traffic": False},
+    }
+    (project_dir / "hostai.profiles.toml").write_text(json.dumps(profiles))
+
+
+def test_do_fresh_uses_resolved_profile_disk(config, project_dir):
+    """When a profile defines disk_gb, it is used for search and instance creation."""
+    _write_test_profiles(project_dir, with_disk_gb=150)
+    config.hostai.profiles_file = "hostai.profiles.toml"
+    config.image.base = "example/hostai"
+
+    with (
+        mock.patch("hostai.commands.up.market.select_offer", return_value=make_offer()) as select,
+        mock.patch("hostai.commands.up.create_instance_from_offer", return_value={"new_contract": 123}) as create,
+        mock.patch("hostai.commands.up._do_fresh_core"),
+    ):
+        _do_fresh(config, "test", None, None, None, False, False, False, False, None)
+
+    assert select.call_args.kwargs["storage"] == 150
+    assert create.call_args.kwargs["disk"] == 150
+
+
+def test_do_fresh_falls_back_to_market_disk_when_profile_has_none(config, project_dir):
+    _write_test_profiles(project_dir)
+    config.hostai.profiles_file = "hostai.profiles.toml"
+    config.image.base = "example/hostai"
+
+    with (
+        mock.patch("hostai.commands.up.market.select_offer", return_value=make_offer()) as select,
+        mock.patch("hostai.commands.up.create_instance_from_offer", return_value={"new_contract": 123}),
+        mock.patch("hostai.commands.up._do_fresh_core"),
+    ):
+        _do_fresh(config, "test", None, None, None, False, False, False, False, None)
+
+    assert select.call_args.kwargs["storage"] == config.market.disk_gb
+
+
+def test_do_fresh_uses_bid_price_for_interruptible(config, project_dir):
+    _write_test_profiles(project_dir)
+    config.hostai.profiles_file = "hostai.profiles.toml"
+    config.image.base = "example/hostai"
+
+    with (
+        mock.patch("hostai.commands.up.market.select_offer", return_value=make_offer()) as select,
+        mock.patch("hostai.commands.up.create_instance_from_offer", return_value={"new_contract": 123}) as create,
+        mock.patch("hostai.commands.up._do_fresh_core"),
+    ):
+        _do_fresh(config, "test", None, None, None, False, False, False, False, None, bid_price=0.35)
+
+    assert select.call_args.kwargs["offer_type"] == "bid"
+    assert create.call_args.kwargs["bid_price"] == 0.35
+
+
+def test_do_fresh_dry_run_does_not_create(config, project_dir):
+    _write_test_profiles(project_dir)
+    config.hostai.profiles_file = "hostai.profiles.toml"
+    config.image.base = "example/hostai"
+
+    with (
+        mock.patch("hostai.commands.up.market.select_offer", return_value=make_offer()),
+        mock.patch("hostai.commands.up.create_instance_from_offer") as create,
+    ):
+        _do_fresh(
             config,
-            "/var/lib/qwen38/slots",
-            "qwen-slot-cache/default/sig",
-            tmp_path / "known_hosts",
+            "test",
+            None,
+            None,
+            None,
+            False,
+            False,
+            False,
+            False,
+            None,
+            bid_price=0.35,
+            dry_run=True,
         )
 
-    assert result is True
-    assert len(calls) == 1
-    ssh_url, command, timeout, input_data = calls[0]
-    assert ssh_url == "ssh://root@1.2.3.4:22"
-    assert command == "bash -s"
-    assert timeout == 330
-    assert "current.bin" in input_data
-    assert "ok" in input_data
+    create.assert_not_called()
 
 
 def test_do_fresh_blocks_running_instance(config, project_dir):
@@ -177,17 +187,3 @@ def test_do_fresh_allows_recreate_when_instance_is_exited(config, project_dir):
         with mock.patch("hostai.commands.up._resolve_profile", side_effect=RuntimeError("later step")):
             with pytest.raises(RuntimeError, match="later step"):
                 _do_fresh(config, "test", None, None, None, False, False, False, False, None)
-
-
-def test_emit_instance_logs_skips_non_text_logs(config):
-    """_emit_instance_logs must not crash when get_instance_logs returns a dict."""
-    seen = {"container": set(), "daemon": set()}
-
-    def fake_logs(config, instance_id, *, tail, daemon_logs, timeout):
-        return {"not_ready": True} if daemon_logs else "line one\nline two"
-
-    with mock.patch("hostai.commands.up.get_instance_logs", side_effect=fake_logs):
-        _emit_instance_logs(config, 123, seen)
-
-    assert "line one" in seen["container"]
-    assert seen["daemon"] == set()

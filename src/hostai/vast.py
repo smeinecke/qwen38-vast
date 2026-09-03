@@ -56,6 +56,7 @@ def search_instance_offers(
     order: Optional[str] = "dph_total",
     storage: float = 5.0,
     no_default: bool = False,
+    offer_type: str = "on-demand",
 ) -> List[Dict[str, Any]]:
     """Search for offers matching a Vast query string."""
     parsed_query = _parse_query_string(query) if not no_default else {}
@@ -70,6 +71,7 @@ def search_instance_offers(
         limit=limit,
         storage=storage,
         no_default=no_default,
+        offer_type=offer_type,
     )
 
 
@@ -114,6 +116,7 @@ def create_instance_from_offer(
     disk: float,
     env: Dict[str, str],
     price: Optional[float] = None,
+    bid_price: Optional[float] = None,
     label: Optional[str] = None,
     extra: Optional[str] = None,
     runtype: Optional[str] = None,
@@ -124,8 +127,31 @@ def create_instance_from_offer(
     volume_info: Optional[Dict[str, Any]] = None,
     timeout: float = 120.0,
 ) -> Dict[str, Any]:
-    """Create an instance from an offer ID."""
+    """Create an instance from an offer ID.
+
+    Pass either ``price`` for on-demand instances or ``bid_price`` for
+    interruptible/bid instances, never both.
+    """
+    if price is not None and bid_price is not None:
+        raise VastError("pass either price or bid_price, not both")
     client = _client(_api_key(config), timeout=timeout)
+    if bid_price is not None:
+        return create_instance(
+            client,
+            offer_id,
+            image=image,
+            disk=int(disk),
+            env=env,
+            bid_price=bid_price,
+            label=label,
+            extra=extra,
+            runtype=runtype,
+            args=args,
+            force=force,
+            cancel_unavail=cancel_unavail,
+            template_hash=template_hash,
+            volume_info=volume_info,
+        )
     return create_instance(
         client,
         offer_id,

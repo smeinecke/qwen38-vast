@@ -48,7 +48,7 @@ def test_down_happy_path(config, project_dir):
     with mock.patch("hostai.commands.down.State.load", return_value=state):
         with mock.patch("hostai.commands.down._refresh_ssh_state"):
             with mock.patch("hostai.commands.down.ssh.ensure_tunnel"):
-                with mock.patch("hostai.commands.down._save_and_upload_slot_cache", return_value=True):
+                with mock.patch("hostai.commands.down._save_and_upload_slot_cache", return_value={"save_ms": 50, "n_written": 1024, "uploaded": True, "upload_duration_s": 1.0}):
                     with mock.patch("hostai.commands.down._archive_session"):
                         with mock.patch("hostai.commands.down._stop_remote_model"):
                             with mock.patch("hostai.commands.down.ssh.stop_tunnel"):

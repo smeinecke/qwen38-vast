@@ -1,3 +1,11 @@
+"""Monitor Vast prices for cheaper, equivalent offers.
+
+The monitor reuses the same query building, storage allocation, eligibility
+filtering, and hardware-rank logic as ``hostai up``.  It only alerts for an
+offer that is the same context size, uses an equal-or-better GPU, and has a
+lower hourly price.
+"""
+
 import os
 import shutil
 import signal
@@ -9,10 +17,10 @@ from typing import Any, Dict, List, Optional
 
 import click
 
+from hostai import market
 from hostai.config import Config
-from hostai.profiles import Profiles
+from hostai.profiles import Profile, Profiles
 from hostai.state import State, state_dir
-from hostai.vast import search_instance_offers
 
 
 def _monitor_pid_file(config: Config) -> Path:
@@ -49,46 +57,91 @@ def _resolve_monitor_targets(
     profiles: Profiles,
     profile: Optional[str],
     group: Optional[str],
-) -> List[str]:
+) -> List[Profile]:
     if profile:
-        return [profile]
+        p = profiles.resolve_profile(profile)
+        if not p:
+            raise click.ClickException(f"unknown profile '{profile}'")
+        return [p]
     if config.monitor.profile:
-        return [config.monitor.profile]
+        p = profiles.resolve_profile(config.monitor.profile)
+        if p:
+            return [p]
     group = group or config.monitor.group
     if group:
-        names = [p.name for p in profiles.profiles if p.monitor_group == group]
-        if not names:
+        targets = [p for p in profiles.profiles if p.monitor_group == group]
+        if not targets:
             raise click.ClickException(f"no profiles in monitor group '{group}'")
-        return names
-    return [config.hostai.default_profile]
+        return targets
+    p = profiles.resolve_profile(config.hostai.default_profile)
+    if p:
+        return [p]
+    raise click.ClickException("no profile configured")
 
 
-def _search_profile(config: Config, profiles: Profiles, profile_name: str) -> Optional[List[Dict[str, Any]]]:
-    p = profiles.resolve_profile(profile_name)
-    if not p:
-        return None
-    query = config.hostai.gpu_query_override or p.gpu_query
-    max_dph = config.market.max_dph
-    if config.market.max_inet_down_cost:
-        query += f" inet_down_cost<={config.market.max_inet_down_cost}"
-        query += f" inet_up_cost<={config.market.max_inet_up_cost}"
-    if "dph" not in query:
-        query += f" dph_total <= {max_dph}"
-    try:
-        return search_instance_offers(config, query, limit=10, order="dph_total")
-    except Exception:
-        return None
-
-
-def _search_targets(config: Config, profiles: Profiles, targets: List[str]) -> List[Dict[str, Any]]:
-    """Search a list of profiles and merge/sort the results by dph_total."""
+def _search_profiles(
+    config: Config,
+    profiles: Profiles,
+    targets: List[Profile],
+) -> List[Dict[str, Any]]:
+    """Search a list of profiles and merge the results."""
     all_offers: List[Dict[str, Any]] = []
-    for target in targets:
-        offers = _search_profile(config, profiles, target)
-        if offers:
-            all_offers.extend(offers)
-    all_offers.sort(key=lambda o: o.get("dph_total", float("inf")))
+    for p in targets:
+        query, max_dph = market.build_search_query(
+            config,
+            profiles,
+            p,
+            max_price=None,
+            unverified=config.market.allow_unverified,
+            offer=None,
+        )
+        disk_gb = market.resolved_disk_gb(p, config)
+        try:
+            offers = market.search_offers(
+                config,
+                query,
+                storage=disk_gb,
+                max_dph=max_dph,
+                offer=None,
+                offer_type="on-demand",
+                limit=10,
+            )
+        except Exception:
+            continue
+        all_offers.extend(offers)
     return all_offers
+
+
+def _ranked_best_for_monitor(
+    config: Config,
+    profiles: Profiles,
+    current: State,
+    candidates: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Return the cheapest offer that is an economic/performance upgrade."""
+    if not candidates:
+        return None
+
+    current_gpu = current.gpu
+    ctx_size = current.ctx_size or 0
+    if current.exists and current.dph is not None:
+        max_dph = current.dph
+    else:
+        max_dph = config.market.max_dph
+
+    matches = market.filter_eligible_offers(
+        candidates,
+        max_dph=max_dph,
+        offer=None,
+        current_gpu=current_gpu,
+        profiles=profiles,
+        ctx_size=ctx_size,
+    )
+    if not matches:
+        return None
+
+    matches.sort(key=lambda o: o.get("dph_total", float("inf")))
+    return matches[0]
 
 
 @cmd_monitor.command("once", help="Run a single price check.")
@@ -98,16 +151,15 @@ def _search_targets(config: Config, profiles: Profiles, targets: List[str]) -> L
 def cmd_monitor_once(config: Config, profile: Optional[str], group: Optional[str]):
     profiles = Profiles.from_file(config.root_dir / config.hostai.profiles_file)
     targets = _resolve_monitor_targets(config, profiles, profile, group)
-    for target in targets:
-        if not profiles.resolve_profile(target):
-            raise click.ClickException(f"unknown profile '{target}'")
-    offers = _search_targets(config, profiles, targets)
-    if not offers:
-        click.echo("no matching offers")
-        return
     current = State.load(state_dir(config.root_dir) / "state.json")
     current_dph = current.dph if current.exists else None
-    best = offers[0]
+
+    all_offers = _search_profiles(config, profiles, targets)
+    best = _ranked_best_for_monitor(config, profiles, current, all_offers)
+    if best is None:
+        click.echo("no matching offers")
+        return
+
     best_dph = best.get("dph_total", 0)
     click.echo(
         f"[monitor] best {best.get('gpu_name')} at ${best_dph:.4f}/h "
@@ -131,18 +183,15 @@ def cmd_monitor_watch(
     pct = threshold if threshold is not None else config.monitor.threshold_pct
     profiles = Profiles.from_file(config.root_dir / config.hostai.profiles_file)
     targets = _resolve_monitor_targets(config, profiles, profile, group)
-    for target in targets:
-        if not profiles.resolve_profile(target):
-            raise click.ClickException(f"unknown profile '{target}'")
-    label = group or ", ".join(targets)
+    label = group or ", ".join(p.name for p in targets)
     click.echo(f"[monitor] watching '{label}' every {sec}s (threshold {pct}%)")
     try:
         while True:
-            offers = _search_targets(config, profiles, targets)
-            if offers:
-                current = State.load(state_dir(config.root_dir) / "state.json")
-                current_dph = current.dph if current.exists else None
-                best = offers[0]
+            current = State.load(state_dir(config.root_dir) / "state.json")
+            current_dph = current.dph if current.exists else None
+            all_offers = _search_profiles(config, profiles, targets)
+            best = _ranked_best_for_monitor(config, profiles, current, all_offers)
+            if best:
                 best_dph = best.get("dph_total", 0)
                 if current_dph and current_dph > 0 and current_dph > best_dph:
                     saving = (current_dph - best_dph) / current_dph * 100
@@ -154,6 +203,8 @@ def cmd_monitor_watch(
                         click.echo(f"[monitor] best ${best_dph:.4f}/h (saving {saving:.1f}%)")
                 else:
                     click.echo(f"[monitor] best ${best_dph:.4f}/h")
+            else:
+                click.echo("[monitor] no cheaper equivalent offer")
             time.sleep(sec)
     except KeyboardInterrupt:
         click.echo("\n[monitor] stopped")

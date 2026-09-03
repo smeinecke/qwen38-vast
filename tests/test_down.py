@@ -53,7 +53,7 @@ def test_save_and_upload_slot_cache_happy_path(config, running_state, tmp_path):
                 with mock.patch("hostai.commands.down.ssh.run_remote", return_value=fake_completed()) as run:
                     with mock.patch("hostai.commands.down.ssh.scp_to", return_value=fake_completed()):
                         with mock.patch("hostai.commands.down._upload_slot_cache_from_vast", return_value=True):
-                            ok = _save_and_upload_slot_cache(
+                            result = _save_and_upload_slot_cache(
                                 config,
                                 running_state,
                                 run_dir,
@@ -61,7 +61,8 @@ def test_save_and_upload_slot_cache_happy_path(config, running_state, tmp_path):
                                 known_hosts=tmp_path / "known_hosts",
                             )
 
-    assert ok is True
+    assert result is not None
+    assert result["uploaded"] is True
     assert running_state.data["slot_cache_save"] == "uploaded"
     assert running_state.data["slot_cache_n_saved"] == 100
     assert (run_dir / "cache-save.json").exists()
@@ -69,27 +70,27 @@ def test_save_and_upload_slot_cache_happy_path(config, running_state, tmp_path):
 
 def test_save_and_upload_slot_cache_disabled(config, running_state, tmp_path):
     running_state.slot_cache_enabled = False
-    ok = _save_and_upload_slot_cache(
+    result = _save_and_upload_slot_cache(
         config,
         running_state,
         tmp_path / "run",
         no_cache=False,
         known_hosts=tmp_path / "known_hosts",
     )
-    assert ok is True
+    assert result is None
 
 
 def test_save_and_upload_slot_cache_no_ssh(config, running_state, tmp_path):
     running_state.ssh_url = None
     config.cache.require_save = False
-    ok = _save_and_upload_slot_cache(
+    result = _save_and_upload_slot_cache(
         config,
         running_state,
         tmp_path / "run",
         no_cache=False,
         known_hosts=tmp_path / "known_hosts",
     )
-    assert ok is False
+    assert result is None
 
 
 def test_pause_or_destroy_destroy(config, running_state, tmp_path):

@@ -67,6 +67,7 @@ class Profile:
     monitor_search: bool = True
     cache_ram: Optional[int] = None
     ctx_checkpoints: Optional[int] = None
+    disk_gb: Optional[int] = None
 
 
 @dataclass

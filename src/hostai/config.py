@@ -113,6 +113,13 @@ class MarketSection:
     allow_unverified: bool = False
     max_inet_down_cost: float = 0.001
     max_inet_up_cost: float = 0.001
+    scoring_mode: str = "dph"  # "dph", "perf", "session"
+    scoring_prompt_weight: float = 0.3
+    scoring_decode_weight: float = 0.7
+    min_historical_samples: int = 3
+    max_history_age_days: int = 30
+    model_download_gb: float = 25.0
+    image_size_gb: float = 5.0
 
 
 @dataclass
@@ -143,6 +150,13 @@ class VastSection:
     keep_on_failure: bool = False
     destroy_timeout_seconds: int = 45
     pause_timeout_seconds: int = 60
+    idle_timeout_seconds: Optional[int] = None
+    max_runtime_seconds: Optional[int] = None
+    idle_poll_interval_seconds: int = 60
+    interruptible: bool = False
+    bid_price: Optional[float] = None
+    expected_session_seconds: Optional[int] = None
+    watchdog_auto_start: bool = False
 
 
 @dataclass
@@ -233,6 +247,13 @@ ENV_MAP: Dict[str, tuple[str, str, Optional[Type[Any]]]] = {
     "HOSTAI_ALLOW_UNVERIFIED": ("market", "allow_unverified", bool),
     "HOSTAI_MAX_INET_DOWN_COST": ("market", "max_inet_down_cost", float),
     "HOSTAI_MAX_INET_UP_COST": ("market", "max_inet_up_cost", float),
+    "HOSTAI_SCORING_MODE": ("market", "scoring_mode", str),
+    "HOSTAI_SCORING_PROMPT_WEIGHT": ("market", "scoring_prompt_weight", float),
+    "HOSTAI_SCORING_DECODE_WEIGHT": ("market", "scoring_decode_weight", float),
+    "HOSTAI_MIN_HISTORICAL_SAMPLES": ("market", "min_historical_samples", int),
+    "HOSTAI_MAX_HISTORY_AGE_DAYS": ("market", "max_history_age_days", int),
+    "HOSTAI_MODEL_DOWNLOAD_GB": ("market", "model_download_gb", float),
+    "HOSTAI_IMAGE_SIZE_GB": ("market", "image_size_gb", float),
     "HF_REPO": ("model", "hf_repo", str),
     "HF_REVISION": ("model", "hf_revision", str),
     "MODEL": ("model", "model", str),
@@ -252,6 +273,13 @@ ENV_MAP: Dict[str, tuple[str, str, Optional[Type[Any]]]] = {
     "KEEP_ON_FAILURE": ("vast", "keep_on_failure", bool),
     "HOSTAI_DESTROY_TIMEOUT_SECONDS": ("vast", "destroy_timeout_seconds", int),
     "HOSTAI_PAUSE_TIMEOUT_SECONDS": ("vast", "pause_timeout_seconds", int),
+    "HOSTAI_IDLE_TIMEOUT_SECONDS": ("vast", "idle_timeout_seconds", int),
+    "HOSTAI_MAX_RUNTIME_SECONDS": ("vast", "max_runtime_seconds", int),
+    "HOSTAI_IDLE_POLL_INTERVAL_SECONDS": ("vast", "idle_poll_interval_seconds", int),
+    "HOSTAI_INTERRUPTIBLE": ("vast", "interruptible", bool),
+    "HOSTAI_BID_PRICE": ("vast", "bid_price", float),
+    "HOSTAI_EXPECTED_SESSION_SECONDS": ("vast", "expected_session_seconds", int),
+    "HOSTAI_WATCHDOG_AUTO_START": ("vast", "watchdog_auto_start", bool),
     "HOSTAI_SLOT_CACHE_ENABLED": ("cache", "enabled", bool),
     "HOSTAI_SLOT_CACHE_HOST": ("cache", "host", str),
     "HOSTAI_SLOT_CACHE_PORT": ("cache", "port", int),
@@ -412,9 +440,15 @@ def load_config(project_root: Optional[Path] = None) -> Config:
         if value:
             config.secrets[key] = value
 
-    # Empty optional ints from env can become 0; treat 0 as None where empty means unset.
+    # Empty optional ints/floats from env can become 0; treat 0 as None where empty means unset.
     for field_name in ("cache_ram", "ctx_checkpoints", "shm_size_gb"):
         section = getattr(config, "model" if field_name in ("cache_ram", "ctx_checkpoints") else "vast")
+        current = getattr(section, field_name)
+        if current == 0:
+            setattr(section, field_name, None)
+
+    for field_name in ("idle_timeout_seconds", "max_runtime_seconds", "expected_session_seconds", "bid_price"):
+        section = getattr(config, "vast")
         current = getattr(section, field_name)
         if current == 0:
             setattr(section, field_name, None)

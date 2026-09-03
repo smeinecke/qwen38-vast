@@ -1,0 +1,560 @@
+"""Central market logic: offer search, filtering, hardware ranking, and scoring.
+
+This module is shared by ``hostai up`` and ``hostai monitor`` so both commands
+use the same query construction, storage allocation, transfer-cost handling,
+eligibility filtering, and optional cost-efficiency scoring.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import statistics
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import click
+
+from hostai import vast
+from hostai.config import Config
+from hostai.profiles import Profile, Profiles, re_normalize_gpu
+
+MAX_INET_DOWN_MBPS = 1.0
+MAX_DISK_BW_MBPS = 1.0
+MIN_STARTUP_SECONDS = 30.0
+
+
+@dataclass
+class OfferScore:
+    """Scoring result attached to an offer dict."""
+
+    score: float
+    reason: str
+    prompt_tps: Optional[float] = None
+    decode_tps: Optional[float] = None
+    startup_seconds: Optional[float] = None
+    session_seconds: Optional[float] = None
+    transfer_cost: Optional[float] = None
+
+
+def resolved_disk_gb(profile: Optional[Profile], config: Config) -> int:
+    """Return the disk size for a profile, falling back to the global market default."""
+    if profile is not None and profile.disk_gb is not None:
+        return int(profile.disk_gb)
+    return int(config.market.disk_gb)
+
+
+def _effective_dph(offer: Dict[str, Any]) -> float:
+    for key in ("dph_total", "dph"):
+        if key in offer and offer[key] is not None:
+            return float(offer[key])
+    return float("inf")
+
+
+def _normalized_gpu_name(offer: Dict[str, Any]) -> str:
+    return re_normalize_gpu(str(offer.get("gpu_name", "")))
+
+
+def hardware_rank_for_offer(profiles: Profiles, offer: Dict[str, Any]) -> Optional[int]:
+    """Return the hardware rank for an offer's GPU, or None if unknown."""
+    return profiles.hardware_rank(str(offer.get("gpu_name", "")))
+
+
+def is_same_or_better_gpu(
+    profiles: Profiles,
+    current_gpu: Optional[str],
+    candidate_gpu: Optional[str],
+    policy: str = "same_or_better",
+) -> bool:
+    """Return True when *candidate_gpu* is at least as good as *current_gpu*.
+
+    Unknown GPUs are rejected unless the current GPU is also unknown.
+    """
+    if not current_gpu or not candidate_gpu:
+        return False
+    if policy not in ("same_or_better",):
+        raise ValueError(f"unsupported monitor hardware policy: {policy}")
+    current_rank = profiles.hardware_rank(current_gpu)
+    candidate_rank = profiles.hardware_rank(candidate_gpu)
+    if current_rank is None and candidate_rank is None:
+        return re_normalize_gpu(current_gpu) == re_normalize_gpu(candidate_gpu)
+    if current_rank is None or candidate_rank is None:
+        return False
+    return candidate_rank >= current_rank
+
+
+def build_search_query(
+    config: Config,
+    profiles: Profiles,
+    profile: Profile,
+    *,
+    max_price: Optional[float] = None,
+    unverified: bool = False,
+    offer: Optional[int] = None,
+) -> Tuple[str, float]:
+    """Build a Vast query string from profile and config.
+
+    Traffic-cost constraints are appended explicitly with ``<=`` and use the
+    configured values, including ``0``.  This keeps ``hostai up`` and the
+    monitor on the same search semantics.
+    """
+    if max_price is not None and max_price < 0:
+        raise click.ClickException("--max-price must be non-negative")
+
+    max_dph = max_price if max_price is not None else config.market.max_dph
+    query = config.hostai.gpu_query_override or profile.gpu_query
+
+    if unverified:
+        query = re.sub(r"\s*reliability\s*(>=?|<=?|=)\s*[^\s]+", "", query)
+        query = re.sub(r"\s+", " ", query).strip()
+        query += ' verification in ["verified","unverified","deverified"]'
+
+    if profiles.market_policy.require_free_traffic:
+        query += f" inet_down_cost<={config.market.max_inet_down_cost}"
+        query += f" inet_up_cost<={config.market.max_inet_up_cost}"
+
+    if offer is None and "dph" not in query:
+        query += f" dph_total <= {max_dph}"
+
+    # Exclude the consistently slow/unstable China RTX 5090 host.
+    query += " machine_id != 148003"
+
+    return query, max_dph
+
+
+def offer_download_estimate(
+    offer: Dict[str, Any],
+    config: Config,
+    profile: Optional[Profile] = None,
+) -> Tuple[float, float, float]:
+    """Estimate download size (GB), time (s), and transfer cost ($).
+
+    The size combines the image size (layers) and the model files.  Transfer
+    cost is a rough ingress estimate based on the offer's ``inet_down_cost``.
+    """
+    size_gb = config.market.model_download_gb + config.market.image_size_gb
+    inet_down = float(offer.get("inet_down", 0) or 0)
+    disk_bw = float(offer.get("disk_bw", 0) or 0)
+
+    # Convert Vast's Mbps into seconds for the full payload.
+    if inet_down > 0:
+        net_seconds = (size_gb * 8 * 1000) / inet_down
+    else:
+        net_seconds = float("inf")
+
+    if disk_bw > 0:
+        # Disk bandwidth is reported in MB/s. Image/model extraction is rarely
+        # sequential; use a conservative 2x multiplier.
+        disk_seconds = (size_gb * 1024 / disk_bw) * 2
+    else:
+        disk_seconds = float("inf")
+
+    download_seconds = max(MIN_STARTUP_SECONDS, min(net_seconds, disk_seconds))
+
+    inet_down_cost = float(offer.get("inet_down_cost", 0) or 0)
+    transfer_cost = size_gb * inet_down_cost
+    return size_gb, download_seconds, transfer_cost
+
+
+def historical_per_gpu_stats(
+    runs_dir: Path,
+    min_samples: int = 3,
+    max_age_days: int = 30,
+) -> Dict[str, Dict[str, Any]]:
+    """Aggregate prompt/decode/startup statistics per normalized GPU.
+
+    Scans ``.hostai-runs/*/benchmarks/*/metrics.json`` and run metadata.  Only
+    runs newer than *max_age_days* are considered.  Robust median aggregation
+    prevents a single anomalous benchmark from dominating the score.
+    """
+    import time
+
+    stats: Dict[str, Dict[str, List[float]]] = {}
+    startup_stats: Dict[str, List[float]] = {}
+    cutoff = time.time() - (max_age_days * 86400)
+
+    if not runs_dir.exists():
+        return {}
+
+    for run_dir in runs_dir.iterdir():
+        if not run_dir.is_dir():
+            continue
+        meta_path = run_dir / "metadata.json"
+        meta: Dict[str, Any] = {}
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text())
+            except Exception:
+                pass
+        started = meta.get("started_epoch") or meta.get("run_started_epoch")
+        if started and int(started) < cutoff:
+            continue
+
+        gpu = re_normalize_gpu(str(meta.get("gpu", "")))
+        if not gpu:
+            continue
+
+        startup = meta.get("startup_seconds")
+        if isinstance(startup, (int, float)) and startup > 0:
+            startup_stats.setdefault(gpu, []).append(float(startup))
+
+        bench_root = run_dir / "benchmarks"
+        if not bench_root.exists():
+            continue
+        for bench_dir in bench_root.iterdir():
+            metrics_path = bench_dir / "metrics.json"
+            if not metrics_path.exists():
+                continue
+            try:
+                data = json.loads(metrics_path.read_text())
+            except Exception:
+                continue
+            perf = data.get("performance") or {}
+            session = data.get("session") or {}
+            bench_gpu = re_normalize_gpu(str(session.get("gpu", meta.get("gpu", ""))))
+            if not bench_gpu:
+                continue
+            entry = stats.setdefault(bench_gpu, {})
+            for key in ("prompt_tps", "decode_tps"):
+                value = perf.get(key)
+                if isinstance(value, (int, float)) and value > 0:
+                    entry.setdefault(key, []).append(float(value))
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for gpu, values in stats.items():
+        prompt = values.get("prompt_tps", [])
+        decode = values.get("decode_tps", [])
+        if len(prompt) + len(decode) == 0:
+            continue
+        out[gpu] = {
+            "prompt_tps": statistics.median(prompt) if prompt else None,
+            "decode_tps": statistics.median(decode) if decode else None,
+            "prompt_samples": len(prompt),
+            "decode_samples": len(decode),
+        }
+        if gpu in startup_stats:
+            out[gpu]["startup_seconds"] = statistics.median(startup_stats[gpu])
+            out[gpu]["startup_samples"] = len(startup_stats[gpu])
+    return out
+
+
+def _median(values: List[float]) -> Optional[float]:
+    if not values:
+        return None
+    return float(statistics.median(values))
+
+
+def _robust_min(values: List[float]) -> Optional[float]:
+    """Return the median of the lower half to avoid one fast outlier dominating."""
+    if not values:
+        return None
+    sorted_values = sorted(values)
+    n = len(sorted_values)
+    lower = sorted_values[: (n // 2) + 1]
+    return float(statistics.median(lower))
+
+
+def estimate_startup_seconds(
+    offer: Dict[str, Any],
+    config: Config,
+    stats: Optional[Dict[str, Dict[str, Any]]] = None,
+    min_samples: int = 3,
+) -> float:
+    """Return an estimated startup time for an offer.
+
+    Prefer measured historical startup data when enough samples exist.  Fall
+    back to a bandwidth-based estimate derived from the model/image size and
+    the offer's ``inet_down``/``disk_bw``.
+    """
+    stats = stats or {}
+    gpu = _normalized_gpu_name(offer)
+    gpu_stats = stats.get(gpu, {})
+    startup_samples = gpu_stats.get("startup_samples", 0)
+    startup_seconds = gpu_stats.get("startup_seconds")
+    if startup_samples >= min_samples and isinstance(startup_seconds, (int, float)) and startup_seconds > 0:
+        return float(startup_seconds)
+
+    _, download_seconds, _ = offer_download_estimate(offer, config)
+    return download_seconds
+
+
+def _performance_for_offer(
+    offer: Dict[str, Any],
+    stats: Dict[str, Dict[str, Any]],
+    config: Config,
+) -> Tuple[Optional[float], Optional[float], str]:
+    """Return (prompt_tps, decode_tps, reason) for an offer."""
+    gpu = _normalized_gpu_name(offer)
+    gpu_stats = stats.get(gpu)
+    if gpu_stats is None:
+        return None, None, "no historical data"
+
+    prompt_samples = gpu_stats.get("prompt_samples", 0)
+    decode_samples = gpu_stats.get("decode_samples", 0)
+    total_samples = prompt_samples + decode_samples
+    if total_samples < config.market.min_historical_samples:
+        return None, None, f"insufficient samples ({total_samples})"
+
+    prompt_tps = gpu_stats.get("prompt_tps")
+    decode_tps = gpu_stats.get("decode_tps")
+    if not prompt_tps and not decode_tps:
+        return None, None, "no positive tps values"
+    return prompt_tps, decode_tps, f"history n={total_samples}"
+
+
+def _weighted_tps(
+    prompt_tps: Optional[float],
+    decode_tps: Optional[float],
+    config: Config,
+) -> Optional[float]:
+    """Combine prompt and decode tps with configured weights."""
+    total_weight = config.market.scoring_prompt_weight + config.market.scoring_decode_weight
+    if total_weight == 0:
+        return None
+    weighted = 0.0
+    if prompt_tps:
+        weighted += config.market.scoring_prompt_weight * prompt_tps
+    if decode_tps:
+        weighted += config.market.scoring_decode_weight * decode_tps
+    return weighted / total_weight if weighted > 0 else None
+
+
+def score_offer(
+    offer: Dict[str, Any],
+    config: Config,
+    stats: Dict[str, Dict[str, Any]],
+    session_seconds: Optional[int] = None,
+) -> OfferScore:
+    """Score a single offer.
+
+    * ``dph`` mode simply uses the hourly price.
+    * ``perf`` mode divides the hourly price by historical tps.
+    * ``session`` mode adds an estimated startup cost and transfer cost.
+
+    The returned score is a cost figure: lower is better.  When historical data
+    is unavailable or insufficient, the score falls back to ``dph_total``.
+    """
+    dph = _effective_dph(offer)
+    mode = config.market.scoring_mode
+
+    if mode == "dph":
+        return OfferScore(score=dph, reason="dph")
+
+    prompt_tps, decode_tps, reason = _performance_for_offer(offer, stats, config)
+    weighted = _weighted_tps(prompt_tps, decode_tps, config)
+
+    if mode == "perf":
+        if weighted:
+            score = (dph / 3600) / weighted
+            return OfferScore(score=score, reason=f"perf: {reason}", prompt_tps=prompt_tps, decode_tps=decode_tps)
+        return OfferScore(score=dph, reason=f"perf fallback: {reason}")
+
+    if mode == "session":
+        startup = estimate_startup_seconds(offer, config, stats, config.market.min_historical_samples)
+        active = session_seconds if session_seconds else 0
+        total_seconds = startup + active
+        total_cost = dph * total_seconds / 3600.0
+        _, _, transfer_cost = offer_download_estimate(offer, config)
+        total_cost += transfer_cost
+
+        if weighted and active > 0:
+            effective_tokens = weighted * active
+            score = total_cost / effective_tokens
+            return OfferScore(
+                score=score,
+                reason=f"session: {reason}, startup={startup:.0f}s",
+                prompt_tps=prompt_tps,
+                decode_tps=decode_tps,
+                startup_seconds=startup,
+                session_seconds=active,
+                transfer_cost=transfer_cost,
+            )
+        return OfferScore(
+            score=total_cost,
+            reason=f"session fallback: {reason}, startup={startup:.0f}s",
+            startup_seconds=startup,
+            session_seconds=active,
+            transfer_cost=transfer_cost,
+        )
+
+    return OfferScore(score=dph, reason=f"unknown scoring mode {mode}")
+
+
+def score_offers(
+    offers: List[Dict[str, Any]],
+    config: Config,
+    stats: Optional[Dict[str, Dict[str, Any]]] = None,
+    session_seconds: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Attach a ``_hostai_score`` to each offer and sort by score (lower=better)."""
+    stats = stats or {}
+    for offer in offers:
+        scoring = score_offer(offer, config, stats, session_seconds=session_seconds)
+        offer["_hostai_score"] = scoring
+    offers.sort(key=lambda o: o["_hostai_score"].score)
+    return offers
+
+
+def filter_eligible_offers(
+    offers: List[Dict[str, Any]],
+    *,
+    max_dph: float,
+    offer: Optional[int] = None,
+    current_gpu: Optional[str] = None,
+    profiles: Optional[Profiles] = None,
+    ctx_size: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Filter search results by price, specific id, hardware rank, and context."""
+    matches: List[Dict[str, Any]] = []
+    for o in offers:
+        if offer is not None:
+            if str(o.get("id")) != str(offer) and str(o.get("ask_contract_id")) != str(offer):
+                continue
+        else:
+            if _effective_dph(o) > max_dph:
+                continue
+
+        if current_gpu is not None and profiles is not None:
+            if not is_same_or_better_gpu(profiles, current_gpu, str(o.get("gpu_name", ""))):
+                continue
+
+        if ctx_size is not None and int(o.get("ctx_size", 0)) != 0 and int(o.get("ctx_size", 0)) != ctx_size:
+            continue
+
+        matches.append(o)
+    return matches
+
+
+def search_offers(
+    config: Config,
+    query: str,
+    *,
+    storage: float,
+    max_dph: float,
+    offer: Optional[int] = None,
+    offer_type: str = "on-demand",
+    unverified: bool = False,
+    order: str = "dph_total",
+    limit: int = 25,
+) -> List[Dict[str, Any]]:
+    """Search Vast and return raw offers.
+
+    Uses a higher limit when an explicit *offer* id is requested so the
+    requested contract is likely to appear in the result set.
+    """
+    search_limit = 100 if offer is not None else limit
+    try:
+        return vast.search_instance_offers(
+            config,
+            query,
+            limit=search_limit,
+            order=order,
+            storage=storage,
+            offer_type=offer_type,
+        )
+    except Exception as exc:
+        raise click.ClickException(f"search failed: {exc}")
+
+
+def select_offer(
+    config: Config,
+    profiles: Profiles,
+    query: str,
+    *,
+    profile: Optional[Profile] = None,
+    max_dph: float,
+    unverified: bool,
+    offer: Optional[int],
+    storage: float,
+    offer_type: str = "on-demand",
+    current_gpu: Optional[str] = None,
+    ctx_size: Optional[int] = None,
+    session_seconds: Optional[int] = None,
+    verbose: bool = False,
+) -> Dict[str, Any]:
+    """Search, filter, and select the best offer for ``up`` or ``monitor``.
+
+    Uses the configured scoring mode.  ``_hostai_score`` is attached to the
+    returned offer for display.  When no scoring data is available, the legacy
+    ``dph_total`` ordering is preserved.
+    """
+    offers = search_offers(
+        config,
+        query,
+        storage=storage,
+        max_dph=max_dph,
+        offer=offer,
+        offer_type=offer_type,
+        unverified=unverified,
+    )
+
+    stats: Dict[str, Dict[str, Any]] = {}
+    if config.market.scoring_mode in ("perf", "session"):
+        from hostai.state import runs_dir
+
+        stats = historical_per_gpu_stats(
+            runs_dir(config.root_dir),
+            min_samples=config.market.min_historical_samples,
+            max_age_days=config.market.max_history_age_days,
+        )
+
+    matches = filter_eligible_offers(
+        offers,
+        max_dph=max_dph,
+        offer=offer,
+        current_gpu=current_gpu,
+        profiles=profiles,
+        ctx_size=ctx_size,
+    )
+
+    if not matches:
+        if offer is not None:
+            raise click.ClickException(f"no matching offer for id {offer}")
+        raise click.ClickException(f"no matching offer at or below ${max_dph:.2f}/h")
+
+    if config.market.scoring_mode in ("perf", "session"):
+        matches = score_offers(matches, config, stats, session_seconds=session_seconds)
+    else:
+        matches.sort(key=_effective_dph)
+
+    best = matches[0]
+    scoring = best.get("_hostai_score")
+    if verbose and scoring:
+        click.echo(
+            f"[market] selected {best.get('gpu_name')} with score {scoring.score:.6f} "
+            f"({scoring.reason})"
+        )
+
+    return best
+
+
+def _format_transfer_cost(cost: float) -> str:
+    if cost == 0:
+        return "free"
+    return f"${cost:.4f}/GB"
+
+
+def offer_summary(offer: Dict[str, Any]) -> str:
+    """Human-readable one-line summary of an offer."""
+    dph = _effective_dph(offer)
+    gpu = offer.get("gpu_name", "unknown")
+    down = offer.get("inet_down", "?")
+    up = offer.get("inet_up", "?")
+    down_cost = offer.get("inet_down_cost", 0)
+    up_cost = offer.get("inet_up_cost", 0)
+    offer_id = offer.get("id") or offer.get("ask_contract_id")
+    scoring = offer.get("_hostai_score")
+    extras = []
+    if scoring:
+        extras.append(f"score={scoring.score:.6f}")
+    if offer.get("is_bid") or offer.get("type") == "bid":
+        extras.append("bid")
+    summary = (
+        f"{gpu} | ${dph:.4f}/h | "
+        f"down={down} ({_format_transfer_cost(down_cost)}) | "
+        f"up={up} ({_format_transfer_cost(up_cost)}) | offer={offer_id}"
+    )
+    if extras:
+        summary += f" | {' '.join(extras)}"
+    return summary

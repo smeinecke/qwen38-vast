@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import json
-import re
 import secrets
 import time
 from pathlib import Path
@@ -12,9 +11,10 @@ from typing import Any, Dict, Optional, Set, Tuple
 
 import click
 
-from hostai import cache, ssh, tls, utils
+from hostai import cache, market, ssh, tls, utils
 from hostai.api import LlamaClient, wait_for_api
 from hostai.commands import _common
+from hostai.commands.watchdog import maybe_start_watchdog
 from hostai.config import Config, image_for_profile
 from hostai.profiles import Profiles
 from hostai.state import State, init_run_dir, runs_dir, state_dir
@@ -23,7 +23,6 @@ from hostai.vast import (
     destroy,
     get_instance,
     get_instance_logs,
-    search_instance_offers,
 )
 from hostai.vast import (
     start as start_instance,
@@ -42,6 +41,11 @@ from hostai.vast import (
 @click.option("--abort-if-shm-too-small", is_flag=True, help="Fail if /dev/shm is too small.")
 @click.option("--offer", type=int, help="Use a specific offer ID.")
 @click.option("--restart", is_flag=True, help="Restart an existing paused instance.")
+@click.option("--interruptible", is_flag=True, help="Use an interruptible/bid instance.")
+@click.option("--bid", type=float, help="Bid price (max $/h) for interruptible instances.")
+@click.option("--expected-session", help="Expected session duration, e.g. 30m, 2h.")
+@click.option("--dry-run", is_flag=True, help="Search and print the chosen offer without renting.")
+@click.option("--scoring-mode", help="Override market scoring mode (dph, perf, session).")
 @click.pass_obj
 def cmd_up(
     config: Config,
@@ -56,6 +60,11 @@ def cmd_up(
     abort_if_shm_too_small: bool,
     offer: Optional[int],
     restart: bool,
+    interruptible: bool,
+    bid: Optional[float],
+    expected_session: Optional[str],
+    dry_run: bool,
+    scoring_mode: Optional[str],
 ):
     chosen_profile = profile or profile_opt or config.hostai.default_profile
     if not chosen_profile:
@@ -64,6 +73,29 @@ def cmd_up(
         raise click.ClickException("--local-port must be between 1 and 65535")
     if max_price is not None and max_price < 0:
         raise click.ClickException("--max-price must be non-negative")
+    if bid is not None and bid <= 0:
+        raise click.ClickException("--bid must be positive")
+    if scoring_mode is not None and scoring_mode not in ("dph", "perf", "session"):
+        raise click.ClickException("--scoring-mode must be dph, perf, or session")
+
+    if scoring_mode:
+        config.market.scoring_mode = scoring_mode
+
+    bid_price = bid if bid is not None else config.vast.bid_price
+    if interruptible or bid_price is not None:
+        if bid_price is None:
+            bid_price = max_price if max_price is not None else config.market.max_dph
+        if bid_price <= 0:
+            raise click.ClickException("interruptible instances require a positive --bid or max_dph")
+
+    session_seconds = None
+    if expected_session is not None:
+        try:
+            session_seconds = utils.parse_duration_to_seconds(expected_session)
+        except ValueError as exc:
+            raise click.ClickException(str(exc))
+    if session_seconds is None and config.vast.expected_session_seconds is not None:
+        session_seconds = config.vast.expected_session_seconds
 
     if restart:
         _do_restart(config, chosen_profile, local_port, unsecure, no_cache)
@@ -79,6 +111,9 @@ def cmd_up(
             no_cache,
             abort_if_shm_too_small,
             offer,
+            bid_price=bid_price,
+            session_seconds=session_seconds,
+            dry_run=dry_run,
         )
 
 
@@ -151,79 +186,6 @@ def _resolve_profile(config: Config, name: str) -> Tuple[Profiles, Any, Any]:
     if not image:
         raise click.ClickException(f"profile '{p.name}' references unknown image '{p.image}'")
     return profiles, p, image
-
-
-def _build_query(
-    config: Config,
-    profiles: Profiles,
-    profile: Any,
-    gpu_query: str,
-    max_price: Optional[float],
-    unverified: bool,
-    offer: Optional[int],
-) -> Tuple[str, float]:
-    if max_price is not None and max_price < 0:
-        raise click.ClickException("--max-price must be non-negative")
-    max_dph = max_price if max_price is not None else config.market.max_dph
-    query = gpu_query
-
-    if unverified:
-        query = re.sub(r"\s*reliability\s*(>=?|<=?|=)\s*[^\s]+", "", query)
-        query = re.sub(r"\s+", " ", query).strip()
-        query += ' verification in ["verified","unverified","deverified"]'
-
-    if profiles.market_policy.require_free_traffic:
-        query += f" inet_down_cost<={config.market.max_inet_down_cost}"
-        query += f" inet_up_cost<={config.market.max_inet_up_cost}"
-
-    if offer is None and "dph" not in query:
-        query += f" dph_total <= {max_dph}"
-
-    # Exclude the consistently slow/unstable China RTX 5090 host.
-    query += " machine_id != 148003"
-
-    return query, max_dph
-
-
-def _select_offer(
-    config: Config,
-    query: str,
-    max_dph: float,
-    unverified: bool,
-    offer: Optional[int],
-) -> Dict[str, Any]:
-    limit = 100 if offer is not None else 25
-    try:
-        offers = search_instance_offers(
-            config,
-            query,
-            limit=limit,
-            order="dph_total",
-            storage=config.market.disk_gb,
-        )
-    except Exception as exc:
-        raise click.ClickException(f"search failed: {exc}")
-
-    for o in offers:
-        o["_effective_dph"] = o.get("dph_total", 999999)
-
-    matches = []
-    for o in offers:
-        if offer is not None:
-            if str(o.get("id")) != str(offer) and str(o.get("ask_contract_id")) != str(offer):
-                continue
-        else:
-            if o["_effective_dph"] > max_dph:
-                continue
-        matches.append(o)
-
-    if not matches:
-        raise click.ClickException(
-            f"no matching offer{' for id ' + str(offer) if offer is not None else ''} at or below ${max_dph:.2f}/h"
-        )
-
-    matches.sort(key=lambda x: x["_effective_dph"])
-    return matches[0]
 
 
 def _env_dict(
@@ -487,6 +449,10 @@ def _do_fresh(
     no_cache: bool,
     abort_if_shm_too_small: bool,
     offer: Optional[int],
+    *,
+    bid_price: Optional[float] = None,
+    session_seconds: Optional[int] = None,
+    dry_run: bool = False,
 ) -> None:
     sdir = state_dir(config.root_dir)
     existing = sdir / "state.json"
@@ -505,26 +471,39 @@ def _do_fresh(
 
     profiles, profile, image = _resolve_profile(config, profile_name)
     ctx_size = config.hostai.ctx_size_override if config.hostai.ctx_size_override else profile.ctx_size
-    gpu_query = config.hostai.gpu_query_override or profile.gpu_query
     model = config.model.model
     selected_image = image_for_profile(config, image.image_tag)
+    disk_gb = market.resolved_disk_gb(profile, config)
+    interruptible = bid_price is not None
 
-    query, max_dph = _build_query(config, profiles, profile, gpu_query, max_price, unverified, offer)
-    click.echo(f"[profile] {profile.name} | sm_{image.cuda_arch} | ctx={ctx_size} | image={selected_image}")
+    query, max_dph = market.build_search_query(config, profiles, profile, max_price=max_price, unverified=unverified, offer=offer)
+    click.echo(f"[profile] {profile.name} | sm_{image.cuda_arch} | ctx={ctx_size} | image={selected_image} | disk={disk_gb}GB")
     click.echo(f"[search]  {query}")
 
-    offer_data = _select_offer(config, query, max_dph, unverified, offer)
+    offer_type = "bid" if interruptible else "on-demand"
+    offer_data = market.select_offer(
+        config,
+        profiles,
+        query,
+        max_dph=max_dph,
+        unverified=unverified,
+        offer=offer,
+        storage=disk_gb,
+        offer_type=offer_type,
+        session_seconds=session_seconds,
+        verbose=True,
+    )
     offer_id_raw = offer_data.get("id") or offer_data.get("ask_contract_id")
     if offer_id_raw is None:
         raise click.ClickException("selected offer has no id")
     offer_id = int(offer_id_raw)
     gpu_name = offer_data.get("gpu_name", "unknown")
     dph = offer_data.get("dph_total", 0.0)
-    click.echo(
-        f"[rent] {gpu_name} | ${dph:.4f}/h | "
-        f"down={offer_data.get('inet_down', '?')} | "
-        f"up={offer_data.get('inet_up', '?')} | offer={offer_id}"
-    )
+    click.echo(f"[rent] {market.offer_summary(offer_data)}")
+
+    if dry_run:
+        click.echo("\nDRY RUN: not creating an instance")
+        return
 
     run_id = utils.make_run_id(profile.name)
     run_dir = init_run_dir(runs_dir(config.root_dir), profile.name, run_id)
@@ -543,7 +522,11 @@ def _do_fresh(
         "profile": profile.name,
         "monitor_group": profile.monitor_group or "",
         "gpu_query": query,
-        "disk_gb": config.market.disk_gb,
+        "disk_gb": disk_gb,
+        "interruptible": interruptible,
+        "bid_price": bid_price if interruptible else None,
+        "expected_session_seconds": session_seconds,
+        "scoring_mode": config.market.scoring_mode,
         "cuda_arch": image.cuda_arch,
         "image": selected_image,
         "ctx_size": ctx_size,
@@ -578,18 +561,19 @@ def _do_fresh(
             volume_info = None
 
     try:
-        create_raw = create_instance_from_offer(
-            config,
-            offer_id,
-            image=selected_image,
-            disk=config.market.disk_gb,
-            env=env,
-            label=label,
-            extra=extra,
-            runtype="args",
-            args=None,
-            volume_info=volume_info,
-        )
+        create_kwargs: Dict[str, Any] = {
+            "image": selected_image,
+            "disk": disk_gb,
+            "env": env,
+            "label": label,
+            "extra": extra,
+            "runtype": "args",
+            "args": None,
+            "volume_info": volume_info,
+        }
+        if interruptible:
+            create_kwargs["bid_price"] = bid_price
+        create_raw = create_instance_from_offer(config, offer_id, **create_kwargs)
     except Exception as exc:
         raise click.ClickException(f"Vast create instance failed: {exc}")
 
@@ -622,6 +606,10 @@ def _do_fresh(
     state.label = label
     state.profile = profile.name
     state.monitor_group = profile.monitor_group or ""
+    state.disk_gb = disk_gb
+    state.interruptible = interruptible
+    state.bid_price = bid_price if interruptible else None
+    state.expected_session_seconds = session_seconds
     state.run_id = run_id
     state.run_dir = run_dir
     state.started_at = started_at
@@ -791,6 +779,8 @@ def _do_fresh_core(
     click.echo("\nRun: source .hostai-vast/env")
     click.echo("Stop: hostai down")
 
+    maybe_start_watchdog(config, state)
+
 
 def _do_restart(
     config: Config,
@@ -895,3 +885,5 @@ def _do_restart(
     click.echo(f"  Profile:   {state.profile}")
     click.echo(f"  API:       {base_url}")
     click.echo(f"  Instance:  {state.instance_id}")
+
+    maybe_start_watchdog(config, state)

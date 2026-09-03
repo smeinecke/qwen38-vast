@@ -3,6 +3,7 @@ import click
 from hostai import __version__
 from hostai.commands.bench import cmd_bench
 from hostai.commands.cache_cmd import cmd_cache_copy, cmd_cache_setup
+from hostai.commands.cost import cmd_cost, cmd_volume_break_even
 from hostai.commands.down import cmd_down
 from hostai.commands.lookup import cmd_lookup
 from hostai.commands.monitor import (
@@ -20,6 +21,13 @@ from hostai.commands.ssh_cmd import cmd_ssh_prepare
 from hostai.commands.status import cmd_status
 from hostai.commands.up import cmd_up
 from hostai.commands.validate_repo import cmd_validate
+from hostai.commands.watchdog import (
+    cmd_watchdog,
+    cmd_watchdog_run,
+    cmd_watchdog_start,
+    cmd_watchdog_status,
+    cmd_watchdog_stop,
+)
 from hostai.config import load_config
 
 
@@ -75,6 +83,16 @@ cmd_monitor.add_command(cmd_monitor_start, name="start")
 cmd_monitor.add_command(cmd_monitor_stop, name="stop")
 cmd_monitor.add_command(cmd_monitor_status, name="status")
 cmd_monitor.add_command(cmd_monitor_logs, name="logs")
+
+
+cli.add_command(cmd_watchdog, name="watchdog")
+cmd_watchdog.add_command(cmd_watchdog_run, name="run")
+cmd_watchdog.add_command(cmd_watchdog_start, name="start")
+cmd_watchdog.add_command(cmd_watchdog_stop, name="stop")
+cmd_watchdog.add_command(cmd_watchdog_status, name="status")
+
+cli.add_command(cmd_cost, name="cost")
+cmd_cost.add_command(cmd_volume_break_even, name="volume-break-even")
 
 
 def main() -> None:

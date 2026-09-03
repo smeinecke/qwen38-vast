@@ -112,6 +112,23 @@ def parse_ssh_url(url: str) -> Tuple[str, str, int]:
     return user, host, port
 
 
+_DURATION_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*([smhd]?)$", re.IGNORECASE)
+_DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def parse_duration_to_seconds(value: Optional[str]) -> Optional[int]:
+    """Parse a human duration like ``30m`` or ``2h`` into seconds."""
+    if value is None or value == "":
+        return None
+    text = str(value).strip()
+    match = _DURATION_RE.match(text)
+    if not match:
+        raise ValueError(f"invalid duration: {value}")
+    number = float(match.group(1))
+    unit = match.group(2).lower() or "s"
+    return int(number * _DURATION_UNITS[unit])
+
+
 def mkdir_private(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     path.chmod(0o700)
