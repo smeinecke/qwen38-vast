@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
 import os
 import re
 import secrets
@@ -127,6 +128,42 @@ def parse_duration_to_seconds(value: Optional[str]) -> Optional[int]:
     number = float(match.group(1))
     unit = match.group(2).lower() or "s"
     return int(number * _DURATION_UNITS[unit])
+
+
+def git_commit(root_dir: Path) -> str:
+    """Return the current git commit hash, or an empty string."""
+    try:
+        return subprocess.run(
+            ["git", "-C", str(root_dir), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        ).stdout.strip()
+    except Exception:
+        return ""
+
+
+def is_dirty_tree(root_dir: Path) -> bool:
+    """Return True if the git working tree has uncommitted changes."""
+    try:
+        status = subprocess.run(
+            ["git", "-C", str(root_dir), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        ).stdout.strip()
+        return bool(status)
+    except Exception:
+        return True
+
+
+def file_hash(path: Path) -> str:
+    """Return a 16-character hex hash of the file at *path*, or an empty string."""
+    if not path.is_file():
+        return ""
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
 
 
 def mkdir_private(path: Path) -> Path:

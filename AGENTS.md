@@ -51,5 +51,7 @@
 
 - Run `hostai validate` to check the repository layout and record a `.hostai-vast/validation.json` digest.
 - Run `hostai validate --production` to also require Docker, the integration image, and pass `tests/test_local_integration.py`.
-- Run `hostai validate --compare` to compare the current state against the last recorded validation and warn about drift (git commit, image digest, `profiles.json`).
+- Run `hostai validate --compare` to compare the current state against the last *successful* validation and warn about drift (git commit, image ID, `profiles.json`, validation level).
+- On success, a production validation is also written to `.hostai-vast/validation-last-success.json`.
+- Set `HOSTAI_REQUIRE_PRODUCTION_VALIDATION=1` or `[vast].require_production_validation = true` to make `hostai up` refuse any paid Vast `create_instance` until the current git/image/profiles match the last successful production validation. Use `--allow-unvalidated` to bypass the gate explicitly.
 - Use this gate before a real Vast rental to confirm the local integration image still boots cleanly and the working tree matches the last validated state.

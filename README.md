@@ -470,17 +470,25 @@ The workflow uses Node-24 Docker Actions.
 
 ### Cumulative feature validation
 
-`./scripts/validate-repo` checks these build and runtime features: compiler cache
-seeding, persistent self-hosted BuildKit, self-managed SSH/tunnel recovery,
-non-interactive Vast destroy, slot/KV cache, 256k profiles, hardware-safe
-monitoring and the free-traffic policy. Both Docker
-workflows run this check before building, so a later patch cannot silently drop
-one of these pieces.
+The `hostai validate` command checks the repository layout and records a
+`validation.json` digest.  With `--production`, it also requires Docker, the
+integration image, and passes `tests/test_local_integration.py`, exercising:
+`start.sh`, `entrypoint.sh`, SSH/tunnel setup, `llama-server` health, slot/KV
+cache handling, and `hostai down` cleanup.  On success, `validation-last-success.json`
+is updated with the immutable Docker image ID, git commit, `profiles.json` hash,
+and validation level.  `hostai validate --compare` compares the current state
+against that last *successful* record.
 
-Run it locally with:
+Set `[vast].require_production_validation = true` or
+`HOSTAI_REQUIRE_PRODUCTION_VALIDATION=1` to make `hostai up` refuse real Vast
+rentals until the current state matches the last successful production
+validation.  Use `hostai up ... --allow-unvalidated` to bypass the gate.
+
+Build the integration image and run it locally with:
 
 ```bash
-bash ./scripts/validate-repo
+docker build -f tests/integration/Dockerfile.test -t hostai-test:latest .
+uv run hostai validate --production
 ```
 
 ### Compiler cache

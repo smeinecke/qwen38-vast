@@ -38,6 +38,11 @@ def _image_exists(name: str) -> bool:
         return False
 
 
+def _integration_image() -> str:
+    """Return the integration image selected by the environment."""
+    return os.environ.get("HOSTAI_LOCAL_IMAGE", "hostai-test:latest")
+
+
 def _container_count() -> int:
     result = subprocess.run(
         ["docker", "ps", "-a", "-q", "--filter", "label=hostai.provider=local"],
@@ -67,14 +72,14 @@ def project_dir(tmp_path):
 def local_env():
     env = dict(os.environ)
     env["HOSTAI_PROVIDER"] = "local"
-    env["HOSTAI_LOCAL_IMAGE"] = "hostai-test:latest"
+    env["HOSTAI_LOCAL_IMAGE"] = os.environ.get("HOSTAI_LOCAL_IMAGE", "hostai-test:latest")
     env["HOSTAI_PROFILES_FILE"] = "profiles.json"
     env["GHCR_IMAGE_BASE"] = "ghcr.io/smeinecke/qwen38-vast"
     return env
 
 
 @pytest.mark.skipif(not _has_docker(), reason="docker not available")
-@pytest.mark.skipif(not _image_exists("hostai-test:latest"), reason="integration image not built")
+@pytest.mark.skipif(not _image_exists(_integration_image()), reason=f"integration image {_integration_image()} not built")
 def test_local_up_down_lifecycle(project_dir, local_env, monkeypatch):
     """Run `hostai up` and `hostai down` against the local Docker backend."""
     runner = CliRunner(env=local_env)
@@ -126,7 +131,7 @@ def test_local_up_down_lifecycle(project_dir, local_env, monkeypatch):
 
 
 @pytest.mark.skipif(not _has_docker(), reason="docker not available")
-@pytest.mark.skipif(not _image_exists("hostai-test:latest"), reason="integration image not built")
+@pytest.mark.skipif(not _image_exists(_integration_image()), reason=f"integration image {_integration_image()} not built")
 def test_local_up_shm_size_configurable(project_dir):
     """HOSTAI_LOCAL_SHM_SIZE_GB is reflected in the container's --shm-size."""
     from hostai.config import Config
@@ -138,7 +143,7 @@ def test_local_up_shm_size_configurable(project_dir):
         env_file=project_dir / ".env",
     )
     cfg.provider.backend = "local"
-    cfg.provider.local_image = "hostai-test:latest"
+    cfg.provider.local_image = _integration_image()
     cfg.provider.local_shm_size_gb = 2
 
     provider = LocalProvider(cfg)
@@ -148,7 +153,7 @@ def test_local_up_shm_size_configurable(project_dir):
 
 
 @pytest.mark.skipif(not _has_docker(), reason="docker not available")
-@pytest.mark.skipif(not _image_exists("hostai-test:latest"), reason="integration image not built")
+@pytest.mark.skipif(not _image_exists(_integration_image()), reason=f"integration image {_integration_image()} not built")
 def test_local_up_with_small_shm(project_dir, local_env, monkeypatch):
     """A /dev/shm smaller than the cache minimum disables slot cache gracefully."""
     runner = CliRunner(env=local_env)
@@ -184,7 +189,7 @@ def test_local_up_with_small_shm(project_dir, local_env, monkeypatch):
 
 
 @pytest.mark.skipif(not _has_docker(), reason="docker not available")
-@pytest.mark.skipif(not _image_exists("hostai-test:latest"), reason="integration image not built")
+@pytest.mark.skipif(not _image_exists(_integration_image()), reason=f"integration image {_integration_image()} not built")
 def test_local_up_socket_delay_regression(project_dir, local_env, monkeypatch):
     """A 15-second socket delay is covered by a 60-second global boot deadline."""
     env = dict(local_env)
@@ -210,7 +215,7 @@ def test_local_up_socket_delay_regression(project_dir, local_env, monkeypatch):
 
 
 @pytest.mark.skipif(not _has_docker(), reason="docker not available")
-@pytest.mark.skipif(not _image_exists("hostai-test:latest"), reason="integration image not built")
+@pytest.mark.skipif(not _image_exists(_integration_image()), reason=f"integration image {_integration_image()} not built")
 def test_local_up_socket_timeout_regression(project_dir, local_env, monkeypatch):
     """A socket delay that exceeds the global deadline fails with a precise stage error and cleans up."""
     env = dict(local_env)

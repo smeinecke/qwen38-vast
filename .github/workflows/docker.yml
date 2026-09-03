@@ -35,7 +35,7 @@ jobs:
               - 'entrypoint.sh'
               - 'hostai-init-ssh.sh'
               - 'scripts/prepare-authorized-keys'
-              - 'scripts/validate-repo'
+              - 'tests/integration/Dockerfile.test'
               - 'src/hostai/remote_guard.py'
               - 'ssh/**'
               - 'profiles.json'

@@ -71,6 +71,9 @@ bid_price = ""
 expected_session_seconds = ""
 # Auto-start the watchdog after hostai up.
 watchdog_auto_start = false
+# Require a current `hostai validate --production` run before creating real
+# Vast instances. Set to true to turn the validation record into a spending gate.
+require_production_validation = false
 
 [cache]
 enabled = true

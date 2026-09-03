@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from hostai import market
+from hostai import market, utils
 from hostai.config import Config
 from hostai.profiles import Profiles
 
@@ -155,9 +155,13 @@ class ValidationRecord:
     duration_seconds: float
     git_commit: str
     dirty: bool
-    image_digest: str
+    image: str  # image name used for validation (e.g. "hostai-test:latest")
+    image_id: str  # immutable Docker image ID
+    image_digest: str  # repo digest when available (may be empty for local builds)
     profile_hash: str
     errors: List[str]
+    level: str = "repo"  # "repo" or "production"
+    checks_run: List[str] = dataclasses.field(default_factory=list)
     extras: Dict[str, Any] = dataclasses.field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -165,61 +169,63 @@ class ValidationRecord:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ValidationRecord":
+        # Provide defaults for fields added after the first validation.json format.
+        defaults = {
+            "image": "",
+            "image_id": "",
+            "level": "repo",
+            "checks_run": [],
+        }
+        for key, value in defaults.items():
+            data.setdefault(key, value)
         return cls(**data)
-
-
-def _validation_path(root_dir: Path) -> Path:
-    path = root_dir / ".hostai-vast" / "validation.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path
 
 
 def _git_info(root_dir: Path) -> tuple:
     """Return (commit, dirty) for the repository at *root_dir* or ("", True)."""
-    try:
-        commit = subprocess.run(
-            ["git", "-C", str(root_dir), "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=10,
-        ).stdout.strip()
-    except Exception:
-        commit = ""
-    try:
-        status = subprocess.run(
-            ["git", "-C", str(root_dir), "status", "--porcelain"],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=10,
-        ).stdout.strip()
-    except Exception:
-        status = "?"
-    return commit, bool(status)
+    return utils.git_commit(root_dir), utils.is_dirty_tree(root_dir)
 
 
-def _image_digest(image: str = "hostai-test:latest") -> str:
-    """Return the image digest for *image*, or an empty string."""
+def _image_info(image: str = "hostai-test:latest") -> tuple:
+    """Return (image_id, repo_digest) for *image*.
+
+    image_id is the immutable Docker image ID (e.g. ``sha256:...``).
+    repo_digest is the registry digest when the image was pulled by digest; it
+    may be empty for locally built tags, but image_id still reliably changes
+    when the tag is rebuilt.
+    """
     try:
-        raw = subprocess.run(
-            ["docker", "image", "inspect", image, "--format={{index .RepoDigests 0}}"],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=30,
-        ).stdout.strip()
+        data = json.loads(
+            subprocess.run(
+                ["docker", "image", "inspect", image],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30,
+            ).stdout
+        )
+        if not data:
+            return "", ""
+        info = data[0]
+        image_id = info.get("Id", "")
+        repo_digests = info.get("RepoDigests") or []
+        repo_digest = repo_digests[0] if repo_digests else ""
+        return image_id, repo_digest
     except Exception:
-        raw = ""
-    return raw or f"{image}:built-locally"
+        return "", ""
 
 
 def _profile_hash(root_dir: Path) -> str:
     """Return a hash of the profiles used for this validation."""
-    profiles = root_dir / "profiles.json"
-    if not profiles.exists():
-        return ""
-    return hashlib.sha256(profiles.read_bytes()).hexdigest()[:16]
+    return utils.file_hash(root_dir / "profiles.json")
+
+
+def _validation_path(root_dir: Path, *, success: bool = False) -> Path:
+    """Path to the current or last-known-good validation record."""
+    name = "validation-last-success.json" if success else "validation.json"
+    path = root_dir / ".hostai-vast" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def record_validation(
@@ -228,26 +234,43 @@ def record_validation(
     duration: float,
     errors: List[str],
     image: str = "hostai-test:latest",
+    level: str = "repo",
+    checks_run: Optional[List[str]] = None,
 ) -> ValidationRecord:
-    """Record a validation run and return the record."""
+    """Record a validation run and return the record.
+
+    Successful runs are also written to ``validation-last-success.json`` so
+    later ``--compare`` and ``hostai up`` checks always reference the last
+    *successful* validation, not the most recent (possibly failed) attempt.
+    """
     commit, dirty = _git_info(root_dir)
+    image_id, image_digest = _image_info(image)
     record = ValidationRecord(
         timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         result=result,
         duration_seconds=duration,
         git_commit=commit,
         dirty=dirty,
-        image_digest=_image_digest(image),
+        image=image,
+        image_id=image_id,
+        image_digest=image_digest,
         profile_hash=_profile_hash(root_dir),
         errors=errors,
+        level=level,
+        checks_run=checks_run or [],
     )
     _validation_path(root_dir).write_text(json.dumps(record.to_dict(), indent=2))
+    if result == "ok" and level == "production":
+        _validation_path(root_dir, success=True).write_text(json.dumps(record.to_dict(), indent=2))
     return record
 
 
-def load_last_validation(root_dir: Path) -> Optional[ValidationRecord]:
-    path = _validation_path(root_dir)
+def load_last_validation(root_dir: Path, *, success: bool = False) -> Optional[ValidationRecord]:
+    path = _validation_path(root_dir, success=success)
     if not path.exists():
+        # Fall back to the current record if no success record exists.
+        if success:
+            return load_last_validation(root_dir, success=False)
         return None
     try:
         return ValidationRecord.from_dict(json.loads(path.read_text()))
@@ -260,24 +283,39 @@ def validation_digest(record: ValidationRecord) -> str:
     hasher = hashlib.sha256()
     hasher.update(record.git_commit.encode())
     hasher.update(str(record.dirty).encode())
+    hasher.update(record.image.encode())
+    hasher.update(record.image_id.encode())
     hasher.update(record.image_digest.encode())
     hasher.update(record.profile_hash.encode())
+    hasher.update(record.level.encode())
+    for check in record.checks_run:
+        hasher.update(check.encode())
     return hasher.hexdigest()[:16]
 
 
 def compare_validations(current: ValidationRecord, previous: ValidationRecord) -> List[str]:
     """Return a list of human-readable drift messages between two records."""
     diffs: List[str] = []
+    if current.image != previous.image:
+        diffs.append(f"validation image changed: {previous.image} -> {current.image}")
     if current.git_commit != previous.git_commit:
         diffs.append(
             f"git commit changed: {previous.git_commit[:12]} -> {current.git_commit[:12]}"
         )
     if current.dirty != previous.dirty:
         diffs.append(f"working tree dirty state changed: {previous.dirty} -> {current.dirty}")
+    if current.image_id != previous.image_id:
+        diffs.append(
+            f"integration image ID changed: {previous.image_id[:31]}... -> {current.image_id[:31]}..."
+        )
     if current.image_digest != previous.image_digest:
-        diffs.append(f"integration image changed: {previous.image_digest} -> {current.image_digest}")
+        diffs.append(
+            f"integration image digest changed: {previous.image_digest} -> {current.image_digest}"
+        )
     if current.profile_hash != previous.profile_hash:
         diffs.append(f"profiles.json changed: {previous.profile_hash} -> {current.profile_hash}")
+    if current.level != previous.level:
+        diffs.append(f"validation level changed: {previous.level} -> {current.level}")
     return diffs
 
 

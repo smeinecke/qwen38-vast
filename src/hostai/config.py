@@ -167,6 +167,7 @@ class VastSection:
     bid_price: Optional[float] = None
     expected_session_seconds: Optional[int] = None
     watchdog_auto_start: bool = False
+    require_production_validation: bool = False
 
 
 @dataclass
@@ -296,6 +297,7 @@ ENV_MAP: Dict[str, tuple[str, str, Optional[Type[Any]]]] = {
     "HOSTAI_BID_PRICE": ("vast", "bid_price", float),
     "HOSTAI_EXPECTED_SESSION_SECONDS": ("vast", "expected_session_seconds", int),
     "HOSTAI_WATCHDOG_AUTO_START": ("vast", "watchdog_auto_start", bool),
+    "HOSTAI_REQUIRE_PRODUCTION_VALIDATION": ("vast", "require_production_validation", bool),
     "HOSTAI_SLOT_CACHE_ENABLED": ("cache", "enabled", bool),
     "HOSTAI_SLOT_CACHE_HOST": ("cache", "host", str),
     "HOSTAI_SLOT_CACHE_PORT": ("cache", "port", int),

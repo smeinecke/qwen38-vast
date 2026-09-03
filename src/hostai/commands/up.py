@@ -21,6 +21,7 @@ from hostai.config import Config, image_for_profile
 from hostai.profiles import Profiles
 from hostai.providers import get_provider
 from hostai.state import State, init_run_dir, runs_dir, state_dir
+from hostai.validate import ValidationRecord, _image_info, compare_validations, load_last_validation
 
 
 def _provider(config: Config):
@@ -44,6 +45,7 @@ def _provider(config: Config):
 @click.option("--expected-session", help="Expected session duration, e.g. 30m, 2h.")
 @click.option("--dry-run", is_flag=True, help="Search and print the chosen offer without renting.")
 @click.option("--scoring-mode", help="Override market scoring mode (dph, perf, session).")
+@click.option("--allow-unvalidated", is_flag=True, help="Skip the production-validation gate when [vast].require_production_validation is true.")
 @click.pass_obj
 def cmd_up(
     config: Config,
@@ -63,6 +65,7 @@ def cmd_up(
     expected_session: Optional[str],
     dry_run: bool,
     scoring_mode: Optional[str],
+    allow_unvalidated: bool,
 ):
     chosen_profile = profile or profile_opt or config.hostai.default_profile
     if not chosen_profile:
@@ -118,7 +121,64 @@ def cmd_up(
             bid_price=bid_price,
             session_seconds=session_seconds,
             dry_run=dry_run,
+            allow_unvalidated=allow_unvalidated,
         )
+
+
+def _check_production_validation(config: Config, allow_unvalidated: bool) -> None:
+    """Block a Vast launch unless a current production validation exists.
+
+    When `[vast].require_production_validation` is true, this compares the
+    working tree against the last successful `hostai validate --production` run.
+    If the git commit, dirty state, integration image, or profiles have drifted,
+    we refuse to call Vast unless the user passes --allow-unvalidated.
+    """
+    if config.provider.backend != "vast":
+        return
+    if not config.vast.require_production_validation:
+        return
+    if allow_unvalidated:
+        click.echo("[validation] --allow-unvalidated set; skipping production validation gate", err=True)
+        return
+
+    previous = load_last_validation(config.root_dir, success=True)
+    if previous is None:
+        raise click.ClickException(
+            "[validation] no successful production validation on record. "
+            "Run 'hostai validate --production' before a real Vast rental, "
+            "or pass --allow-unvalidated."
+        )
+    if previous.level != "production" or "integration-tests" not in previous.checks_run:
+        raise click.ClickException(
+            "[validation] the last successful validation was not a production validation. "
+            "Run 'hostai validate --production', or pass --allow-unvalidated."
+        )
+
+    current_image_id, current_image_digest = _image_info(previous.image)
+    current_record = ValidationRecord(
+        timestamp="",
+        result="ok",
+        duration_seconds=0.0,
+        git_commit=utils.git_commit(config.root_dir) or "",
+        dirty=utils.is_dirty_tree(config.root_dir),
+        image=previous.image,
+        image_id=current_image_id,
+        image_digest=current_image_digest,
+        profile_hash=utils.file_hash(config.root_dir / "profiles.json"),
+        errors=[],
+        level="production",
+        checks_run=["integration-tests"],
+    )
+    diffs = compare_validations(current_record, previous)
+    if diffs:
+        for d in diffs:
+            click.echo(f"[validation] DRIFT: {d}", err=True)
+        raise click.ClickException(
+            "[validation] current state does not match the last successful production validation. "
+            "Run 'hostai validate --production' again, or pass --allow-unvalidated."
+        )
+
+    click.echo("[validation] production validation gate passed")
 
 
 def _now_rfc() -> str:
@@ -553,6 +613,7 @@ def _do_fresh(
     bid_price: Optional[float] = None,
     session_seconds: Optional[int] = None,
     dry_run: bool = False,
+    allow_unvalidated: bool = False,
 ) -> None:
     sdir = state_dir(config.root_dir)
     existing = sdir / "state.json"
@@ -592,6 +653,7 @@ def _do_fresh(
         click.echo(f"[search]  mode={offer_type} max_dph=${configured_max_dph:.4f}/h")
     provider = _provider(config)
     click.echo(f"[provider] {provider.name}")
+    _check_production_validation(config, allow_unvalidated)
 
     offer_data = market.select_offer(
         config,
