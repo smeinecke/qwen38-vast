@@ -18,6 +18,9 @@ from vastai.api.instances import (
     start_instance,
     stop_instance,
 )
+from vastai.api.instances import (
+    logs as fetch_logs,
+)
 from vastai.api.offers import search_offers
 from vastai.api.query import offers_alias, offers_fields, offers_mult, parse_order, parse_query
 
@@ -80,6 +83,27 @@ def get_instance(config: Config, instance_id: int) -> Optional[Dict[str, Any]]:
     """Return a single instance by ID."""
     client = _client(_api_key(config), timeout=120.0)
     return show_instance(client, instance_id)
+
+
+def get_instance_logs(
+    config: Config,
+    instance_id: int,
+    *,
+    tail: Optional[int] = 100,
+    daemon_logs: bool = False,
+    timeout: float = 30.0,
+) -> Optional[str]:
+    """Fetch container or daemon logs for an instance.
+
+    Returns the log text, or None if the logs are not yet available."""
+    client = _client(_api_key(config), timeout=timeout)
+    try:
+        result = fetch_logs(client, instance_id, tail=tail, daemon_logs=daemon_logs)
+    except TimeoutError:
+        return None
+    if isinstance(result, str):
+        return result
+    return None
 
 
 def create_instance_from_offer(

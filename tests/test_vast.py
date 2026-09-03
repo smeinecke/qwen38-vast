@@ -5,7 +5,6 @@ from unittest import mock
 import pytest
 
 from hostai import vast
-from hostai.config import Config
 
 
 def config_with_key(config):
@@ -102,3 +101,18 @@ def test_create_instance_from_offer(config):
     assert create.call_args.kwargs["disk"] == 100
     assert create.call_args.kwargs["env"] == {"FOO": "bar"}
     assert create.call_args.kwargs["price"] == 0.5
+
+
+def test_get_instance_logs_returns_none_for_dict(config):
+    """SDK may return a dict when logs are not yet ready; we coerce to None."""
+    config = config_with_key(config)
+    with mock.patch("hostai.vast.fetch_logs", return_value={"not_ready": True}):
+        logs = vast.get_instance_logs(config, 123)
+    assert logs is None
+
+
+def test_get_instance_logs_returns_text(config):
+    config = config_with_key(config)
+    with mock.patch("hostai.vast.fetch_logs", return_value="line1\nline2"):
+        logs = vast.get_instance_logs(config, 123)
+    assert logs == "line1\nline2"
