@@ -4,8 +4,6 @@ import socket
 from pathlib import Path
 from unittest import mock
 
-import pytest
-
 from hostai import ssh
 from hostai.ssh import CompletedProcess, resolve_ssh_endpoint, run_remote
 
@@ -44,6 +42,14 @@ def test_resolve_ssh_endpoint_public_ip():
 
 def test_resolve_ssh_endpoint_missing():
     assert resolve_ssh_endpoint({}) is None
+
+
+def test_resolve_ssh_endpoint_ignores_machine_management_port():
+    inst = {
+        "public_ipaddr": "203.0.113.4",
+        "machine_dir_ssh_port": 2222,
+    }
+    assert resolve_ssh_endpoint(inst) is None
 
 
 def test_is_tunnel_healthy_open(config, running_state):

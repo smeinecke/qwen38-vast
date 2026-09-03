@@ -6,10 +6,9 @@ import base64
 import json
 import re
 import secrets
-import shlex
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 
 import click
 
@@ -23,6 +22,7 @@ from hostai.vast import (
     create_instance_from_offer,
     destroy,
     get_instance,
+    get_instance_logs,
     search_instance_offers,
 )
 from hostai.vast import (
@@ -179,6 +179,9 @@ def _build_query(
     if offer is None and "dph" not in query:
         query += f" dph_total <= {max_dph}"
 
+    # Exclude the consistently slow/unstable China RTX 5090 host.
+    query += " machine_id != 148003"
+
     return query, max_dph
 
 
@@ -268,6 +271,10 @@ def _env_dict(
         env["CACHE_TYPE_K"] = config.model.cache_type_k
     if config.model.cache_type_v and config.model.cache_type_v != "default":
         env["CACHE_TYPE_V"] = config.model.cache_type_v
+
+    # Vast maps container port 22 to a public host port in args/entrypoint mode.
+    env["-p 22:22"] = "1"
+
     cache_configured = config.cache.host or config.cache.rclone_url or config.cache.rclone_remote
     if not no_cache and config.cache.enabled and cache_configured:
         env["HOSTAI_SLOT_CACHE_ENABLED"] = "1"
@@ -295,17 +302,42 @@ def _env_dict(
 
 
 def _extra_args(config: Config) -> str:
-    parts = ["-p 22:22"]
+    parts = []
     if config.vast.shm_size_gb:
         parts.append(f"--shm-size={config.vast.shm_size_gb}g")
     return " ".join(parts)
+
+
+def _emit_instance_logs(config: Config, instance_id: int, seen: Dict[str, Set[str]]) -> None:
+    """Fetch and emit any new container/daemon log lines from Vast."""
+    for kind, daemon in (("container", False), ("daemon", True)):
+        try:
+            text = get_instance_logs(
+                config,
+                instance_id,
+                tail=50,
+                daemon_logs=daemon,
+                timeout=15.0,
+            )
+        except Exception:
+            # Logs may not be ready while the container is still starting.
+            continue
+        if not text or not isinstance(text, str):
+            continue
+        for line in text.splitlines():
+            line = line.rstrip()
+            if not line or line in seen[kind]:
+                continue
+            seen[kind].add(line)
+            click.echo(f"[logs:{kind}] {line}")
 
 
 def _wait_for_ssh_endpoint(config: Config, state: State, timeout: int) -> None:
     if not state.instance_id:
         raise click.ClickException("no instance id in state")
     start = _now_epoch()
-    last_log = 0
+    last_status = 0
+    seen_log_lines: Dict[str, Set[str]] = {"container": set(), "daemon": set()}
     while True:
         now = _now_epoch()
         if now - start > timeout:
@@ -325,13 +357,14 @@ def _wait_for_ssh_endpoint(config: Config, state: State, timeout: int) -> None:
             state.save()
             click.echo(f"[ssh] endpoint discovered: {state.ssh_url}")
             return
-        if now - last_log >= 15:
-            last_log = now
+        if now - last_status >= 15:
+            last_status = now
             host = inst.get("public_ipaddr") or inst.get("public_ip") or "?"
             ports = inst.get("ports") or {}
-            tcp = ports.get("22/tcp") or [{}]
-            port = tcp[0].get("HostPort") if tcp else "?"
+            tcp = ports.get("22/tcp") or []
+            port = tcp[0].get("HostPort") if tcp and isinstance(tcp[0], dict) else "?"
             click.echo(f"[boot] status={status} | ssh={host}:{port} | waiting...")
+            _emit_instance_logs(config, state.instance_id, seen_log_lines)
         time.sleep(5)
 
 
@@ -437,31 +470,9 @@ def _prefetch_slot_cache_to_vast(
 
     if config.cache.rclone:
         script = cache.rclone_prefetch_script(config, slot_dir, remote_dir)
-        res = ssh.run_remote(ssh_url, "bash -s", input_data=script, known_hosts=known_hosts, timeout=1800)
-        return res.returncode == 0 and "ok" in (res.stdout or "")
-
-    script = """set -Eeuo pipefail
-umask 077
-cache_host="$1"; cache_port="$2"; cache_user="$3"; remote_dir="$4"; slot_dir="$5"; cache_root="$6"
-key=/root/.ssh/qwen-slot-cache
-known=/root/.ssh/qwen-slot-cache-known_hosts
-mkdir -p /root/.ssh
-touch "$known"
-chmod 600 "$known"
-ssh_base="ssh -n -i $key -p $cache_port -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$known"
-$ssh_base "${cache_user}@${cache_host}" "mkdir -p '$remote_dir' && chmod 700 '$cache_root' '$cache_root/'* 2>/dev/null || true; mkdir -p '$remote_dir'"
-mkdir -p "$slot_dir"
-chmod 700 "$slot_dir"
-rsync -av -e "ssh -i $key -p $cache_port -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$known" "${cache_user}@${cache_host}:${remote_dir}/current.bin" "$slot_dir/.current.bin.part" < /dev/null
-rsync -av -e "ssh -i $key -p $cache_port -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$known" "${cache_user}@${cache_host}:${remote_dir}/current.json" "$slot_dir/.current.json.part" < /dev/null
-mv -f "$slot_dir/.current.bin.part" "$slot_dir/current.bin"
-mv -f "$slot_dir/.current.json.part" "$slot_dir/current.json"
-chmod 600 "$slot_dir/current.bin" "$slot_dir/current.json"
-echo "ok"
-"""
-    args = [config.cache.host, str(config.cache.port), config.cache.user, remote_dir, slot_dir, config.cache.root]
-    arg_str = " ".join(shlex.quote(str(a)) for a in args)
-    res = ssh.run_remote(ssh_url, f"bash -s {arg_str}", input_data=script, known_hosts=known_hosts, timeout=1800)
+    else:
+        script = cache.rsync_prefetch_script(config, slot_dir, remote_dir)
+    res = ssh.run_remote(ssh_url, "bash -s", input_data=script, known_hosts=known_hosts, timeout=330)
     return res.returncode == 0 and "ok" in (res.stdout or "")
 
 
@@ -484,12 +495,13 @@ def _do_fresh(
         if old.instance_id:
             try:
                 inst = get_instance(config, old.instance_id)
-                if inst and (inst.get("actual_status") or inst.get("status")) not in ("exited", "offline"):
-                    raise click.ClickException(
-                        f"state file already references instance {old.instance_id}; run hostai down first"
-                    )
             except Exception:
-                pass
+                # Could not reach Vast to verify; proceed rather than hard-block.
+                inst = None
+            if inst and (inst.get("actual_status") or inst.get("status")) not in ("exited", "offline"):
+                raise click.ClickException(
+                    f"state file already references instance {old.instance_id}; run hostai down first"
+                )
 
     profiles, profile, image = _resolve_profile(config, profile_name)
     ctx_size = config.hostai.ctx_size_override if config.hostai.ctx_size_override else profile.ctx_size
@@ -574,8 +586,8 @@ def _do_fresh(
             env=env,
             label=label,
             extra=extra,
-            runtype=None,
-            args="qwen38",
+            runtype="args",
+            args=None,
             volume_info=volume_info,
         )
     except Exception as exc:
@@ -651,7 +663,7 @@ def _do_fresh_core(
     _wait_for_ssh_endpoint(config, state, config.ssh.start_timeout)
 
     known_hosts = state.state_file.parent / "known_hosts"
-    if not ssh.wait_for_ssh(state.ssh_url, known_hosts=known_hosts, timeout=120):
+    if not ssh.wait_for_ssh(state.ssh_url, known_hosts=known_hosts, timeout=300):
         raise click.ClickException("SSH daemon did not become reachable")
     click.echo("[ssh] connection ready")
 
@@ -807,7 +819,7 @@ def _do_restart(
 
     _wait_for_ssh_endpoint(config, state, config.ssh.start_timeout)
     known_hosts = state.state_file.parent / "known_hosts"
-    if not ssh.wait_for_ssh(state.ssh_url, known_hosts=known_hosts, timeout=120):
+    if not ssh.wait_for_ssh(state.ssh_url, known_hosts=known_hosts, timeout=300):
         raise click.ClickException("SSH daemon did not become reachable")
 
     # cache setup for restart

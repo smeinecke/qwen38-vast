@@ -169,6 +169,6 @@ ENV PATH="/venv/main/bin:${PATH}" \
 
 WORKDIR /models
 
-# qwen-up requests `-p 22:22` explicitly. Vast maps that container port to a
+# hostai up requests `-p 22:22` explicitly. Vast maps that container port to a
 # random external host port; the scripts discover it from show-instance JSON.
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
