@@ -1,9 +1,15 @@
 # Copy to hostai.toml and edit for your account.
-# Secrets (VAST_API_KEY, HF_TOKEN, SSH_PUBLIC_KEY) still live in .env.
+# Secrets (VAST_API_KEY, HF_TOKEN, SSH_PUBLIC_KEY, cache rclone passwords) still
+# live in .env.
 
 [hostai]
 default_profile = "a6000"
 profiles_file = "profiles.json"
+# Override context size for all profiles (optional; normally set per-profile).
+# ctx_size_override = 131072
+# One-off Vast query override (optional).  Use with care: this bypasses profile
+# disk and context handling.
+# gpu_query_override = ""
 
 [market]
 max_dph = 0.80
@@ -16,6 +22,7 @@ disk_gb = 35
 # Set to 0.0 to require free traffic.  Also included in session-cost scoring.
 max_inet_down_cost = 0.001
 max_inet_up_cost = 0.001
+allow_unverified = false
 # Scoring: dph | perf | session
 scoring_mode = "dph"
 scoring_prompt_weight = 0.3
@@ -48,8 +55,8 @@ unsecure = false
 
 [vast]
 # Optional persistent volume for model files.
-# volume_id = ""
-# volume_mount_path = "/models"
+volume_id = ""
+volume_mount_path = ""
 shm_size_gb = ""
 keep_on_failure = false
 destroy_timeout_seconds = 45
@@ -76,19 +83,29 @@ session = "default"
 use_shm = false
 shm_min_gb = 0
 shm_require = false
+# Local SSH private key path (optional; a key is generated automatically if empty).
+key = ""
+# Fixed slot ID to load on cold start (0 = use first available).
+slot_id = 0
+# Override the local directory used to stage slot cache files.
+local_dir = ""
+# Treat a failed cache save as a fatal shutdown error.
+require_save = false
 # Set rclone = true to use rclone instead of SSH/rsync.
 rclone = false
-# rclone_remote = "mywebdav"
-# rclone_type = "webdav"
-# rclone_url = "https://your-cache-server.example.com/"
-# rclone_user = "qwen-cache"
-# rclone_password = ""
+rclone_remote = ""
+rclone_type = ""
+rclone_url = ""
+rclone_user = ""
+rclone_password = ""
 
 [monitor]
 threshold_pct = 10
 interval = 180
 max_results = 5
 auto_start = false
+profile = ""
+group = ""
 
 [ssh]
 local_port = 18080
@@ -98,3 +115,12 @@ start_timeout = 1200
 [bench]
 max_tokens = 512
 timeout = 900
+temperature = 0.7
+
+[proxy]
+# Tokenize prompts locally before forwarding them to the remote llama-server.
+tokenized_only = false
+socket_path = ""
+port = 0
+tokenizer_model = "Qwen/Qwen3.8-27B"
+cache_dir = ""
