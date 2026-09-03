@@ -38,6 +38,7 @@ def test_resolve_query_basic(config):
 
     query, max_dph, ctx_size = _resolve_query(config, profiles, profile, None, False)
     assert "RTX 4090" in query
+    assert f"disk_space>={config.market.disk_gb}" in query
     assert max_dph == 1.0
     assert ctx_size == 32768
 
@@ -124,7 +125,7 @@ def test_cmd_lookup_with_offers(config, project_dir):
     assert "RTX 4090" in result.output
     assert search.call_count == 1
     assert "RTX 4090" in search.call_args.args[1]
-    assert search.call_args.kwargs == {"limit": 50, "order": "dph_total", "storage": 100}
+    assert search.call_args.kwargs == {"limit": 50, "order": "dph_total", "storage": config.market.disk_gb}
 
 
 def test_cmd_lookup_invalid_max_results(config):

@@ -81,11 +81,56 @@ download_file() {
   hf download "$HF_REPO" "$filename" --revision "$HF_REVISION" --local-dir "$MODEL_DIR"
 }
 
+record_disk_usage() {
+  local stage="$1"
+  HOSTAI_DISK_STAGE="$stage" python3 - <<'PY'
+import json
+import os
+import subprocess
+import sys
+
+log_dir = os.environ.get("HOSTAI_LOG_DIR", "/dev/shm/qwen38/log")
+try:
+    df = subprocess.check_output(["df", "-B1", "/"], text=True).strip().splitlines()[1].split()
+    total_bytes = int(df[1])
+    used_bytes = int(df[2])
+    free_bytes = int(df[3])
+
+    def du(path):
+        if not os.path.exists(path):
+            return 0
+        try:
+            return int(subprocess.check_output(["du", "-sb", path], text=True).split()[0])
+        except Exception:
+            return 0
+
+    record = {
+        "stage": os.environ.get("HOSTAI_DISK_STAGE", "unknown"),
+        "total_bytes": total_bytes,
+        "used_bytes": used_bytes,
+        "free_bytes": free_bytes,
+        "models_bytes": du("/models"),
+        "slots_disk_bytes": du("/var/lib/qwen38/slots"),
+        "slots_shm_bytes": du("/dev/shm/qwen38/slots"),
+        "log_bytes": du(log_dir),
+        "run_bytes": du("/run/qwen38"),
+        "tmp_bytes": du("/dev/shm/qwen38/tmp"),
+    }
+    os.makedirs(log_dir, exist_ok=True)
+    with open(os.path.join(log_dir, "disk-usage.log"), "a") as f:
+        f.write(json.dumps(record) + "\n")
+except Exception as e:
+    print(f"[disk-usage] could not record {os.environ.get('HOSTAI_DISK_STAGE', 'unknown')}: {e}", file=sys.stderr)
+PY
+}
+
 # The model repository is publicly downloadable at the time this image was
 # prepared. HF_TOKEN is optional; huggingface_hub will automatically use it if
 # supplied (for rate limits or if upstream access rules change later).
 
+record_disk_usage "after-preflight"
 download_file "$MODEL"
+record_disk_usage "after-main-model"
 
 server_args=(
   --model "$MODEL_DIR/$MODEL"
@@ -133,6 +178,7 @@ fi
 
 if [[ "$USE_FASTMTP" == "1" ]]; then
   download_file "$DRAFT"
+  record_disk_usage "after-draft-model"
   server_args+=(
     --spec-draft-model "$MODEL_DIR/$DRAFT"
     --spec-draft-ngl all
@@ -196,6 +242,8 @@ else
     llama_bind="unix://$llama_socket"
   fi
 fi
+
+record_disk_usage "before-serve"
 
 echo "[serve] profile=$HOSTAI_PROFILE model=$MODEL revision=$HF_REVISION ctx=$CTX_SIZE fastmtp=$USE_FASTMTP bind=$llama_bind slot_save_path=$SLOT_SAVE_PATH"
 echo "[runtime] GPU snapshot:"

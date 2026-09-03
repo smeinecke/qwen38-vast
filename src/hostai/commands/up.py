@@ -7,7 +7,7 @@ import json
 import secrets
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import click
 
@@ -358,6 +358,89 @@ def _wait_for_api(config: Config, state: State, timeout: int, client: LlamaClien
                 pass
         time.sleep(interval)
         interval = min(interval * 2, 5.0)
+
+
+def _capture_disk_telemetry(config: Config, state: State, known_hosts: Path) -> Optional[Dict[str, Any]]:
+    """Capture container disk usage after a successful cold start.
+
+    Reads the disk-usage log written by ``start.sh`` and appends a final
+    snapshot so operators can verify that the allocated disk is realistically
+    sized.  Returns the combined telemetry or ``None`` if it could not be
+    gathered.
+    """
+    if not state.ssh_url:
+        return None
+
+    run_dir = state.run_dir
+    if not run_dir:
+        return None
+
+    log_path = "/var/log/qwen38/disk-usage.log"
+    res = ssh.run_remote(
+        state.ssh_url,
+        f"cat {log_path} 2>/dev/null || true",
+        known_hosts=known_hosts,
+        timeout=30,
+    )
+    records: List[Dict[str, Any]] = []
+    if res.stdout:
+        for line in res.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+
+    # Always capture a final snapshot in case the start.sh log is missing
+    # (older images) or the container's log path differs.
+    final_script = r'''python3 - <<'PY'
+import json, os, subprocess
+
+def du(path):
+    if not os.path.exists(path):
+        return 0
+    try:
+        return int(subprocess.check_output(["du", "-sb", path], text=True).split()[0])
+    except Exception:
+        return 0
+
+df = subprocess.check_output(["df", "-B1", "/"], text=True).strip().splitlines()[1].split()
+record = {
+    "stage": "up-final",
+    "total_bytes": int(df[1]),
+    "used_bytes": int(df[2]),
+    "free_bytes": int(df[3]),
+    "models_bytes": du("/models"),
+    "slots_disk_bytes": du("/var/lib/qwen38/slots"),
+    "slots_shm_bytes": du("/dev/shm/qwen38/slots"),
+    "log_bytes": du("/var/log/qwen38"),
+    "run_bytes": du("/run/qwen38"),
+    "tmp_bytes": du("/dev/shm/qwen38/tmp"),
+}
+print(json.dumps(record))
+PY'''
+    res2 = ssh.run_remote(state.ssh_url, final_script, known_hosts=known_hosts, timeout=60)
+    if res2.returncode == 0 and res2.stdout:
+        try:
+            record = json.loads(res2.stdout.strip().splitlines()[-1])
+            records.append(record)
+        except (json.JSONDecodeError, IndexError):
+            pass
+
+    if not records:
+        return None
+
+    telemetry = {
+        "captured_at": utils.now_rfc3339(),
+        "disk_gb": state.disk_gb,
+        "records": records,
+    }
+    out = run_dir / "disk-telemetry.json"
+    out.write_text(json.dumps(telemetry, indent=2, default=str) + "\n")
+    out.chmod(0o600)
+    return telemetry
 
 
 def _write_env_file(config: Config, state: State, api_url: str, base_url: str) -> None:
@@ -764,6 +847,11 @@ def _do_fresh_core(
     run_dir = state.run_dir
     if run_dir:
         state.save_metadata(run_dir, status="ready")
+
+    if run_dir and state.ssh_url:
+        telemetry = _capture_disk_telemetry(config, state, known_hosts)
+        if telemetry:
+            click.echo(f"[disk] telemetry: {len(telemetry['records'])} stages, free={telemetry['records'][-1]['free_bytes']/1e9:.2f}GB")
 
     click.echo("\nREADY")
     click.echo(f"  Profile:   {state.profile} (sm_{image.cuda_arch})")

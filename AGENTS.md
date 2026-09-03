@@ -20,3 +20,10 @@
 - `hostai up` can auto-start a watchdog when `watchdog_auto_start = true` is set in `[vast]`.
 - `hostai down` records shutdown-tail metrics and reuses the cache-save/telemetery path.
 - `hostai cost volume-break-even` estimates whether a persistent model volume is cheaper than re-downloading.
+
+## Container disk and model storage
+
+- The default `market.disk_gb` is 35, sized for the Q4_K_P main model (~16.7 GiB) + FastMTP draft (~0.84 GiB) + ~5 GiB image/runtime overhead + safety margin.
+- Do not put `disk_space>=N` constraints in `profiles.json` queries. `market.build_search_query` derives `disk_space>=N` from `resolved_disk_gb(profile, config)` so searches, lookups, and monitor checks stay consistent.
+- `start.sh` now logs per-stage disk usage (`after-preflight`, `after-main-model`, `after-draft-model`, `before-serve`) to `/dev/shm/qwen38/log/disk-usage.log`. `hostai up` copies this plus a final snapshot to `run-*/disk-telemetry.json` after a successful cold start.
+- The container image must be rebuilt after changes to `start.sh`.

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
+from hostai import market
+from hostai.config import Config
 from hostai.profiles import Profiles
 
 REQUIRED_FILES = (
@@ -48,7 +51,7 @@ PACKAGE_MODULES = (
 )
 
 
-def validate_repo(root_dir: Path) -> List[str]:
+def validate_repo(root_dir: Path, config: Optional[Config] = None) -> List[str]:
     """Validate the repository layout and return a list of error messages."""
     errors: List[str] = []
 
@@ -87,6 +90,24 @@ def validate_repo(root_dir: Path) -> List[str]:
                 errors.append("profiles.json has no profiles")
             if not profiles.resolve_profile(profiles.default_profile):
                 errors.append(f"default profile '{profiles.default_profile}' not found in profiles.json")
+
+            # Any explicit disk_space constraint in a profile query will be
+            # replaced by the resolved disk allocation.  Flag values that are
+            # lower than the resolved disk as contradictions.
+            if config is not None:
+                disk_space_pat = re.compile(r"\s*disk_space\s*(>=?|<=?|=)\s*([^\s]+)")
+                for p in profiles.profiles:
+                    disk_gb = market.resolved_disk_gb(p, config)
+                    for m in disk_space_pat.finditer(p.gpu_query):
+                        try:
+                            val = float(m.group(2))
+                        except ValueError:
+                            continue
+                        if val < disk_gb:
+                            errors.append(
+                                f"profile {p.name}: gpu_query disk_space>={val} is lower "
+                                f"than resolved disk_gb={disk_gb}"
+                            )
 
     dockerfile = root_dir / "Dockerfile"
     if dockerfile.exists():

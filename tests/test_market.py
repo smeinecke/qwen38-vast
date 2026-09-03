@@ -30,6 +30,7 @@ def test_build_search_query_includes_zero_traffic_costs(config):
     """A zero max transfer cost must still be written into the query."""
     config.market.max_inet_down_cost = 0.0
     config.market.max_inet_up_cost = 0.0
+    config.market.disk_gb = 80
     profiles = Profiles(
         schema_version=1,
         images=[],
@@ -40,6 +41,7 @@ def test_build_search_query_includes_zero_traffic_costs(config):
     query, _ = market.build_search_query(config, profiles, make_profile())
     assert "inet_down_cost<=0.0" in query
     assert "inet_up_cost<=0.0" in query
+    assert "disk_space>=80" in query
 
 
 def test_build_search_query_appends_max_dph_when_offer_not_given(config):
@@ -55,6 +57,23 @@ def test_build_search_query_appends_max_dph_when_offer_not_given(config):
     assert max_dph == 0.4
 
 
+def test_build_search_query_replaces_stale_disk_space(config):
+    """Any disk_space in the profile query is replaced by the resolved disk_gb."""
+    config.market.disk_gb = 80
+    profiles = Profiles(
+        schema_version=1,
+        images=[],
+        profiles=[make_profile(query="gpu_name == RTX_4090 disk_space>=200")],
+        monitor_hardware=MonitorHardware(),
+        market_policy=MarketPolicy(require_free_traffic=False),
+    )
+    query, _ = market.build_search_query(config, profiles, profiles.profiles[0])
+    assert "disk_space>=200" not in query
+    assert "disk_space>=80" in query
+    # Only one disk_space constraint should remain.
+    assert query.count("disk_space") == 1
+
+
 def test_resolved_disk_gb_uses_profile_override(config):
     profile = make_profile(disk_gb=175)
     assert market.resolved_disk_gb(profile, config) == 175
@@ -63,6 +82,14 @@ def test_resolved_disk_gb_uses_profile_override(config):
 def test_resolved_disk_gb_falls_back_to_market(config):
     config.market.disk_gb = 80
     assert market.resolved_disk_gb(make_profile(), config) == 80
+
+
+def test_resolved_disk_gb_independent_of_ctx_size(config):
+    """Large context alone must not inflate the persistent disk requirement."""
+    config.market.disk_gb = 35
+    big_ctx = make_profile(disk_gb=None, query="gpu_name == RTX_4090")
+    big_ctx.ctx_size = 262144
+    assert market.resolved_disk_gb(big_ctx, config) == 35
 
 
 def test_is_same_or_better_gpu_rejects_worse_rank():
@@ -170,8 +197,8 @@ def test_score_offers_session_mode_prefers_short_startup(config):
 def test_offer_download_estimate_prefers_network_bandwidth(config):
     offer = {"inet_down": 1000, "disk_bw": 200}
     size, seconds, _ = market.offer_download_estimate(offer, config)
-    # 25 GB model + 5 GB image at 1000 Mbps ~ (30*8*1000)/1000 = 240s plus extraction slower
-    assert size == 30.0
+    # 18.83 GB model + 5 GB image at 1000 Mbps ~ (23.83*8*1000)/1000 = 191s plus extraction slower
+    assert size == 23.83
     assert seconds > 0
 
 

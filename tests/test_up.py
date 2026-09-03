@@ -98,6 +98,10 @@ def test_do_fresh_uses_resolved_profile_disk(config, project_dir):
 
     assert select.call_args.kwargs["storage"] == 150
     assert create.call_args.kwargs["disk"] == 150
+    # The search query must derive the host disk-space eligibility from the
+    # same resolved disk allocation.
+    query = select.call_args.args[2]
+    assert "disk_space>=150" in query
 
 
 def test_do_fresh_falls_back_to_market_disk_when_profile_has_none(config, project_dir):
@@ -113,6 +117,8 @@ def test_do_fresh_falls_back_to_market_disk_when_profile_has_none(config, projec
         _do_fresh(config, "test", None, None, None, False, False, False, False, None)
 
     assert select.call_args.kwargs["storage"] == config.market.disk_gb
+    query = select.call_args.args[2]
+    assert f"disk_space>={config.market.disk_gb}" in query
 
 
 def test_do_fresh_uses_bid_price_for_interruptible(config, project_dir):

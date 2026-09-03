@@ -7,7 +7,10 @@ profiles_file = "profiles.json"
 
 [market]
 max_dph = 0.80
-disk_gb = 100
+# Container disk (GB).  For the default Q4_K_P main model (16.7 GiB) plus the
+# FastMTP draft (0.84 GiB) plus ~5 GiB of image/runtime overhead and a safety
+# margin, 35 GB is the conservative target.  Override per-profile with disk_gb.
+disk_gb = 35
 max_inet_down_cost = 0.001
 max_inet_up_cost = 0.001
 # Scoring: dph | perf | session
@@ -17,7 +20,8 @@ scoring_decode_weight = 0.7
 min_historical_samples = 3
 max_history_age_days = 30
 # Estimated model+image download size used for startup/session-cost scoring.
-model_download_gb = 25.0
+# 18.83 decimal GB = Q4_K_P main (17.92) + FastMTP-32K draft (0.90).
+model_download_gb = 18.83
 image_size_gb = 5.0
 
 [model]

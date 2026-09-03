@@ -109,7 +109,7 @@ class HostaiSection:
 @dataclass
 class MarketSection:
     max_dph: float = 0.80
-    disk_gb: int = 100
+    disk_gb: int = 35
     allow_unverified: bool = False
     max_inet_down_cost: float = 0.001
     max_inet_up_cost: float = 0.001
@@ -118,7 +118,8 @@ class MarketSection:
     scoring_decode_weight: float = 0.7
     min_historical_samples: int = 3
     max_history_age_days: int = 30
-    model_download_gb: float = 25.0
+    # 18.83 decimal GB is the default Q4_K_P main model (17.92) + FastMTP-32K draft (0.90).
+    model_download_gb: float = 18.83
     image_size_gb: float = 5.0
 
 

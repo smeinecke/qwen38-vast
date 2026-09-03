@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 import statistics
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -40,7 +41,7 @@ class OfferScore:
 
 def resolved_disk_gb(profile: Optional[Profile], config: Config) -> int:
     """Return the disk size for a profile, falling back to the global market default."""
-    if profile is not None and profile.disk_gb is not None:
+    if profile is not None and isinstance(profile.disk_gb, (int, float)) and not isinstance(profile.disk_gb, bool):
         return int(profile.disk_gb)
     return int(config.market.disk_gb)
 
@@ -96,14 +97,18 @@ def build_search_query(
     """Build a Vast query string from profile and config.
 
     Traffic-cost constraints are appended explicitly with ``<=`` and use the
-    configured values, including ``0``.  This keeps ``hostai up`` and the
-    monitor on the same search semantics.
+    configured values, including ``0``.  The resolved disk allocation is the
+    single source of truth for the ``disk_space`` host-eligibility constraint.
+    Any ``disk_space`` clause already present in the profile query is replaced.
+
+    This keeps ``hostai up`` and the monitor on the same search semantics.
     """
     if max_price is not None and max_price < 0:
         raise click.ClickException("--max-price must be non-negative")
 
     max_dph = max_price if max_price is not None else config.market.max_dph
     query = config.hostai.gpu_query_override or profile.gpu_query
+    disk_gb = resolved_disk_gb(profile, config)
 
     if unverified:
         query = re.sub(r"\s*reliability\s*(>=?|<=?|=)\s*[^\s]+", "", query)
@@ -116,6 +121,27 @@ def build_search_query(
 
     if offer is None and "dph" not in query:
         query += f" dph_total <= {max_dph}"
+
+    # Replace any explicit disk_space constraint with the resolved disk
+    # allocation.  A value lower than the resolved allocation would be a
+    # contradiction: we could ask a host with less free disk than we intend
+    # to rent.  Warnings preserve traceability without failing a search.
+    disk_space_pattern = re.compile(r"\s*disk_space\s*(>=?|<=?|=)\s*([^\s]+)")
+    for m in disk_space_pattern.finditer(query):
+        try:
+            val = float(m.group(2))
+        except ValueError:
+            continue
+        if val < disk_gb:
+            warnings.warn(
+                f"profile {profile.name}: gpu_query disk_space>={val} is lower "
+                f"than resolved disk_gb={disk_gb}; using {disk_gb}",
+                stacklevel=2,
+            )
+
+    query = disk_space_pattern.sub(" ", query)
+    query = re.sub(r"\s+", " ", query).strip()
+    query += f" disk_space>={disk_gb}"
 
     # Exclude the consistently slow/unstable China RTX 5090 host.
     query += " machine_id != 148003"

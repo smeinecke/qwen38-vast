@@ -1,13 +1,13 @@
 import csv
 import io
 import json
-import re
 from typing import Any, Dict, List, Optional
 
 import click
 from rich.console import Console
 from rich.table import Table
 
+from hostai import market
 from hostai.config import Config
 from hostai.profiles import Profiles
 from hostai.vast import search_instance_offers
@@ -20,27 +20,18 @@ def _resolve_query(
     max_price: Optional[float],
     unverified: bool,
 ) -> tuple[str, float, int]:
+    """Build the Vast search query, deriving disk_space from resolved disk_gb."""
     if max_price is not None and max_price < 0:
         raise click.ClickException("--max-price must be non-negative")
-    max_dph = max_price if max_price is not None else config.market.max_dph
-    require_free = profiles.market_policy.require_free_traffic
-    max_down = config.market.max_inet_down_cost
-    max_up = config.market.max_inet_up_cost
 
-    query = str(config.hostai.gpu_query_override or profile.gpu_query)
+    query, max_dph = market.build_search_query(
+        config,
+        profiles,
+        profile,
+        max_price=max_price,
+        unverified=unverified,
+    )
     ctx_size = config.hostai.ctx_size_override or profile.ctx_size or 0
-
-    if unverified:
-        query = re.sub(r"\s*reliability\s*(>=?|<=?|=)\s*[^\s]+", "", query)
-        query = re.sub(r"\s+", " ", query).strip()
-        query += ' verification in ["verified","unverified","deverified"]'
-
-    if require_free:
-        query += f" inet_down_cost<={max_down} inet_up_cost<={max_up}"
-
-    if "dph" not in query:
-        query += f" dph_total <= {max_dph}"
-
     return query, max_dph, ctx_size
 
 
@@ -147,13 +138,15 @@ def cmd_lookup(config: Config, profile, profile_opt, max_price, unverified, max_
     click.echo(f"[profile] {selected.name} | sm_{image.cuda_arch} | ctx={ctx_size} | image={selected.image}")
     click.echo(f"[search]  {query}")
 
+    disk_gb = market.resolved_disk_gb(selected, config)
+
     try:
         offers = search_instance_offers(
             config,
             query,
             limit=50,
             order="dph_total",
-            storage=config.market.disk_gb,
+            storage=disk_gb,
         )
     except Exception as e:
         raise click.ClickException(f"search failed: {e}")

@@ -502,7 +502,11 @@ MAX_DPH=0.55
 Additional search and scoring controls live in `hostai.toml` under `[market]`
 and `[vast]`:
 
-- `disk_gb` — default disk allocation; can also be set per-profile with `disk_gb`
+- `disk_gb` — default container disk in GB; can also be set per-profile with `disk_gb`.
+  The default `35` is sized for the Q4_K_P main model (~16.7 GiB) plus FastMTP
+  draft (~0.84 GiB), ~5 GiB of image/runtime overhead, and a safety margin.
+  The `disk_space>=N` host-eligibility constraint is derived from this value
+  automatically, so do not hard-code `disk_space` in profile queries.
 - `max_inet_down_cost` / `max_inet_up_cost` — reject paid traffic beyond these
   USD/GB limits; set to `0.0` to require free traffic
 - `scoring_mode` — `dph` (default), `perf`, or `session`
@@ -516,8 +520,12 @@ query use `GPU_QUERY_OVERRIDE`.
 Example Europe-only override:
 
 ```dotenv
-GPU_QUERY_OVERRIDE='num_gpus=1 gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=800 disk_bw>=300 cuda_vers>=12.8 disk_space>=60 rented=False rentable=True direct_port_count>=1 geolocation in [DE,NL,FR,SE,FI]'
+GPU_QUERY_OVERRIDE='num_gpus=1 gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=800 disk_bw>=300 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1 geolocation in [DE,NL,FR,SE,FI]'
 ```
+
+After a successful `hostai up`, `run-*/disk-telemetry.json` records per-stage
+`df` and `du` data so you can verify the real container disk requirement and
+adjust `disk_gb` if needed.
 
 ## Runtime failure handling
 
