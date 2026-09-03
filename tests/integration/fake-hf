@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Fake `hf` CLI for integration tests: always claim success.
+set -euo pipefail
+
+echo "[fake-hf] args: $*"
+exit 0

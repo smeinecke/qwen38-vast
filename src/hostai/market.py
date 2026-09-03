@@ -17,9 +17,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import click
 
-from hostai import vast
 from hostai.config import Config
 from hostai.profiles import Profile, Profiles, re_normalize_gpu
+from hostai.providers import get_provider
 
 MAX_INET_DOWN_MBPS = 1.0
 MAX_DISK_BW_MBPS = 1.0
@@ -552,8 +552,8 @@ def search_offers(
     """
     search_limit = 100 if offer is not None else limit
     try:
-        return vast.search_instance_offers(
-            config,
+        provider = get_provider(config)
+        return provider.search_offers(
             query,
             limit=search_limit,
             order=order,

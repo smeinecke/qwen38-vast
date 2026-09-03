@@ -1,0 +1,74 @@
+# syntax=docker/dockerfile:1.7
+
+# Minimal local integration image for hostai LocalProvider.
+#
+# This image simulates the production qwen38-vast runtime without a real GPU or
+# model.  It runs sshd and a fake llama-server, so `hostai up` with
+# HOSTAI_PROVIDER=local can exercise the full SSH/tunnel/API lifecycle.
+
+FROM ubuntu:24.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+         ca-certificates \
+         openssh-server \
+         openssh-client \
+         python3 \
+         python3-pip \
+         curl \
+         netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -f /etc/ssh/ssh_host_* \
+    && mkdir -p /run/sshd /root/.ssh /etc/ssh/sshd_config.d /etc/qwen38/ssh \
+    && chmod 0700 /root/.ssh
+
+# Fake command-line tools that start.sh and the hostai client expect.
+COPY tests/integration/fake-hf /usr/local/bin/hf
+COPY tests/integration/fake-nvidia-smi /usr/local/bin/nvidia-smi
+COPY tests/integration/fake-llama-server /usr/local/bin/fake-llama-server
+RUN chmod 0755 /usr/local/bin/hf /usr/local/bin/nvidia-smi /usr/local/bin/fake-llama-server
+
+# The hostai client expects the server binary to be named llama-server and
+# support --version.  The real binary is replaced by a wrapper.
+COPY tests/integration/llama-server-wrapper /usr/local/bin/llama-server
+RUN chmod 0755 /usr/local/bin/llama-server
+
+# SSH initialization and container supervisor.
+COPY hostai-init-ssh.sh /usr/local/bin/hostai-init-ssh.sh
+COPY tests/integration/entrypoint.test.sh /usr/local/bin/entrypoint.sh
+COPY tests/integration/start.test.sh /usr/local/bin/start.sh
+RUN chmod 0755 /usr/local/bin/hostai-init-ssh.sh /usr/local/bin/entrypoint.sh /usr/local/bin/start.sh
+
+# Bake an empty authorized_keys placeholder; the runtime injects the test key.
+RUN touch /etc/qwen38/ssh/authorized_keys && chmod 0644 /etc/qwen38/ssh/authorized_keys
+
+# Fake build metadata so hostai can read the llama.cpp commit.
+RUN printf '{"llama_cpp_commit":"4df29be4f4c3673f428170fda944a5b19f743bb8","cuda_arch":"70","build_profile":"local-test"}\n' \
+    > /etc/qwen38-build.json && chmod 0444 /etc/qwen38-build.json
+
+# Hardened sshd drop-in used by hostai-init-ssh.sh in secure mode.
+RUN printf '%s\n' \
+    'PermitRootLogin prohibit-password' \
+    'PubkeyAuthentication yes' \
+    'PasswordAuthentication no' \
+    'KbdInteractiveAuthentication no' \
+    'ChallengeResponseAuthentication no' \
+    'StrictModes yes' \
+    'AllowTcpForwarding yes' \
+    'GatewayPorts no' \
+    'X11Forwarding no' \
+    'ClientAliveInterval 15' \
+    'ClientAliveCountMax 3' \
+    'LogLevel VERBOSE' \
+    > /etc/ssh/sshd_config.d/99-qwen38.conf
+
+ENV HOSTAI_TMPFS_BASE=/dev/shm/qwen38 \
+    HOSTAI_LOG_DIR=/dev/shm/qwen38/log \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /models
+
+EXPOSE 22 8080
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

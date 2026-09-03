@@ -31,7 +31,7 @@ def test_api_key_fallback(config):
 
 def test_search_instance_offers(config):
     config = config_with_key(config)
-    with mock.patch("hostai.vast.search_offers", return_value=[{"id": 1, "dph_total": 0.5}]) as search:
+    with mock.patch("hostai.providers.vast.search_offers", return_value=[{"id": 1, "dph_total": 0.5}]) as search:
         offers = vast.search_instance_offers(
             config,
             "dph_total <= 1.0",
@@ -49,7 +49,7 @@ def test_search_instance_offers(config):
 
 def test_get_instance(config):
     config = config_with_key(config)
-    with mock.patch("hostai.vast.show_instance", return_value={"id": 123, "actual_status": "running"}) as show:
+    with mock.patch("hostai.providers.vast.show_instance", return_value={"id": 123, "actual_status": "running"}) as show:
         inst = vast.get_instance(config, 123)
     assert inst == {"id": 123, "actual_status": "running"}
     show.assert_called_once()
@@ -57,13 +57,13 @@ def test_get_instance(config):
 
 def test_get_instance_not_found(config):
     config = config_with_key(config)
-    with mock.patch("hostai.vast.show_instance", return_value=None):
+    with mock.patch("hostai.providers.vast.show_instance", return_value=None):
         assert vast.get_instance(config, 123) is None
 
 
 def test_destroy(config):
     config = config_with_key(config)
-    with mock.patch("hostai.vast.destroy_instance", return_value={"success": True}) as destroy:
+    with mock.patch("hostai.providers.vast.destroy_instance", return_value={"success": True}) as destroy:
         result = vast.destroy(config, 123, timeout=30)
     assert result["success"] is True
     destroy.assert_called_once()
@@ -71,7 +71,7 @@ def test_destroy(config):
 
 def test_pause(config):
     config = config_with_key(config)
-    with mock.patch("hostai.vast.stop_instance", return_value={"success": True}) as stop:
+    with mock.patch("hostai.providers.vast.stop_instance", return_value={"success": True}) as stop:
         result = vast.pause(config, 123)
     assert result["success"] is True
     stop.assert_called_once()
@@ -79,7 +79,7 @@ def test_pause(config):
 
 def test_start(config):
     config = config_with_key(config)
-    with mock.patch("hostai.vast.start_instance", return_value={"success": True}) as start:
+    with mock.patch("hostai.providers.vast.start_instance", return_value={"success": True}) as start:
         result = vast.start(config, 123)
     assert result["success"] is True
     start.assert_called_once()
@@ -87,7 +87,7 @@ def test_start(config):
 
 def test_create_instance_from_offer(config):
     config = config_with_key(config)
-    with mock.patch("hostai.vast.create_instance", return_value={"id": 42}) as create:
+    with mock.patch("hostai.providers.vast.create_instance", return_value={"id": 42}) as create:
         result = vast.create_instance_from_offer(
             config,
             1,
@@ -106,13 +106,13 @@ def test_create_instance_from_offer(config):
 def test_get_instance_logs_returns_none_for_dict(config):
     """SDK may return a dict when logs are not yet ready; we coerce to None."""
     config = config_with_key(config)
-    with mock.patch("hostai.vast.fetch_logs", return_value={"not_ready": True}):
+    with mock.patch("hostai.providers.vast.fetch_logs", return_value={"not_ready": True}):
         logs = vast.get_instance_logs(config, 123)
     assert logs is None
 
 
 def test_get_instance_logs_returns_text(config):
     config = config_with_key(config)
-    with mock.patch("hostai.vast.fetch_logs", return_value="line1\nline2"):
+    with mock.patch("hostai.providers.vast.fetch_logs", return_value="line1\nline2"):
         logs = vast.get_instance_logs(config, 123)
     assert logs == "line1\nline2"

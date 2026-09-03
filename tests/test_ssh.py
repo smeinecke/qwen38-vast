@@ -75,8 +75,8 @@ def test_ensure_tunnel_checks_auto_selected_port(config, running_state):
 
         def start(self):
             local_port = self.args[4]
-            ready = self.args[6]
-            ssh._TUNNELS[local_port] = {"stop": self.args[7]}
+            ready = self.args[8]
+            ssh._TUNNELS[local_port] = {"stop": self.args[9]}
             ready.set()
 
         def join(self, timeout=None):
@@ -100,25 +100,30 @@ def test_ensure_tunnel_checks_auto_selected_port(config, running_state):
 
 
 def test_ensure_tunnel_surfaces_worker_error(config, running_state):
+    ssh._TUNNELS.pop(running_state.local_port, None)
+
     class FakeThread:
         def __init__(self, *, target, args, daemon):
             _ = target, daemon
             self.args = args
 
         def start(self):
-            ready = self.args[6]
-            outcome = self.args[8]
+            ready = self.args[8]
+            outcome = self.args[10]
             outcome["error"] = RuntimeError("login rejected")
             ready.set()
 
         def join(self, timeout=None):
             _ = timeout
 
+        def is_alive(self):
+            return False
+
     with (
         mock.patch("hostai.ssh.utils.port_is_free", return_value=True),
         mock.patch("hostai.ssh.clear_known_hosts"),
         mock.patch("hostai.ssh.threading.Thread", FakeThread),
-        pytest.raises(RuntimeError, match="SSH tunnel failed: login rejected"),
+        pytest.raises(RuntimeError, match="login rejected"),
     ):
         ssh.ensure_tunnel(config, running_state)
 

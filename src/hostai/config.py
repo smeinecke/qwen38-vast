@@ -99,6 +99,15 @@ def _to_dict(obj: Any) -> Any:
 
 
 @dataclass
+class ProviderSection:
+    backend: str = "vast"
+    local_image: str = ""
+    local_shm_size_gb: Optional[int] = None
+    local_test_label: str = "hostai-test"
+    local_volume: str = ""
+
+
+@dataclass
 class HostaiSection:
     default_profile: str = "a6000"
     profiles_file: str = "profiles.json"
@@ -220,6 +229,7 @@ class ProxySection:
 
 @dataclass
 class Config:
+    provider: ProviderSection = field(default_factory=ProviderSection)
     hostai: HostaiSection = field(default_factory=HostaiSection)
     market: MarketSection = field(default_factory=MarketSection)
     model: ModelSection = field(default_factory=ModelSection)
@@ -240,6 +250,10 @@ class Config:
 
 # Mapping from legacy .env / environment variable name to (section, attribute, converter).
 ENV_MAP: Dict[str, tuple[str, str, Optional[Type[Any]]]] = {
+    "HOSTAI_PROVIDER": ("provider", "backend", str),
+    "HOSTAI_LOCAL_IMAGE": ("provider", "local_image", str),
+    "HOSTAI_LOCAL_SHM_SIZE_GB": ("provider", "local_shm_size_gb", int),
+    "HOSTAI_LOCAL_TEST_LABEL": ("provider", "local_test_label", str),
     "HOSTAI_PROFILE": ("hostai", "default_profile", str),
     "HOSTAI_PROFILES_FILE": ("hostai", "profiles_file", str),
     "CTX_SIZE_OVERRIDE": ("hostai", "ctx_size_override", int),

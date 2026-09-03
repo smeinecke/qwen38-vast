@@ -139,6 +139,15 @@ class State:
         self._data["ssh_url"] = value
 
     @property
+    def ssh_identity(self) -> Optional[Path]:
+        value = self._data.get("ssh_identity")
+        return Path(value) if value else None
+
+    @ssh_identity.setter
+    def ssh_identity(self, value: Optional[Path]) -> None:
+        self._data["ssh_identity"] = str(value) if value else None
+
+    @property
     def started_epoch(self) -> Optional[int]:
         value = self._data.get("started_epoch")
         if value is None:

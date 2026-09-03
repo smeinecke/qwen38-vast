@@ -107,6 +107,13 @@ def test_parse_rsync_transferred_bytes_no_match():
     assert _parse_rsync_transferred_bytes("no stats here") is None
 
 
+def _mock_provider(**kwargs):
+    m = mock.Mock()
+    for k, v in kwargs.items():
+        getattr(m, k).side_effect = v if callable(v) and not isinstance(v, mock.Mock) else [v]
+    return m
+
+
 def test_pause_or_destroy_destroy(config, running_state, tmp_path):
     run_dir = tmp_path / "run"
     run_dir.mkdir()
@@ -114,7 +121,8 @@ def test_pause_or_destroy_destroy(config, running_state, tmp_path):
     running_state.dph = 1.0
     running_state.status = "running"
 
-    with mock.patch("hostai.commands.down.vast.destroy", return_value=None):
+    provider = _mock_provider(destroy_instance=None)
+    with mock.patch("hostai.commands.down._provider", return_value=provider):
         msg = _pause_or_destroy(config, running_state, pause=False, run_dir=run_dir)
 
     assert "destroyed" in msg or "Session duration" in msg
@@ -128,7 +136,8 @@ def test_pause_or_destroy_404_becomes_already_absent(config, running_state, tmp_
     running_state.dph = 1.0
 
     err = requests.exceptions.HTTPError(response=mock.Mock(status_code=404))
-    with mock.patch("hostai.commands.down.vast.destroy", side_effect=err):
+    provider = _mock_provider(destroy_instance=err)
+    with mock.patch("hostai.commands.down._provider", return_value=provider):
         msg = _pause_or_destroy(config, running_state, pause=False, run_dir=run_dir)
 
     assert "already_absent" in msg
@@ -144,7 +153,8 @@ def test_pause_or_destroy_removes_active_state(config, running_state, tmp_path):
     running_state.save()  # create the active state file
     assert running_state.state_file.exists()
 
-    with mock.patch("hostai.commands.down.vast.destroy", return_value=None):
+    provider = _mock_provider(destroy_instance=None)
+    with mock.patch("hostai.commands.down._provider", return_value=provider):
         _ = _pause_or_destroy(config, running_state, pause=False, run_dir=run_dir)
 
     assert not running_state.state_file.exists()
@@ -161,7 +171,8 @@ def test_pause_or_destroy_pause_retains_state(config, running_state, tmp_path):
     running_state.status = "running"
     running_state.save()
 
-    with mock.patch("hostai.commands.down.vast.pause", return_value=None):
+    provider = _mock_provider(stop_instance=None)
+    with mock.patch("hostai.commands.down._provider", return_value=provider):
         _ = _pause_or_destroy(config, running_state, pause=True, run_dir=run_dir)
 
     assert running_state.state_file.exists()

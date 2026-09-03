@@ -11,10 +11,15 @@ import click
 from rich.console import Console
 from rich.table import Table
 
-from hostai import api, ssh, utils, vast
+from hostai import api, ssh, utils
 from hostai.commands import _common
 from hostai.config import Config
+from hostai.providers import get_provider
 from hostai.state import State, state_dir
+
+
+def _provider(config: Config):
+    return get_provider(config)
 
 _refresh_ssh_state = _common.refresh_ssh_state
 
@@ -199,11 +204,11 @@ def cmd_status(config: Config, logs: bool, lines: int, follow: bool, no_save: bo
         return
 
     try:
-        instance = vast.get_instance(config, state.instance_id)
+        instance = _provider(config).get_instance(state.instance_id)
     except Exception:
         instance = None
     if not instance:
-        raise click.ClickException(f"Vast instance {state.instance_id} could not be found. Local state may be stale.")
+        raise click.ClickException(f"instance {state.instance_id} could not be found. Local state may be stale.")
 
     if _refresh_ssh_state(config, state):
         state.save()

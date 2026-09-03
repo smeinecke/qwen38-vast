@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Wrapper so that `llama-server --version` and real llama-server arguments
+# launched by start.sh are redirected to the fake server.
+set -euo pipefail
+
+if [[ "${1:-}" == "--version" ]]; then
+  echo "version: 0 (fake-llama-server for hostai integration test)"
+  exit 0
+fi
+
+# start.sh may background the original llama-server.  We run the fake server
+# in the foreground instead.
+exec /usr/local/bin/fake-llama-server "$@"

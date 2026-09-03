@@ -26,6 +26,14 @@ def make_offer(**overrides):
     return base
 
 
+def _mock_provider():
+    """Return a mock provider for tests that bypass real Vast."""
+    m = mock.Mock()
+    m.name = "vast"
+    m.create_instance.return_value = {"new_contract": 123}
+    return m
+
+
 def test_cmd_up_rejects_invalid_port(config):
     runner = CliRunner()
     result = runner.invoke(cmd_up, ["--local-port", "70000"], obj=config)
@@ -97,13 +105,13 @@ def test_do_fresh_uses_resolved_profile_disk(config, project_dir):
 
     with (
         mock.patch("hostai.commands.up.market.select_offer", return_value=make_offer()) as select,
-        mock.patch("hostai.commands.up.create_instance_from_offer", return_value={"new_contract": 123}) as create,
+        mock.patch("hostai.commands.up._provider", return_value=_mock_provider()) as provider,
         mock.patch("hostai.commands.up._do_fresh_core"),
     ):
         _do_fresh(config, "test", None, None, None, False, False, False, False, None)
 
     assert select.call_args.kwargs["storage"] == 150
-    assert create.call_args.kwargs["disk"] == 150
+    assert provider.return_value.create_instance.call_args.kwargs["disk"] == 150
     # The search query must derive the host disk-space eligibility from the
     # same resolved disk allocation.
     query = select.call_args.args[2]
@@ -117,7 +125,7 @@ def test_do_fresh_falls_back_to_market_disk_when_profile_has_none(config, projec
 
     with (
         mock.patch("hostai.commands.up.market.select_offer", return_value=make_offer()) as select,
-        mock.patch("hostai.commands.up.create_instance_from_offer", return_value={"new_contract": 123}),
+        mock.patch("hostai.commands.up._provider", return_value=_mock_provider()),
         mock.patch("hostai.commands.up._do_fresh_core"),
     ):
         _do_fresh(config, "test", None, None, None, False, False, False, False, None)
@@ -134,13 +142,13 @@ def test_do_fresh_uses_bid_price_for_interruptible(config, project_dir):
 
     with (
         mock.patch("hostai.commands.up.market.select_offer", return_value=make_offer()) as select,
-        mock.patch("hostai.commands.up.create_instance_from_offer", return_value={"new_contract": 123}) as create,
+        mock.patch("hostai.commands.up._provider", return_value=_mock_provider()) as provider,
         mock.patch("hostai.commands.up._do_fresh_core"),
     ):
         _do_fresh(config, "test", None, None, None, False, False, False, False, None, bid_price=0.35)
 
     assert select.call_args.kwargs["offer_type"] == "bid"
-    assert create.call_args.kwargs["bid_price"] == 0.35
+    assert provider.return_value.create_instance.call_args.kwargs["bid_price"] == 0.35
 
 
 def test_do_fresh_dry_run_does_not_create(config, project_dir):
@@ -150,7 +158,7 @@ def test_do_fresh_dry_run_does_not_create(config, project_dir):
 
     with (
         mock.patch("hostai.commands.up.market.select_offer", return_value=make_offer()),
-        mock.patch("hostai.commands.up.create_instance_from_offer") as create,
+        mock.patch("hostai.commands.up._provider") as provider,
     ):
         _do_fresh(
             config,
@@ -167,7 +175,7 @@ def test_do_fresh_dry_run_does_not_create(config, project_dir):
             dry_run=True,
         )
 
-    create.assert_not_called()
+    provider.return_value.create_instance.assert_not_called()
 
 
 def test_do_fresh_blocks_running_instance(config, project_dir):
@@ -180,7 +188,9 @@ def test_do_fresh_blocks_running_instance(config, project_dir):
     state.instance_id = 123
     state.save()
 
-    with mock.patch("hostai.commands.up.get_instance", return_value={"id": 123, "actual_status": "running"}):
+    provider = _mock_provider()
+    provider.get_instance.return_value = {"id": 123, "actual_status": "running"}
+    with mock.patch("hostai.commands.up._provider", return_value=provider):
         with pytest.raises(click.ClickException, match="run hostai down first"):
             _do_fresh(config, "test", None, None, None, False, False, False, False, None)
 
@@ -195,7 +205,9 @@ def test_do_fresh_allows_recreate_when_instance_is_exited(config, project_dir):
     state.instance_id = 123
     state.save()
 
-    with mock.patch("hostai.commands.up.get_instance", return_value={"id": 123, "actual_status": "exited"}):
+    provider = _mock_provider()
+    provider.get_instance.return_value = {"id": 123, "actual_status": "exited"}
+    with mock.patch("hostai.commands.up._provider", return_value=provider):
         with mock.patch("hostai.commands.up._resolve_profile", side_effect=RuntimeError("later step")):
             with pytest.raises(RuntimeError, match="later step"):
                 _do_fresh(config, "test", None, None, None, False, False, False, False, None)
@@ -293,7 +305,7 @@ def test_do_fresh_search_query_caps_at_bid(config, project_dir):
 
     with (
         mock.patch("hostai.commands.up.market.select_offer", return_value=make_offer()) as select,
-        mock.patch("hostai.commands.up.create_instance_from_offer", return_value={"new_contract": 123}),
+        mock.patch("hostai.commands.up._provider", return_value=_mock_provider()),
         mock.patch("hostai.commands.up._do_fresh_core"),
     ):
         _do_fresh(config, "test", None, None, None, False, False, False, False, None, bid_price=0.35)

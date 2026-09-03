@@ -79,6 +79,12 @@ def test_filter_offers_free_traffic():
     assert filtered[0]["inet_down_cost"] == 0.0
 
 
+def _mock_provider(offers=None):
+    m = mock.Mock()
+    m.search_offers.return_value = offers if offers is not None else []
+    return m
+
+
 def test_cmd_lookup_no_offers(config, project_dir):
     with mock.patch("hostai.commands.lookup.Profiles.from_file") as from_file:
         profile = mock.Mock()
@@ -94,7 +100,7 @@ def test_cmd_lookup_no_offers(config, project_dir):
         profiles.market_policy.require_free_traffic = False
         from_file.return_value = profiles
 
-        with mock.patch("hostai.commands.lookup.search_instance_offers", return_value=[]):
+        with mock.patch("hostai.commands.lookup.get_provider", return_value=_mock_provider([])):
             runner = CliRunner()
             result = runner.invoke(cmd_lookup, [], obj=config)
 
@@ -103,8 +109,9 @@ def test_cmd_lookup_no_offers(config, project_dir):
 
 
 def test_cmd_lookup_with_offers(config, project_dir):
+    provider = _mock_provider([make_offer()])
     with mock.patch("hostai.commands.lookup.Profiles.from_file") as from_file, \
-         mock.patch("hostai.commands.lookup.search_instance_offers", return_value=[make_offer()]) as search:
+         mock.patch("hostai.commands.lookup.get_provider", return_value=provider):
         profile = mock.Mock()
         profile.name = "test"
         profile.gpu_query = "gpu_name == RTX 4090"
@@ -123,9 +130,10 @@ def test_cmd_lookup_with_offers(config, project_dir):
 
     assert result.exit_code == 0
     assert "RTX 4090" in result.output
-    assert search.call_count == 1
-    assert "RTX 4090" in search.call_args.args[1]
-    assert search.call_args.kwargs == {"limit": 50, "order": "dph_total", "storage": config.market.disk_gb}
+    assert provider.search_offers.call_count == 1
+    call_args = provider.search_offers.call_args
+    assert "RTX 4090" in call_args.args[0]
+    assert call_args.kwargs == {"limit": 50, "order": "dph_total", "storage": config.market.disk_gb}
 
 
 def test_cmd_lookup_invalid_max_results(config):

@@ -10,7 +10,7 @@ from rich.table import Table
 from hostai import market
 from hostai.config import Config
 from hostai.profiles import Profiles
-from hostai.vast import search_instance_offers
+from hostai.providers import get_provider
 
 
 def _resolve_query(
@@ -141,8 +141,8 @@ def cmd_lookup(config: Config, profile, profile_opt, max_price, unverified, max_
     disk_gb = market.resolved_disk_gb(selected, config)
 
     try:
-        offers = search_instance_offers(
-            config,
+        provider = get_provider(config)
+        offers = provider.search_offers(
             query,
             limit=50,
             order="dph_total",

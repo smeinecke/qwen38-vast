@@ -18,16 +18,12 @@ from hostai.commands.monitor import maybe_start_monitor
 from hostai.commands.watchdog import maybe_start_watchdog
 from hostai.config import Config, image_for_profile
 from hostai.profiles import Profiles
+from hostai.providers import get_provider
 from hostai.state import State, init_run_dir, runs_dir, state_dir
-from hostai.vast import (
-    create_instance_from_offer,
-    destroy,
-    get_instance,
-    get_instance_logs,
-)
-from hostai.vast import (
-    start as start_instance,
-)
+
+
+def _provider(config: Config):
+    return get_provider(config)
 
 
 @click.command("up", help="Start a Vast instance for a profile.")
@@ -144,7 +140,7 @@ def _cleanup_instance(config: Config, state: State, reason: str) -> None:
         return
     click.echo(f"[cleanup] {reason}; destroying instance {state.instance_id}...", err=True)
     try:
-        destroy(config, state.instance_id, timeout=config.vast.destroy_timeout_seconds)
+        _provider(config).destroy_instance(state.instance_id)
         click.echo(f"[cleanup] instance {state.instance_id} destroyed", err=True)
     except Exception as exc:
         click.echo(f"[cleanup] destroy failed: {exc}; please remove it manually", err=True)
@@ -171,6 +167,7 @@ def _shm_preflight(
         ssh_url,
         "df -P -B1 /dev/shm | awk 'NR==2 {print $4}'",
         known_hosts=known_hosts,
+        config=config,
         timeout=30,
     )
     if res.returncode != 0:
@@ -281,11 +278,10 @@ def _extra_args(config: Config, no_cache: bool = False) -> str:
 
 
 def _emit_instance_logs(config: Config, instance_id: int, seen: Dict[str, Set[str]]) -> None:
-    """Fetch and emit any new container/daemon log lines from Vast."""
+    """Fetch and emit any new container/daemon log lines from the provider."""
     for kind, daemon in (("container", False), ("daemon", True)):
         try:
-            text = get_instance_logs(
-                config,
+            text = _provider(config).get_logs(
                 instance_id,
                 tail=50,
                 daemon_logs=daemon,
@@ -314,7 +310,7 @@ def _wait_for_ssh_endpoint(config: Config, state: State, timeout: int) -> None:
         now = _now_epoch()
         if now - start > timeout:
             raise click.ClickException("timeout waiting for SSH endpoint")
-        inst = get_instance(config, state.instance_id)
+        inst = _provider(config).get_instance(state.instance_id)
         if not inst:
             click.echo("[boot] waiting for instance to appear...")
             time.sleep(5)
@@ -360,6 +356,8 @@ def _wait_for_api(config: Config, state: State, timeout: int, client: LlamaClien
                     state.ssh_url,
                     "tail -n 20 /var/log/qwen38/server.log 2>/dev/null || true",
                     known_hosts=known_hosts,
+                    config=config,
+                    state=state,
                     timeout=10,
                 )
                 if result.stdout:
@@ -390,6 +388,8 @@ def _capture_disk_telemetry(config: Config, state: State, known_hosts: Path) -> 
         state.ssh_url,
         f"cat {log_path} 2>/dev/null || true",
         known_hosts=known_hosts,
+        config=config,
+        state=state,
         timeout=30,
     )
     records: List[Dict[str, Any]] = []
@@ -431,7 +431,7 @@ record = {
 }
 print(json.dumps(record))
 PY'''
-    res2 = ssh.run_remote(state.ssh_url, final_script, known_hosts=known_hosts, timeout=60)
+    res2 = ssh.run_remote(state.ssh_url, final_script, known_hosts=known_hosts, config=config, state=state, timeout=60)
     if res2.returncode == 0 and res2.stdout:
         try:
             record = json.loads(res2.stdout.strip().splitlines()[-1])
@@ -527,7 +527,7 @@ def _prefetch_slot_cache_to_vast(
         script = cache.rclone_prefetch_script(config, slot_dir, remote_dir)
     else:
         script = cache.rsync_prefetch_script(config, slot_dir, remote_dir)
-    res = ssh.run_remote(ssh_url, "bash -s", input_data=script, known_hosts=known_hosts, timeout=330)
+    res = ssh.run_remote(ssh_url, "bash -s", input_data=script, known_hosts=known_hosts, config=config, timeout=330)
     return res.returncode == 0 and "ok" in (res.stdout or "")
 
 
@@ -553,9 +553,9 @@ def _do_fresh(
         old = State.load(existing)
         if old.instance_id:
             try:
-                inst = get_instance(config, old.instance_id)
+                inst = _provider(config).get_instance(old.instance_id)
             except Exception:
-                # Could not reach Vast to verify; proceed rather than hard-block.
+                # Could not reach provider to verify; proceed rather than hard-block.
                 inst = None
             if inst and (inst.get("actual_status") or inst.get("status")) not in ("exited", "offline"):
                 raise click.ClickException(
@@ -583,6 +583,9 @@ def _do_fresh(
         )
     else:
         click.echo(f"[search]  mode={offer_type} max_dph=${configured_max_dph:.4f}/h")
+    provider = _provider(config)
+    click.echo(f"[provider] {provider.name}")
+
     offer_data = market.select_offer(
         config,
         profiles,
@@ -675,13 +678,13 @@ def _do_fresh(
         }
         if interruptible:
             create_kwargs["bid_price"] = bid_price
-        create_raw = create_instance_from_offer(config, offer_id, **create_kwargs)
+        create_raw = _provider(config).create_instance(offer_id, **create_kwargs)
     except Exception as exc:
-        raise click.ClickException(f"Vast create instance failed: {exc}")
+        raise click.ClickException(f"create instance failed: {exc}")
 
     instance_id = create_raw.get("new_contract") or create_raw.get("instance_id") or create_raw.get("id")
     if not instance_id:
-        raise click.ClickException(f"Vast create response did not contain an instance ID: {create_raw}")
+        raise click.ClickException(f"create response did not contain an instance ID: {create_raw}")
 
     started_at = _now_rfc()
     started_epoch = _now_epoch()
@@ -728,6 +731,13 @@ def _do_fresh(
     state.slot_cache_max_gb = config.cache.max_gb
     state.slot_cache_local_dir = cache._default_local_dir(config)
     state.slot_cache_use_shm = config.cache.use_shm
+
+    # LocalProvider generates an SSH key pair for the container.
+    provider = _provider(config)
+    private_key: Optional[Path] = getattr(provider, "ssh_private_key", None)
+    if private_key:
+        state.ssh_identity = private_key
+
     state.save()
     state.save_metadata(run_dir, status="provisioning")
 
@@ -748,12 +758,12 @@ def _do_fresh_core(
     no_cache: bool,
     abort_if_shm_too_small: bool,
 ) -> None:
-    """Provision a freshly created Vast instance (SSH, cache, tunnel, TLS, API)."""
-    click.echo(f"[boot] Vast instance {state.instance_id} created; waiting for SSH...")
+    """Provision a freshly created instance (SSH, cache, tunnel, TLS, API)."""
+    click.echo(f"[boot] instance {state.instance_id} created; waiting for SSH...")
     _wait_for_ssh_endpoint(config, state, config.ssh.start_timeout)
 
     known_hosts = state.state_file.parent / "known_hosts"
-    if not ssh.wait_for_ssh(state.ssh_url, known_hosts=known_hosts, timeout=300):
+    if not ssh.wait_for_ssh(state.ssh_url, known_hosts=known_hosts, config=config, state=state, timeout=300):
         raise click.ClickException("SSH daemon did not become reachable")
     click.echo("[ssh] connection ready")
 
@@ -762,6 +772,8 @@ def _do_fresh_core(
         state.ssh_url,
         "/usr/local/bin/llama-server --version",
         known_hosts=known_hosts,
+        config=config,
+        state=state,
         timeout=30,
     )
     if result.returncode != 0:
@@ -829,7 +841,7 @@ def _do_fresh_core(
     if not state.unsecure:
         tls_dir = tls.ensure_local_tls_dir(config.root_dir)
         tls.generate_cert(tls_dir)
-        if not tls.deliver_cert(state.ssh_url, tls_dir, known_hosts=known_hosts):
+        if not tls.deliver_cert(state.ssh_url, tls_dir, known_hosts=known_hosts, config=config, state=state):
             raise click.ClickException("TLS certificate delivery failed")
         state.tls_ca = tls_dir / "ca.crt"
         state.save()
@@ -906,18 +918,18 @@ def _do_restart(
     if local_port is not None:
         state.local_port = local_port
 
-    inst = get_instance(config, state.instance_id)
+    inst = _provider(config).get_instance(state.instance_id)
     status = inst.get("actual_status") or inst.get("status") if inst else None
     if status != "running":
         try:
-            start_instance(config, state.instance_id)
+            _provider(config).start_instance(state.instance_id)
             click.echo(f"[restart] started instance {state.instance_id}")
         except Exception as exc:
             raise click.ClickException(f"failed to start instance: {exc}")
 
     _wait_for_ssh_endpoint(config, state, config.ssh.start_timeout)
     known_hosts = state.state_file.parent / "known_hosts"
-    if not ssh.wait_for_ssh(state.ssh_url, known_hosts=known_hosts, timeout=300):
+    if not ssh.wait_for_ssh(state.ssh_url, known_hosts=known_hosts, config=config, state=state, timeout=300):
         raise click.ClickException("SSH daemon did not become reachable")
 
     # cache setup for restart
@@ -956,7 +968,7 @@ def _do_restart(
         tls_dir = tls.ensure_local_tls_dir(config.root_dir)
         if not (tls_dir / "server.crt").exists():
             tls.generate_cert(tls_dir)
-        if not tls.deliver_cert(state.ssh_url, tls_dir, known_hosts=known_hosts):
+        if not tls.deliver_cert(state.ssh_url, tls_dir, known_hosts=known_hosts, config=config, state=state):
             raise click.ClickException("TLS certificate delivery failed")
         state.tls_ca = tls_dir / "ca.crt"
         api_scheme = "https"

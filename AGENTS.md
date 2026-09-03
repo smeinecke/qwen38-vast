@@ -29,3 +29,13 @@
 - Do not put `disk_space>=N` constraints in `profiles.json` queries. `market.build_search_query` derives `disk_space>=N` from `resolved_disk_gb(profile, config)` so searches, lookups, monitor checks, and cost/startup estimates stay consistent.
 - `start.sh` now logs per-stage disk usage (`after-preflight`, `after-main-model`, `after-draft-model`, `before-serve`) to `/dev/shm/qwen38/log/disk-usage.log`. `hostai up` copies this plus a final snapshot to `run-*/disk-telemetry.json` after a successful cold start.
 - The container image must be rebuilt after changes to `start.sh`.
+
+## Local provider and integration tests
+
+- Set `HOSTAI_PROVIDER=local` to run `hostai up`/`down` against a local Docker container instead of Vast.
+- `HOSTAI_LOCAL_IMAGE` overrides the Docker image used by `LocalProvider` (default: `ghcr.io/smeinecke/qwen38-vast:<tag>`).
+- `HOSTAI_LOCAL_SHM_SIZE_GB` controls the container `--shm-size` (default: 32 GB).
+- Build the integration test image with:
+    docker build -f tests/integration/Dockerfile.test -t hostai-test:latest .
+- Run the integration acceptance test with `uv run pytest -q -m "not slow" tests/test_local_integration.py`.
+- The integration image uses `tests/integration/fake-llama-server` and is gated on Docker and the `hostai-test:latest` image.

@@ -11,16 +11,21 @@ from typing import Any, Dict, Optional
 import click
 import requests
 
-from hostai import api, cache, ssh, utils, vast
+from hostai import api, cache, ssh, utils
 from hostai.commands import _common
 from hostai.commands.monitor import stop_monitor
 from hostai.config import Config
+from hostai.providers import get_provider
 from hostai.state import State, init_run_dir, runs_dir, state_dir
 
 _install_cache_key_on_vast = cache.install_cache_key_on_vast
 _fetch_llama_commit = _common.fetch_llama_commit
 _refresh_ssh_state = _common.refresh_ssh_state
 _stop_remote_model = _common.stop_remote_model
+
+
+def _provider(config: Config):
+    return get_provider(config)
 
 
 def _slot_save(config: Config, state: State, slot_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
@@ -302,7 +307,7 @@ def _archive_session(config: Config, state: State, run_dir: Path, no_archive: bo
     state.save_metadata(run_dir, status="archiving")
 
     try:
-        instance = vast.get_instance(config, state.instance_id) if state.instance_id else None
+        instance = _provider(config).get_instance(state.instance_id) if state.instance_id else None
         if instance:
             (run_dir / "vast-final.json").write_text(json.dumps(instance, indent=2, default=str))
     except Exception:
@@ -363,17 +368,17 @@ def _pause_or_destroy(config: Config, state: State, pause: bool, run_dir: Path) 
     cost = utils.format_cost(duration, state.dph)
 
     if pause:
-        click.echo(f"Pausing Vast instance {state.instance_id}...")
+        click.echo(f"Pausing instance {state.instance_id}...")
         try:
-            vast.pause(config, state.instance_id, timeout=config.vast.pause_timeout_seconds)
+            _provider(config).stop_instance(state.instance_id)
             pause_outcome = "paused"
         except requests.exceptions.HTTPError as exc:
             if exc.response is not None and exc.response.status_code == 404:
                 pause_outcome = "not_found"
             else:
-                raise click.ClickException(f"Vast pause failed: {exc}")
+                raise click.ClickException(f"pause failed: {exc}")
         except requests.exceptions.RequestException as exc:
-            raise click.ClickException(f"Vast pause failed: {exc}")
+            raise click.ClickException(f"pause failed: {exc}")
         state.status = "paused"
         state.set("pause_outcome", pause_outcome)
         state.set("ended_at", now)
@@ -387,17 +392,17 @@ def _pause_or_destroy(config: Config, state: State, pause: bool, run_dir: Path) 
         _client_log(run_dir, f"paused instance {state.instance_id}")
         return f"Paused. Session duration: {duration}s | estimated compute: ${cost:.4f}"
 
-    click.echo(f"Destroying Vast instance {state.instance_id}...")
+    click.echo(f"Destroying instance {state.instance_id}...")
     destroy_outcome = "destroyed"
     try:
-        vast.destroy(config, state.instance_id, timeout=config.vast.destroy_timeout_seconds)
+        _provider(config).destroy_instance(state.instance_id)
     except requests.exceptions.HTTPError as exc:
         if exc.response is not None and exc.response.status_code == 404:
             destroy_outcome = "already_absent"
         else:
-            raise click.ClickException(f"Vast destroy failed: {exc}")
+            raise click.ClickException(f"destroy failed: {exc}")
     except requests.exceptions.RequestException as exc:
-        raise click.ClickException(f"Vast destroy failed (timeout): {exc}")
+        raise click.ClickException(f"destroy failed (timeout): {exc}")
 
     state.status = "destroyed"
     state.set("ended_at", now)
@@ -439,7 +444,7 @@ def down_instance(
     gpu = state.gpu
     dph = state.dph
     if not skip_confirm:
-        if not click.confirm(f"{action} Vast instance {state.instance_id} ({gpu}, ${dph:.4f}/h)?"):
+        if not click.confirm(f"{action} instance {state.instance_id} ({gpu}, ${dph:.4f}/h)?"):
             click.echo("Cancelled.")
             return "cancelled"
 

@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 from hostai import ssh, utils
+from hostai.config import Config
+from hostai.state import State
 
 
 def ensure_local_tls_dir(root_dir: Path) -> Path:
@@ -62,6 +64,8 @@ def deliver_cert(
     *,
     known_hosts: Optional[Path] = None,
     identity: Optional[Path] = None,
+    config: Optional[Config] = None,
+    state: Optional[State] = None,
 ) -> bool:
     """Deliver server.crt and server.key to /dev/shm/qwen38/certs over SSH.
 
@@ -87,6 +91,8 @@ def deliver_cert(
         "install -d -m 700 /dev/shm/qwen38/certs",
         known_hosts=known_hosts,
         identity=identity,
+        config=config,
+        state=state,
         capture=True,
     )
     if result.returncode != 0:
@@ -99,6 +105,8 @@ def deliver_cert(
             f"cat > /dev/shm/qwen38/certs/{remote_name}",
             known_hosts=known_hosts,
             identity=identity,
+            config=config,
+            state=state,
             input_data=local_text,
             capture=True,
         )
@@ -111,6 +119,8 @@ def deliver_cert(
         "chmod 600 /dev/shm/qwen38/certs/server.key",
         known_hosts=known_hosts,
         identity=identity,
+        config=config,
+        state=state,
         capture=True,
     )
     return result.returncode == 0

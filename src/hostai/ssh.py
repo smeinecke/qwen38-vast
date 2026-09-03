@@ -110,6 +110,15 @@ def _connect_kwargs(known_hosts: Optional[Path] = None, identity: Optional[Path]
     return kwargs
 
 
+def _default_identity(config: Optional[Config], state: Optional[State]) -> Optional[Path]:
+    """Return the SSH private key to use for the current state/config."""
+    if state and state.ssh_identity:
+        return state.ssh_identity
+    if config and config.secrets.get("SSH_PRIVATE_KEY"):
+        return Path(config.secrets["SSH_PRIVATE_KEY"])
+    return None
+
+
 @dataclass
 class CompletedProcess:
     """Minimal replacement for subprocess.CompletedProcess."""
@@ -170,6 +179,8 @@ def run_remote(
     *,
     known_hosts: Path,
     identity: Optional[Path] = None,
+    config: Optional[Config] = None,
+    state: Optional[State] = None,
     timeout: Optional[float] = None,
     capture: bool = True,
     input_data: Optional[str] = None,
@@ -177,6 +188,8 @@ def run_remote(
     """Run a command on the remote host via asyncssh."""
     if not ssh_url:
         return CompletedProcess(args=command, returncode=1, stderr="no ssh_url provided")
+    if identity is None and (config or state):
+        identity = _default_identity(config, state)
     user, host, port = _parse_url(ssh_url)
     try:
         return asyncio.run(_run_remote(host, port, user, command, input_data, timeout, known_hosts, identity))
@@ -189,34 +202,54 @@ def run_remote(
         )
 
 
-async def _is_ssh_reachable(host: str, port: int, user: str, known_hosts: Optional[Path] = None) -> bool:
+async def _is_ssh_reachable(
+    host: str,
+    port: int,
+    user: str,
+    known_hosts: Optional[Path] = None,
+    identity: Optional[Path] = None,
+) -> bool:
     try:
-        async with asyncssh.connect(host, port=port, username=user, **_connect_kwargs(known_hosts)) as conn:
+        async with asyncssh.connect(host, port=port, username=user, **_connect_kwargs(known_hosts, identity)) as conn:
             result = await conn.run("echo ok")
             return result.returncode == 0 and (result.stdout or "").strip() == "ok"
     except Exception:
         return False
 
 
-def is_ssh_reachable(ssh_url: str, *, known_hosts: Path) -> bool:
+def is_ssh_reachable(
+    ssh_url: str,
+    *,
+    known_hosts: Path,
+    identity: Optional[Path] = None,
+    config: Optional[Config] = None,
+    state: Optional[State] = None,
+) -> bool:
+    if identity is None and (config or state):
+        identity = _default_identity(config, state)
     user, host, port = _parse_url(ssh_url)
-    return asyncio.run(_is_ssh_reachable(host, port, user, known_hosts))
+    return asyncio.run(_is_ssh_reachable(host, port, user, known_hosts, identity))
 
 
 def wait_for_ssh(
     ssh_url: Optional[str],
     *,
     known_hosts: Path,
+    identity: Optional[Path] = None,
+    config: Optional[Config] = None,
+    state: Optional[State] = None,
     timeout: int = 120,
     quiet: bool = False,
 ) -> bool:
     """Wait up to timeout seconds for SSH to become reachable."""
     if not ssh_url:
         return False
+    if identity is None and (config or state):
+        identity = _default_identity(config, state)
     user, host, port = _parse_url(ssh_url)
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if asyncio.run(_is_ssh_reachable(host, port, user, known_hosts)):
+        if asyncio.run(_is_ssh_reachable(host, port, user, known_hosts, identity)):
             return True
         if not quiet:
             print(f"[ssh] waiting for {ssh_url} ...")
@@ -261,11 +294,15 @@ def scp_to(
     *,
     known_hosts: Path,
     identity: Optional[Path] = None,
+    config: Optional[Config] = None,
+    state: Optional[State] = None,
     timeout: Optional[float] = None,
 ) -> CompletedProcess:
     """Copy a local file to the remote host via asyncssh SCP."""
     if not ssh_url:
         return CompletedProcess(args=[str(local_path), remote_path], returncode=1, stderr="no ssh_url provided")
+    if identity is None and (config or state):
+        identity = _default_identity(config, state)
     user, host, port = _parse_url(ssh_url)
     return asyncio.run(_scp(local_path, host, port, user, remote_path, known_hosts, identity, timeout))
 
@@ -307,9 +344,13 @@ def scp_from(
     *,
     known_hosts: Path,
     identity: Optional[Path] = None,
+    config: Optional[Config] = None,
+    state: Optional[State] = None,
     timeout: Optional[float] = None,
 ) -> CompletedProcess:
     """Copy a remote file to the local host via asyncssh SCP."""
+    if identity is None and (config or state):
+        identity = _default_identity(config, state)
     user, host, port = _parse_url(ssh_url)
     return asyncio.run(_scp_from(remote_path, local_path, host, port, user, known_hosts, identity, timeout))
 
@@ -324,14 +365,17 @@ async def _start_tunnel_worker(
     port: int,
     local_port: int,
     remote_dest: str,
+    identity: Optional[Path],
+    connect_timeout: float,
     ready: threading.Event,
     stop: threading.Event,
     outcome: Dict[str, Any],
 ) -> None:
     try:
-        kwargs = _connect_kwargs()
-        kwargs["connect_timeout"] = _TUNNEL_CONNECT_TIMEOUT
-        kwargs["login_timeout"] = _TUNNEL_CONNECT_TIMEOUT
+        known_hosts = outcome.get("known_hosts")
+        kwargs = _connect_kwargs(known_hosts, identity)
+        kwargs["connect_timeout"] = connect_timeout
+        kwargs["login_timeout"] = connect_timeout
         async with asyncssh.connect(host, port=port, username=user, **kwargs) as conn:
             if remote_dest.startswith("/"):
                 # Forward local TCP port to remote Unix domain socket.
@@ -364,12 +408,18 @@ def _tunnel_thread_runner(
     port: int,
     local_port: int,
     remote_dest: str,
+    identity: Optional[Path],
+    connect_timeout: float,
     ready: threading.Event,
     stop: threading.Event,
     outcome: Dict[str, Any],
 ) -> None:
     asyncio.set_event_loop(loop)
-    loop.run_until_complete(_start_tunnel_worker(user, host, port, local_port, remote_dest, ready, stop, outcome))
+    loop.run_until_complete(
+        _start_tunnel_worker(
+            user, host, port, local_port, remote_dest, identity, connect_timeout, ready, stop, outcome
+        )
+    )
     loop.close()
 
 
@@ -383,12 +433,16 @@ def ensure_tunnel(
     config: Config,
     state: State,
     remote_dest: Optional[str] = None,
+    timeout: Optional[float] = None,
 ) -> int:
     """Start or reuse an SSH -L tunnel and persist its pid/port in state."""
     if not state.ssh_url:
         raise RuntimeError("no ssh_url in state; cannot establish tunnel")
 
     remote_dest = remote_dest or _default_remote_dest(state)
+    timeout = timeout if timeout is not None else config.ssh.start_timeout
+    if timeout is None or timeout <= 0:
+        timeout = _TUNNEL_START_TIMEOUT
 
     # Reuse an existing healthy tunnel.
     if _tunnel_is_running(state) and is_tunnel_healthy(config, state, timeout=3):
@@ -409,37 +463,43 @@ def ensure_tunnel(
     known_hosts.parent.mkdir(parents=True, exist_ok=True)
     clear_known_hosts(host, port, known_hosts)
 
+    identity = _default_identity(config, state)
+    connect_timeout = max(10.0, min(timeout, _TUNNEL_CONNECT_TIMEOUT))
+
+    start = time.monotonic()
     loop = asyncio.new_event_loop()
     ready = threading.Event()
     stop = threading.Event()
-    outcome: Dict[str, Any] = {}
+    outcome: Dict[str, Any] = {"known_hosts": known_hosts}
     thread = threading.Thread(
         target=_tunnel_thread_runner,
-        args=(loop, user, host, port, local_port, remote_dest, ready, stop, outcome),
+        args=(loop, user, host, port, local_port, remote_dest, identity, connect_timeout, ready, stop, outcome),
         daemon=True,
     )
     thread.start()
-    ready.wait(timeout=_TUNNEL_START_TIMEOUT)
+    ready.wait(timeout=timeout)
+    elapsed = time.monotonic() - start
     if not ready.is_set():
         stop.set()
         thread.join(timeout=5)
-        raise RuntimeError(f"SSH tunnel failed to start within {_TUNNEL_START_TIMEOUT} seconds")
+        raise RuntimeError(f"[boot:tunnel-ssh] timeout after {elapsed:.1f}s")
 
     if "error" in outcome:
         err = outcome["error"]
         stop.set()
         thread.join(timeout=5)
-        raise RuntimeError(f"SSH tunnel failed: {err}")
+        raise RuntimeError(f"[boot:tunnel-ssh] failed: {err}")
 
     # Wait for the local port to accept connections.
     if not _local_port_is_open(local_port, timeout=5):
         stop.set()
         thread.join(timeout=5)
-        raise RuntimeError("SSH tunnel local port is not accepting connections")
+        raise RuntimeError("[boot:tunnel-forward] local port is not accepting connections")
 
     _TUNNELS[local_port]["state"] = state
     _TUNNELS[local_port]["thread"] = thread
     _TUNNELS[local_port]["stop"] = stop
+    _TUNNELS[local_port]["identity"] = identity
     state.tunnel_pid = 0
     state.local_port = local_port
     state.save()

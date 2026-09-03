@@ -9,17 +9,22 @@ from typing import Optional
 
 import click
 
-from hostai import ssh, vast
+from hostai import ssh
 from hostai.config import Config
+from hostai.providers import get_provider
 from hostai.state import State
 
 
+def _provider(config: Config):
+    return get_provider(config)
+
+
 def refresh_ssh_state(config: Config, state: State) -> bool:
-    """Refresh SSH endpoint fields from the Vast API."""
+    """Refresh SSH endpoint fields from the provider."""
     if not state.instance_id:
         return False
     try:
-        instance = vast.get_instance(config, state.instance_id)
+        instance = _provider(config).get_instance(state.instance_id)
     except Exception:
         return False
     if not instance:
