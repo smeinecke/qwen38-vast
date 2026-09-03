@@ -123,4 +123,7 @@ tokenized_only = false
 socket_path = ""
 port = 0
 tokenizer_model = "Qwen/Qwen3.8-27B"
+# Pinned tokenizer revision (commit SHA). Pin this to a known-good commit so
+# tokenization stays reproducible across Hugging Face updates.
+tokenizer_revision = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
 cache_dir = ""

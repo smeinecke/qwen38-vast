@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import ssl
 import time
 from pathlib import Path
@@ -19,6 +20,60 @@ from hostai.state import State
 from hostai.tokenize import Tokenizer, TokenizerError, default_reasoning_kwargs
 
 _logger = logging.getLogger(__name__)
+
+
+# Pattern for tool-call output produced by the Qwen tool-use template.  It
+# wraps JSON tool calls between <tool_call> and </tool_call> tags.
+_TOOL_CALL_RE = re.compile(
+    r"<tool_call>(.*?)</tool_call>",
+    re.DOTALL,
+)
+
+
+def _parse_tool_calls(content: str) -> List[Dict[str, Any]]:
+    """Parse Qwen-style <tool_call>...</tool_call> output into OpenAI tool_calls.
+
+    Returns an empty list when the content contains no tool-call tags or the
+    JSON cannot be parsed.
+    """
+    tool_calls: List[Dict[str, Any]] = []
+    for match in _TOOL_CALL_RE.finditer(content):
+        raw = match.group(1).strip()
+        if not raw:
+            continue
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+
+        name = parsed.get("name")
+        arguments = parsed.get("arguments", {})
+        if not name:
+            continue
+
+        if isinstance(arguments, dict):
+            arguments = json.dumps(arguments, ensure_ascii=False)
+        else:
+            arguments = str(arguments)
+
+        tool_calls.append(
+            {
+                "id": f"call_{os.urandom(8).hex()}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": arguments,
+                },
+            }
+        )
+    return tool_calls
+
+
+def _strip_tool_call_tags(content: str) -> str:
+    """Return content with tool-call tags removed, preserving surrounding text."""
+    return _TOOL_CALL_RE.sub("", content).strip()
 
 
 class ProxyError(Exception):
@@ -202,6 +257,14 @@ class TokenizedProxy:
         finish_reason = self._map_finish_reason(data)
         completion_tokens = data.get("tokens_predicted", 0) or 0
 
+        tool_calls = _parse_tool_calls(content)
+        if tool_calls:
+            message: Dict[str, Any] = {"role": "assistant", "content": None, "tool_calls": tool_calls}
+            if finish_reason != "length":
+                finish_reason = "tool_calls"
+        else:
+            message = {"role": "assistant", "content": content}
+
         output = {
             "id": f"chatcmpl-{os.urandom(12).hex()}",
             "object": "chat.completion",
@@ -210,7 +273,7 @@ class TokenizedProxy:
             "choices": [
                 {
                     "index": 0,
-                    "message": {"role": "assistant", "content": content},
+                    "message": message,
                     "finish_reason": finish_reason,
                 }
             ],

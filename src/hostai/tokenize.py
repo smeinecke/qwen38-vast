@@ -23,6 +23,52 @@ class TokenizerError(RuntimeError):
     """The local tokenizer cannot be loaded or the chat template cannot be applied."""
 
 
+# Content types that the tokenized proxy does not support.  These map to the
+# common OpenAI message keys for multimodal payloads.
+_MULTIMODAL_KEYS = {
+    "image_url",
+    "image",
+    "video",
+    "video_url",
+    "audio",
+    "audio_url",
+    "file",
+    "file_url",
+    "document",
+    "document_url",
+}
+
+
+def _content_is_multimodal(content: Any) -> Optional[str]:
+    """Return the first multimodal content key found, or None."""
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict):
+                # The OpenAI message format sets "type" to "image_url" etc.
+                item_type = item.get("type")
+                if item_type in _MULTIMODAL_KEYS:
+                    return item_type
+                for key in _MULTIMODAL_KEYS:
+                    if key in item:
+                        return key
+    return None
+
+
+def _has_multimodal_input(
+    messages: List[Dict[str, Any]],
+    tools: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[str]:
+    """Detect unsupported image/video/audio/file inputs in a conversation."""
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        multimodal = _content_is_multimodal(content)
+        if multimodal:
+            return multimodal
+    return None
+
+
 class Tokenizer:
     """Lazy-loaded Qwen tokenizer with an optional remote chat template."""
 
@@ -53,15 +99,17 @@ class Tokenizer:
             ) from exc
 
         model_id = self._config.proxy.tokenizer_model or "Qwen/Qwen3.8-27B"
+        revision = self._config.proxy.tokenizer_revision
         try:
             tokenizer = AutoTokenizer.from_pretrained(
                 model_id,
                 cache_dir=str(cache_path),
                 local_files_only=False,
                 trust_remote_code=False,
+                revision=revision or None,
             )
         except Exception as exc:
-            raise TokenizerError(f"failed to load tokenizer for {model_id}: {exc}") from exc
+            raise TokenizerError(f"failed to load tokenizer for {model_id}@{revision}: {exc}") from exc
 
         if self._chat_template:
             tokenizer.chat_template = self._chat_template
@@ -77,6 +125,10 @@ class Tokenizer:
         **kwargs: Any,
     ) -> List[int]:
         """Apply the model's chat template and return token IDs."""
+        multimodal = _has_multimodal_input(messages, tools)
+        if multimodal:
+            raise TokenizerError(f"multimodal input not supported: {multimodal}")
+
         tokenizer = self._load()
 
         try:
@@ -85,6 +137,8 @@ class Tokenizer:
                 tools=tools,
                 add_generation_prompt=add_generation_prompt,
                 tokenize=True,
+                return_dict=False,
+                return_tensors=None,
                 **kwargs,
             )
         except Exception as exc:
@@ -108,10 +162,36 @@ class Tokenizer:
         tokenizer = self._load()
         return tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens)
 
+    def special_tokens(self) -> Dict[str, Optional[int]]:
+        """Return a map of important special token IDs.
+
+        Unknown or missing special tokens are returned as ``None`` so callers
+        can decide whether to fail or fall back.
+        """
+        tokenizer = self._load()
+        out: Dict[str, Optional[int]] = {
+            "bos_token_id": getattr(tokenizer, "bos_token_id", None),
+            "eos_token_id": getattr(tokenizer, "eos_token_id", None),
+            "pad_token_id": getattr(tokenizer, "pad_token_id", None),
+            "im_start": tokenizer.convert_tokens_to_ids("<|im_start|>"),
+            "im_end": tokenizer.convert_tokens_to_ids("<|im_end|>"),
+            "tool_call": tokenizer.convert_tokens_to_ids("<tool_call>"),
+            "end_tool": tokenizer.convert_tokens_to_ids("</tool_call>"),
+            "tool_response": tokenizer.convert_tokens_to_ids("<tool_response>"),
+            "end_tool_response": tokenizer.convert_tokens_to_ids("</tool_response>"),
+            "sep": tokenizer.convert_tokens_to_ids("<|endoftext|>"),
+        }
+        return out
+
 
 def default_reasoning_kwargs(config: Config) -> Dict[str, Any]:
     """Return Qwen3.8 reasoning kwargs that mirror the server defaults."""
-    effort = config.model.reasoning_effort or "xhigh"
+    effort = (config.model.reasoning_effort or "xhigh").strip().lower()
+    valid = {"low", "medium", "xhigh"}
+    if effort not in valid:
+        raise TokenizerError(
+            f"invalid reasoning_effort {effort!r}; must be one of {sorted(valid)}"
+        )
     return {
         "enable_thinking": True,
         "preserve_thinking": True,

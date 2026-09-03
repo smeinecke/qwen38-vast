@@ -2,7 +2,6 @@
 
 from unittest import mock
 
-import click
 from click.testing import CliRunner
 
 from hostai.commands.status import cmd_status

@@ -1,8 +1,10 @@
 """Tests for the local tokenizing proxy."""
 
+import json
+
 import pytest
 
-from hostai.proxy import TokenizedProxy
+from hostai.proxy import TokenizedProxy, _parse_tool_calls
 from hostai.tokenize import default_reasoning_kwargs
 
 
@@ -46,3 +48,40 @@ def test_build_completion_payload():
     assert payload["seed"] == 42
     assert payload["stop"] == ["\n"]
     assert "extra_ignored" not in payload
+
+
+def test_parse_tool_calls_extracts_openai_format():
+    content = '<tool_call>{"name": "get_weather", "arguments": {"city": "Berlin"}}</tool_call>'
+    calls = _parse_tool_calls(content)
+    assert len(calls) == 1
+    assert calls[0]["type"] == "function"
+    assert calls[0]["function"]["name"] == "get_weather"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"city": "Berlin"}
+
+
+def test_parse_tool_calls_with_string_arguments():
+    content = '<tool_call>{"name": "search", "arguments": "{\\"q\\":\\"cats\\"}"}</tool_call>'
+    calls = _parse_tool_calls(content)
+    assert calls[0]["function"]["arguments"] == '{"q":"cats"}'
+
+
+def test_parse_tool_calls_returns_empty_for_plain_text():
+    assert _parse_tool_calls("hello world") == []
+
+
+def test_parse_tool_calls_with_multiple_calls():
+    content = (
+        '<tool_call>{"name": "get_weather", "arguments": {"city": "Berlin"}}</tool_call>'
+        '<tool_call>{"name": "get_time", "arguments": {"timezone": "CET"}}</tool_call>'
+    )
+    calls = _parse_tool_calls(content)
+    assert len(calls) == 2
+    assert calls[0]["function"]["name"] == "get_weather"
+    assert calls[1]["function"]["name"] == "get_time"
+
+
+def test_parse_tool_calls_ignores_invalid_json():
+    content = '<tool_call>not json</tool_call><tool_call>{"name":"x"}</tool_call>'
+    calls = _parse_tool_calls(content)
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "x"

@@ -7,12 +7,14 @@
 - Use `uv run ruff check src/hostai` for linting and `uv run ruff check --fix src/hostai` for auto-fixes.
 - Use `uv run pyright src/hostai` for type checking.
 - Use `bash -n start.sh` to validate shell script syntax.
+- Some tests download the Qwen/Qwen3.8-27B tokenizer and are marked `slow`; use `uv run pytest -m "not slow"` to skip them.
 
 ## Tokenized-Only Mode
 
 - Set `HOSTAI_TOKENIZED_ONLY=1` in `hostai.toml` (or as an environment variable) and run `hostai up`.
 - After `up`, run `hostai proxy` to start the local Unix-socket proxy that tokenizes prompts before forwarding them.
 - Clients that cannot speak Unix sockets should set `HOSTAI_PROXY_PORT` to a local TCP port; `OPENAI_BASE_URL` in the generated `env` file will then point at the proxy.
+- The proxy tokenizer is pinned to a known-good Qwen3.8-27B commit (`tokenizer_revision` / `HOSTAI_PROXY_TOKENIZER_REVISION`).  Changing it should be followed by regenerating `tests/fixtures/tokenizer_golden.json` and running the tokenizer golden tests.
 - The remote container image must be rebuilt/pushed when `Dockerfile`, `start.sh`, or `src/hostai/remote_guard.py` change because the guard runs inside the image.
 
 ## Lifecycle & Cost

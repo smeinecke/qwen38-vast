@@ -1,7 +1,6 @@
 """Tests for hostai.config loading and helpers."""
 
 from pathlib import Path
-from unittest import mock
 
 import pytest
 

@@ -63,8 +63,8 @@ def test_down_happy_path(config, project_dir):
 
 
 def test_down_destroy_removes_state_and_writes_shutdown_tail(config, project_dir):
-    from hostai.state import State
     from hostai.commands.down import down_instance
+    from hostai.state import State
 
     state = State(
         project_dir / ".hostai-vast" / "state.json",
@@ -107,8 +107,8 @@ def test_down_destroy_removes_state_and_writes_shutdown_tail(config, project_dir
 
 
 def test_down_pause_keeps_state(config, project_dir):
-    from hostai.state import State
     from hostai.commands.down import down_instance
+    from hostai.state import State
 
     state = State(
         project_dir / ".hostai-vast" / "state.json",
@@ -145,8 +145,8 @@ def test_down_pause_keeps_state(config, project_dir):
 
 
 def test_down_failed_destroy_preserves_state(config, project_dir):
-    from hostai.state import State
     from hostai.commands.down import down_instance
+    from hostai.state import State
 
     state = State(
         project_dir / ".hostai-vast" / "state.json",

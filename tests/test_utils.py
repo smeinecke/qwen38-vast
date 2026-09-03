@@ -4,8 +4,6 @@ import re
 import time
 from unittest import mock
 
-import pytest
-
 from hostai import utils
 
 

@@ -25,6 +25,12 @@ from hostai.state import State
 # Keys are local ports; values are dicts with stop_event, thread, local_port.
 _TUNNELS: Dict[int, Dict[str, Any]] = {}
 
+# Vast hosts can accept a probe connection before sshd is responsive enough to
+# complete another login. Keep the tunnel's own limits below the caller wait so
+# the worker reports a useful result before the outer startup guard expires.
+_TUNNEL_CONNECT_TIMEOUT = 40
+_TUNNEL_START_TIMEOUT = 45
+
 
 def resolve_ssh_endpoint(instance: dict) -> Optional[Dict[str, Any]]:
     """Extract an SSH endpoint from a Vast instance dict.
@@ -320,9 +326,12 @@ async def _start_tunnel_worker(
     remote_dest: str,
     ready: threading.Event,
     stop: threading.Event,
+    outcome: Dict[str, Any],
 ) -> None:
     try:
         kwargs = _connect_kwargs()
+        kwargs["connect_timeout"] = _TUNNEL_CONNECT_TIMEOUT
+        kwargs["login_timeout"] = _TUNNEL_CONNECT_TIMEOUT
         async with asyncssh.connect(host, port=port, username=user, **kwargs) as conn:
             if remote_dest.startswith("/"):
                 # Forward local TCP port to remote Unix domain socket.
@@ -342,7 +351,7 @@ async def _start_tunnel_worker(
                 while not stop.is_set():
                     await asyncio.sleep(0.5)
     except Exception as exc:
-        _TUNNELS[local_port] = {"error": exc}
+        outcome["error"] = exc
         ready.set()
     finally:
         _TUNNELS.pop(local_port, None)
@@ -357,9 +366,10 @@ def _tunnel_thread_runner(
     remote_dest: str,
     ready: threading.Event,
     stop: threading.Event,
+    outcome: Dict[str, Any],
 ) -> None:
     asyncio.set_event_loop(loop)
-    loop.run_until_complete(_start_tunnel_worker(user, host, port, local_port, remote_dest, ready, stop))
+    loop.run_until_complete(_start_tunnel_worker(user, host, port, local_port, remote_dest, ready, stop, outcome))
     loop.close()
 
 
@@ -402,26 +412,27 @@ def ensure_tunnel(
     loop = asyncio.new_event_loop()
     ready = threading.Event()
     stop = threading.Event()
+    outcome: Dict[str, Any] = {}
     thread = threading.Thread(
         target=_tunnel_thread_runner,
-        args=(loop, user, host, port, local_port, remote_dest, ready, stop),
+        args=(loop, user, host, port, local_port, remote_dest, ready, stop, outcome),
         daemon=True,
     )
     thread.start()
-    ready.wait(timeout=10)
+    ready.wait(timeout=_TUNNEL_START_TIMEOUT)
     if not ready.is_set():
         stop.set()
         thread.join(timeout=5)
-        raise RuntimeError("SSH tunnel failed to start within 10 seconds")
+        raise RuntimeError(f"SSH tunnel failed to start within {_TUNNEL_START_TIMEOUT} seconds")
 
-    if "error" in _TUNNELS.get(local_port, {}):
-        err = _TUNNELS[local_port]["error"]
+    if "error" in outcome:
+        err = outcome["error"]
         stop.set()
         thread.join(timeout=5)
         raise RuntimeError(f"SSH tunnel failed: {err}")
 
     # Wait for the local port to accept connections.
-    if not is_tunnel_healthy(config, state, timeout=5):
+    if not _local_port_is_open(local_port, timeout=5):
         stop.set()
         thread.join(timeout=5)
         raise RuntimeError("SSH tunnel local port is not accepting connections")
@@ -455,6 +466,11 @@ def is_tunnel_healthy(config: Config, state: State, timeout: int = 3) -> bool:
     local_port = state.local_port
     if not local_port:
         return False
+    return _local_port_is_open(local_port, timeout)
+
+
+def _local_port_is_open(local_port: int, timeout: int) -> bool:
+    """Return whether a specific local tunnel port accepts TCP connections."""
     try:
         with socket.create_connection(("127.0.0.1", local_port), timeout=timeout):
             return True

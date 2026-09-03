@@ -14,6 +14,7 @@ import click
 from hostai import cache, market, ssh, tls, utils
 from hostai.api import LlamaClient, wait_for_api
 from hostai.commands import _common
+from hostai.commands.monitor import maybe_start_monitor
 from hostai.commands.watchdog import maybe_start_watchdog
 from hostai.config import Config, image_for_profile
 from hostai.profiles import Profiles
@@ -269,10 +270,13 @@ def _env_dict(
     return env
 
 
-def _extra_args(config: Config) -> str:
+def _extra_args(config: Config, no_cache: bool = False) -> str:
     parts = []
-    if config.vast.shm_size_gb:
-        parts.append(f"--shm-size={config.vast.shm_size_gb}g")
+    shm_size_gb = config.vast.shm_size_gb
+    if shm_size_gb is None and config.cache.enabled and config.cache.use_shm and not no_cache:
+        shm_size_gb = config.cache.shm_min_gb
+    if shm_size_gb:
+        parts.append(f"--shm-size={shm_size_gb}g")
     return " ".join(parts)
 
 
@@ -648,7 +652,7 @@ def _do_fresh(
     (run_dir / "metadata.json").chmod(0o600)
 
     env = _env_dict(config, profile, image, model, ctx_size, api_key, unsecure, no_cache, session)
-    extra = _extra_args(config)
+    extra = _extra_args(config, no_cache=no_cache)
     label = f"hostai-{profile.name}-{_now_epoch()}"
 
     volume_info = None
@@ -883,6 +887,7 @@ def _do_fresh_core(
     click.echo("Stop: hostai down")
 
     maybe_start_watchdog(config, state)
+    maybe_start_monitor(config, state)
 
 
 def _do_restart(
@@ -990,3 +995,4 @@ def _do_restart(
     click.echo(f"  Instance:  {state.instance_id}")
 
     maybe_start_watchdog(config, state)
+    maybe_start_monitor(config, state)

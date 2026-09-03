@@ -62,6 +62,14 @@ can request a local TCP port as well:
 HOSTAI_PROXY_PORT=18081
 ```
 
+The proxy tokenizer is pinned to the Qwen3.8-27B base model at a known-good
+revision so tokenization stays reproducible.  Override it only when you have
+verified a new revision with `hostai test-tokenizer` or the golden tests:
+
+```dotenv
+HOSTAI_PROXY_TOKENIZER_REVISION=1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0
+```
+
 After `hostai up`:
 
 ```bash

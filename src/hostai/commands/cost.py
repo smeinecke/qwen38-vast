@@ -93,6 +93,7 @@ def cmd_cost(config: Config):
 @click.option("--dph", type=float, default=None, help="GPU all-in $/h (default from state/market).")
 @click.option("--inet-down", type=float, default=None, help="Host download bandwidth in Mbps (default 500).")
 @click.option("--disk-bw", type=float, default=None, help="Host disk bandwidth in MB/s (default 200).")
+@click.option("--inet-down-cost", type=float, default=None, help="Download traffic cost in $/GB (default from state/market).")
 @click.option("--starts-per-month", type=int, default=None, help="Override starts/month estimate.")
 @click.pass_obj
 def cmd_volume_break_even(
@@ -102,6 +103,7 @@ def cmd_volume_break_even(
     dph: Optional[float],
     inet_down: Optional[float],
     disk_bw: Optional[float],
+    inet_down_cost: Optional[float],
     starts_per_month: Optional[int],
 ):
     """Estimate whether a persistent model volume is cheaper than re-downloading.
@@ -121,6 +123,11 @@ def cmd_volume_break_even(
     dph = dph if dph is not None else default_dph
     inet_down = inet_down if inet_down is not None else default_inet
     disk_bw = disk_bw if disk_bw is not None else default_disk
+    inet_down_cost = (
+        inet_down_cost
+        if inet_down_cost is not None
+        else config.market.max_inet_down_cost
+    )
 
     model_gb = config.market.model_download_gb
     # The volume can only save what it can hold.  If it is smaller than the
@@ -140,9 +147,14 @@ def cmd_volume_break_even(
     offer: Dict[str, Any] = {
         "inet_down": inet_down,
         "disk_bw": disk_bw,
-        "inet_down_cost": 0.0,
+        "inet_down_cost": inet_down_cost,
     }
-    _, full_startup_seconds, _ = market.offer_download_estimate(offer, config)
+    _, full_startup_seconds, full_transfer_cost = market.offer_download_estimate(
+        offer, config, cache_state=market.CACHE_STATE_COLD
+    )
+    _, image_only_startup_seconds, _ = market.offer_download_estimate(
+        offer, config, cache_state=market.CACHE_STATE_CACHED
+    )
 
     model_fetch_seconds, avoided_download_gb = _model_fetch_estimate(
         effective_model_gb, inet_down, disk_bw
@@ -153,7 +165,7 @@ def cmd_volume_break_even(
     # rented while the model is being downloaded/extracted.
     gpu_rental_savings = dph * model_fetch_hours
     # Transfer cost on the model bytes that are no longer downloaded.
-    transfer_savings = avoided_download_gb * float(offer.get("inet_down_cost", 0) or 0)
+    transfer_savings = avoided_download_gb * inet_down_cost
     saving_per_start = gpu_rental_savings + transfer_savings
 
     if starts_per_month is None:
@@ -162,9 +174,9 @@ def cmd_volume_break_even(
         months = max(1, len(counts)) if counts else 1
         starts_per_month = total // months if total else 0
 
-    if starts_per_month <= 0:
-        starts_per_month = 10
-        click.echo(f"[cost] no recent starts; using placeholder {starts_per_month}/month")
+        if starts_per_month <= 0:
+            starts_per_month = 10
+            click.echo(f"[cost] no recent starts; using placeholder {starts_per_month}/month")
 
     monthly_savings = starts_per_month * saving_per_start
     break_even_starts = volume_cost_month / saving_per_start if saving_per_start > 0 else float("inf")
@@ -174,19 +186,17 @@ def cmd_volume_break_even(
     per_day_cost = volume_cost_month / 30.44
 
     click.echo(f"[cost] dph=${dph:.4f}/h")
+    click.echo(f"[cost] traffic cost: ${inet_down_cost:.4f}/GB")
     click.echo(
         f"[cost] avoided model download: {avoided_download_gb:.2f} GB "
         f"(main + draft/MTP; image pull is not saved)"
     )
     click.echo(
         f"[cost] avoided model fetch: {model_fetch_seconds:.0f}s "
-        f"({model_fetch_hours:.3f}h); full cold-start would be ~{full_startup_seconds:.0f}s"
+        f"({model_fetch_hours:.3f}h); image-only startup ~{image_only_startup_seconds:.0f}s; full cold-start ~{full_startup_seconds:.0f}s"
     )
     click.echo(f"[cost] GPU rental savings per start: ${gpu_rental_savings:.4f}")
-    if transfer_savings:
-        click.echo(f"[cost] transfer savings per start: ${transfer_savings:.4f}")
-    else:
-        click.echo("[cost] transfer savings per start: $0.00 (free traffic)")
+    click.echo(f"[cost] transfer savings per start: ${transfer_savings:.4f}")
     click.echo(f"[cost] total saving per start: ${saving_per_start:.4f}")
     click.echo(f"[cost] starts/month: {starts_per_month} | monthly savings: ${monthly_savings:.2f}")
     click.echo(f"[cost] volume: {volume_gb:.1f} GiB @ ${volume_cost_month:.2f}/month")

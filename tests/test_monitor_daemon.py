@@ -4,17 +4,16 @@ import os
 import signal
 from unittest import mock
 
-import pytest
 from click.testing import CliRunner
 
 from hostai.commands.monitor import (
+    _monitor_is_running,
+    _monitor_log_file,
+    _monitor_pid_file,
     cmd_monitor_logs,
     cmd_monitor_start,
     cmd_monitor_status,
     cmd_monitor_stop,
-    _monitor_is_running,
-    _monitor_log_file,
-    _monitor_pid_file,
 )
 
 

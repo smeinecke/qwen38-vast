@@ -25,6 +25,18 @@ MAX_INET_DOWN_MBPS = 1.0
 MAX_DISK_BW_MBPS = 1.0
 MIN_STARTUP_SECONDS = 30.0
 
+# Conservative TPS fallbacks for performance scoring when a GPU has no
+# historical benchmark data.  They must be used consistently so the resulting
+# score stays in cost-per-token units and unknown GPUs are not silently
+# compared against measured GPUs using $/h.
+PERF_UNKNOWN_PROMPT_TPS = 10.0
+PERF_UNKNOWN_DECODE_TPS = 50.0
+
+# Cache state for startup cost estimation.
+CACHE_STATE_COLD = "cold"
+CACHE_STATE_CACHED = "cached"
+CACHE_STATE_UNKNOWN = "unknown"
+
 
 @dataclass
 class OfferScore:
@@ -160,19 +172,34 @@ def offer_download_estimate(
     offer: Dict[str, Any],
     config: Config,
     profile: Optional[Profile] = None,
+    cache_state: str = CACHE_STATE_COLD,
 ) -> Tuple[float, float, float]:
     """Estimate download size (GB), time (s), and transfer cost ($).
 
     The size combines the image size (layers) and the model files.  Transfer
     cost is a rough ingress estimate based on the offer's ``inet_down_cost``.
+
+    *cache_state* controls how much of the model payload is assumed to already
+    be present:
+      * ``cold``: full model + image download.
+      * ``cached``: image only (model already on a persistent volume).
+      * ``unknown``: image + half the model; a conservative middle estimate.
     """
-    size_gb = config.market.model_download_gb + config.market.image_size_gb
+    model_gb = float(config.market.model_download_gb)
+    image_gb = float(config.market.image_size_gb)
+
+    if cache_state == CACHE_STATE_CACHED:
+        size_gb = image_gb
+    elif cache_state == CACHE_STATE_UNKNOWN:
+        size_gb = image_gb + (model_gb * 0.5)
+    else:
+        size_gb = image_gb + model_gb
+
     inet_down = float(offer.get("inet_down", 0) or 0)
     disk_bw = float(offer.get("disk_bw", 0) or 0)
 
-    # Convert Vast's Mbps into seconds for the full payload.
+    # Convert Vast's Mbps into seconds for the payload.
     if inet_down > 0:
-        # Vast reports inet_down in Mbps; convert to megabits and divide.
         net_seconds = (size_gb * 8 * 1000) / inet_down
     else:
         net_seconds = float("inf")
@@ -303,6 +330,7 @@ def estimate_startup_seconds(
     config: Config,
     stats: Optional[Dict[str, Dict[str, Any]]] = None,
     min_samples: int = 3,
+    cache_state: str = CACHE_STATE_COLD,
 ) -> float:
     """Return an estimated startup time for an offer.
 
@@ -318,7 +346,7 @@ def estimate_startup_seconds(
     if startup_samples >= min_samples and isinstance(startup_seconds, (int, float)) and startup_seconds > 0:
         return float(startup_seconds)
 
-    _, download_seconds, _ = offer_download_estimate(offer, config)
+    _, download_seconds, _ = offer_download_estimate(offer, config, cache_state=cache_state)
     return download_seconds
 
 
@@ -346,21 +374,48 @@ def _performance_for_offer(
     return prompt_tps, decode_tps, f"history n={total_samples}"
 
 
-def _weighted_tps(
+def _seconds_per_token(
     prompt_tps: Optional[float],
     decode_tps: Optional[float],
     config: Config,
 ) -> Optional[float]:
-    """Combine prompt and decode tps with configured weights."""
-    total_weight = config.market.scoring_prompt_weight + config.market.scoring_decode_weight
+    """Return the weighted time to process one token.
+
+    Uses the configured prompt/decode weights as fractions of a mixed
+    prompt/decode workload.  Missing or non-positive measurements fall back to
+    conservative constants so the result is always in comparable units.
+    """
+    wp = float(config.market.scoring_prompt_weight)
+    wd = float(config.market.scoring_decode_weight)
+    total_weight = wp + wd
     if total_weight == 0:
         return None
-    weighted = 0.0
-    if prompt_tps:
-        weighted += config.market.scoring_prompt_weight * prompt_tps
-    if decode_tps:
-        weighted += config.market.scoring_decode_weight * decode_tps
-    return weighted / total_weight if weighted > 0 else None
+    wp /= total_weight
+    wd /= total_weight
+
+    prompt = float(prompt_tps or 0)
+    decode = float(decode_tps or 0)
+    if prompt <= 0:
+        prompt = PERF_UNKNOWN_PROMPT_TPS
+    if decode <= 0:
+        decode = PERF_UNKNOWN_DECODE_TPS
+
+    # Time for one weighted token = fraction of prompt time + fraction of
+    # decode time.  Both denominators are positive by this point.
+    return (wp / prompt) + (wd / decode)
+
+
+def _resolve_cache_state(config: Config) -> str:
+    """Return the startup cache state assumed for a fresh search.
+
+    A persistent model volume is assumed to keep the model weights; otherwise
+    we default to a full cold start.  ``unknown`` is used conservatively only
+    when the caller explicitly chooses it; normal launches do not benefit from
+    an optimistic partially-cached estimate.
+    """
+    if config.vast.volume_id and config.vast.volume_mount_path:
+        return CACHE_STATE_CACHED
+    return CACHE_STATE_COLD
 
 
 def score_offer(
@@ -368,15 +423,16 @@ def score_offer(
     config: Config,
     stats: Dict[str, Dict[str, Any]],
     session_seconds: Optional[int] = None,
+    cache_state: str = CACHE_STATE_COLD,
 ) -> OfferScore:
     """Score a single offer.
 
-    * ``dph`` mode simply uses the hourly price.
-    * ``perf`` mode divides the hourly price by historical tps.
-    * ``session`` mode adds an estimated startup cost and transfer cost.
+    * ``dph`` mode simply uses the hourly price (units: $/h).
+    * ``perf`` mode uses a cost-per-token score (units: $/token) that never
+      falls back to $/h.
+    * ``session`` mode returns the estimated total session cost (units: $).
 
-    The returned score is a cost figure: lower is better.  When historical data
-    is unavailable or insufficient, the score falls back to ``dph_total``.
+    The returned score is a cost figure: lower is better.
     """
     dph = _effective_dph(offer)
     mode = config.market.scoring_mode
@@ -385,37 +441,40 @@ def score_offer(
         return OfferScore(score=dph, reason="dph")
 
     prompt_tps, decode_tps, reason = _performance_for_offer(offer, stats, config)
-    weighted = _weighted_tps(prompt_tps, decode_tps, config)
+    seconds_per_token = _seconds_per_token(prompt_tps, decode_tps, config)
 
     if mode == "perf":
-        if weighted:
-            score = (dph / 3600) / weighted
-            return OfferScore(score=score, reason=f"perf: {reason}", prompt_tps=prompt_tps, decode_tps=decode_tps)
-        return OfferScore(score=dph, reason=f"perf fallback: {reason}")
+        if seconds_per_token is None:
+            return OfferScore(
+                score=dph,
+                reason="perf fallback: scoring weights are zero",
+                prompt_tps=prompt_tps,
+                decode_tps=decode_tps,
+            )
+        # cost/token = hourly cost per second * seconds per token
+        score = (dph / 3600.0) * seconds_per_token
+        return OfferScore(
+            score=score,
+            reason=f"perf: {reason}",
+            prompt_tps=prompt_tps,
+            decode_tps=decode_tps,
+        )
 
     if mode == "session":
-        startup = estimate_startup_seconds(offer, config, stats, config.market.min_historical_samples)
+        startup = estimate_startup_seconds(
+            offer, config, stats, config.market.min_historical_samples, cache_state=cache_state
+        )
         active = session_seconds if session_seconds else 0
         total_seconds = startup + active
         total_cost = dph * total_seconds / 3600.0
-        _, _, transfer_cost = offer_download_estimate(offer, config)
+        _, _, transfer_cost = offer_download_estimate(offer, config, cache_state=cache_state)
         total_cost += transfer_cost
 
-        if weighted and active > 0:
-            effective_tokens = weighted * active
-            score = total_cost / effective_tokens
-            return OfferScore(
-                score=score,
-                reason=f"session: {reason}, startup={startup:.0f}s",
-                prompt_tps=prompt_tps,
-                decode_tps=decode_tps,
-                startup_seconds=startup,
-                session_seconds=active,
-                transfer_cost=transfer_cost,
-            )
         return OfferScore(
             score=total_cost,
-            reason=f"session fallback: {reason}, startup={startup:.0f}s",
+            reason=f"session: {reason}, startup={startup:.0f}s",
+            prompt_tps=prompt_tps,
+            decode_tps=decode_tps,
             startup_seconds=startup,
             session_seconds=active,
             transfer_cost=transfer_cost,
@@ -429,11 +488,16 @@ def score_offers(
     config: Config,
     stats: Optional[Dict[str, Dict[str, Any]]] = None,
     session_seconds: Optional[int] = None,
+    cache_state: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Attach a ``_hostai_score`` to each offer and sort by score (lower=better)."""
     stats = stats or {}
+    if cache_state is None:
+        cache_state = _resolve_cache_state(config)
     for offer in offers:
-        scoring = score_offer(offer, config, stats, session_seconds=session_seconds)
+        scoring = score_offer(
+            offer, config, stats, session_seconds=session_seconds, cache_state=cache_state
+        )
         offer["_hostai_score"] = scoring
     offers.sort(key=lambda o: o["_hostai_score"].score)
     return offers
@@ -514,6 +578,7 @@ def select_offer(
     current_gpu: Optional[str] = None,
     ctx_size: Optional[int] = None,
     session_seconds: Optional[int] = None,
+    cache_state: Optional[str] = None,
     verbose: bool = False,
 ) -> Dict[str, Any]:
     """Search, filter, and select the best offer for ``up`` or ``monitor``.
@@ -556,8 +621,13 @@ def select_offer(
             raise click.ClickException(f"no matching offer for id {offer}")
         raise click.ClickException(f"no matching offer at or below ${max_dph:.2f}/h")
 
+    if cache_state is None:
+        cache_state = _resolve_cache_state(config)
+
     if config.market.scoring_mode in ("perf", "session"):
-        matches = score_offers(matches, config, stats, session_seconds=session_seconds)
+        matches = score_offers(
+            matches, config, stats, session_seconds=session_seconds, cache_state=cache_state
+        )
     else:
         matches.sort(key=_effective_dph)
 

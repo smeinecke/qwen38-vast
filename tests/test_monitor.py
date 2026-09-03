@@ -101,6 +101,38 @@ def test_resolve_monitor_targets_active_uses_ctx_override(config, project_dir):
     assert targets[0].ctx_size == 262144
 
 
+def test_resolve_monitor_targets_uses_all_monitor_profiles_for_group(config, project_dir):
+    """A running profile with a monitor_group searches all same-context, same-group profiles."""
+    p64 = make_profile(name="a6000", group="q4-64k", ctx_size=65536, monitor_search=False)
+    p_value = make_profile(name="ampere-value", group="q4-64k", ctx_size=65536, monitor_search=True)
+    p128 = make_profile(name="a6000-128k", group="q4-128k", ctx_size=131072, monitor_search=False)
+    profiles = _make_profiles(p64, p_value, p128)
+    config.hostai.default_profile = "a6000"
+
+    current = _state(project_dir, profile="a6000", ctx_size=65536, instance_id=123, dph=0.5)
+
+    targets = _resolve_monitor_targets(config, profiles, None, None, current)
+    names = [t.name for t in targets]
+    assert "ampere-value" in names
+    assert "a6000" in names
+    assert "a6000-128k" not in names
+    assert all(t.ctx_size == 65536 for t in targets)
+
+
+def test_resolve_monitor_targets_ignores_wrong_context_alternatives(config, project_dir):
+    """Only same-context monitor profiles are candidates, even if cheaper."""
+    p64 = make_profile(name="a6000", ctx_size=65536, monitor_search=True)
+    p128 = make_profile(name="a6000-128k", ctx_size=131072, monitor_search=True)
+    profiles = _make_profiles(p64, p128)
+    config.hostai.default_profile = "a6000"
+
+    current = _state(project_dir, profile="a6000-128k", ctx_size=131072, instance_id=123, dph=0.5)
+
+    targets = _resolve_monitor_targets(config, profiles, None, None, current)
+    assert [t.name for t in targets] == ["a6000-128k"]
+    assert targets[0].ctx_size == 131072
+
+
 def test_search_profiles_uses_profile_disk_and_storage(config, project_dir):
     """Monitor searches must pass the resolved disk size to the market layer."""
     p = make_profile("test", disk_gb=200)
@@ -205,12 +237,23 @@ def test_ranked_best_for_monitor_respects_zero_max_dph(config):
     assert best is None
 
 
-def test_ranked_best_for_monitor_ignores_vast_ctx_size(config):
-    """Offers with a mismatching Vast ctx_size must not be rejected."""
+def test_ranked_best_for_monitor_rejects_mismatching_vast_ctx_size(config):
+    """A Vast offer with a non-matching ctx_size must not be considered an alternative."""
     profiles = _make_profiles(make_profile("test", ctx_size=32768))
     current = mock.Mock(gpu="RTX 4090", dph=0.5, ctx_size=32768, exists=True)
     candidates = [
         {"id": 1, "gpu_name": "RTX 4090", "dph_total": 0.3, "ctx_size": 65536},
+    ]
+    best = _ranked_best_for_monitor(config, profiles, current, candidates)
+    assert best is None
+
+
+def test_ranked_best_for_monitor_accepts_matching_vast_ctx_size(config):
+    """A Vast offer with a matching ctx_size is allowed through."""
+    profiles = _make_profiles(make_profile("test", ctx_size=32768))
+    current = mock.Mock(gpu="RTX 4090", dph=0.5, ctx_size=32768, exists=True)
+    candidates = [
+        {"id": 1, "gpu_name": "RTX 4090", "dph_total": 0.3, "ctx_size": 32768},
     ]
     best = _ranked_best_for_monitor(config, profiles, current, candidates)
     assert best is not None

@@ -1,10 +1,8 @@
 """Tests for hostai.commands.bench with mocked API and SSH."""
 
-import json
 from pathlib import Path
 from unittest import mock
 
-import click
 from click.testing import CliRunner
 
 from hostai.commands.bench import cmd_bench

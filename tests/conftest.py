@@ -3,16 +3,7 @@
 import pytest
 
 from hostai.config import (
-    BenchSection,
-    CacheSection,
     Config,
-    HostaiSection,
-    ImageSection,
-    MarketSection,
-    ModelSection,
-    MonitorSection,
-    SSHSection,
-    VastSection,
 )
 from hostai.state import State
 

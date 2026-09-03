@@ -60,6 +60,11 @@ def _log(config: Config, message: str) -> None:
         f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {message}\n")
 
 
+# Number of consecutive successful "inactive" observations required before an
+# idle timeout is allowed.  This protects against a single flaky read being
+# misclassified as idle.
+MIN_IDLE_OBSERVATIONS = 2
+
 ActivityState = str
 
 
@@ -111,10 +116,11 @@ def _run_once(
     last_activity_epoch: float,
     max_runtime_deadline: Optional[float],
     consecutive_failures: int = 0,
-) -> tuple[Dict[str, Any], float, bool, int]:
+    consecutive_inactive: int = 0,
+) -> tuple[Dict[str, Any], float, bool, int, int]:
     """Single watchdog iteration.
 
-    Returns ``(updated_metrics, updated_last_activity, should_shutdown, consecutive_failures)``.
+    Returns ``(updated_metrics, updated_last_activity, should_shutdown, consecutive_failures, consecutive_inactive)``.
     """
     client = api.LlamaClient(config, state)
     activity_state, current = _is_request_active(client, previous_metrics)
@@ -123,35 +129,43 @@ def _run_once(
     if activity_state == "active":
         last_activity_epoch = now
         consecutive_failures = 0
+        consecutive_inactive = 0
     elif activity_state == "unknown":
         consecutive_failures += 1
+        consecutive_inactive = 0
         # Reset the idle clock while activity is unknown so we do not destroy
         # an instance just because the metrics endpoint is unreachable.
         last_activity_epoch = now
         if consecutive_failures == 1 or consecutive_failures % 5 == 0:
-            _log(config, f"activity state unknown ({consecutive_failures} consecutive failures)")
+            _log(config, f"activity state unknown ({consecutive_failures} consecutive failures); treating as not-idle")
     else:  # inactive
         consecutive_failures = 0
+        consecutive_inactive += 1
 
     max_runtime_elapsed = max_runtime_deadline is not None and now >= max_runtime_deadline
     idle_elapsed = (
         config.vast.idle_timeout_seconds is not None
         and now - last_activity_epoch >= config.vast.idle_timeout_seconds
     )
+    idle_observations_ok = consecutive_inactive >= MIN_IDLE_OBSERVATIONS
 
     reason: Optional[str] = None
     if idle_elapsed:
-        if activity_state == "inactive":
+        if activity_state == "inactive" and idle_observations_ok:
             reason = "idle-timeout"
-            _log(config, f"idle for {now - last_activity_epoch:.0f}s; destroying instance {state.instance_id}")
+            _log(config, f"idle for {now - last_activity_epoch:.0f}s ({consecutive_inactive} consecutive inactive observations); destroying instance {state.instance_id}")
+        elif activity_state == "inactive":
+            _log(config, f"idle timeout reached but only {consecutive_inactive} inactive observation(s); waiting for {MIN_IDLE_OBSERVATIONS}")
         elif activity_state == "active":
             _log(config, "idle timeout reached but request still active; waiting")
         elif activity_state == "unknown":
             _log(config, "idle timeout reached but activity state unknown; waiting")
     elif max_runtime_elapsed:
-        if activity_state == "inactive":
+        if activity_state == "inactive" and idle_observations_ok:
             reason = "max-runtime"
-            _log(config, f"max runtime reached and idle; destroying instance {state.instance_id}")
+            _log(config, f"max runtime reached and idle ({consecutive_inactive} observations); destroying instance {state.instance_id}")
+        elif activity_state == "inactive":
+            _log(config, f"max runtime reached but only {consecutive_inactive} inactive observation(s); waiting")
         elif activity_state == "active":
             _log(config, "max runtime reached but request still active; waiting")
         elif activity_state == "unknown":
@@ -163,9 +177,9 @@ def _run_once(
             _watchdog_pid_file(config).unlink(missing_ok=True)
         except Exception as exc:
             _log(config, f"down_instance failed: {exc}")
-        return current, last_activity_epoch, True, consecutive_failures
+        return current, last_activity_epoch, True, consecutive_failures, consecutive_inactive
 
-    return current, last_activity_epoch, False, consecutive_failures
+    return current, last_activity_epoch, False, consecutive_failures, consecutive_inactive
 
 
 def run_watchdog(config: Config) -> None:
@@ -195,6 +209,7 @@ def run_watchdog(config: Config) -> None:
     previous_metrics: Dict[str, Any] = {}
     last_activity_epoch = time.time()
     consecutive_failures = 0
+    consecutive_inactive = 0
 
     try:
         while True:
@@ -203,13 +218,14 @@ def run_watchdog(config: Config) -> None:
                 _log(config, "state cleared; exiting")
                 break
 
-            previous_metrics, last_activity_epoch, done, consecutive_failures = _run_once(
+            previous_metrics, last_activity_epoch, done, consecutive_failures, consecutive_inactive = _run_once(
                 config,
                 state,
                 previous_metrics,
                 last_activity_epoch,
                 max_runtime_deadline,
                 consecutive_failures,
+                consecutive_inactive,
             )
             if done:
                 break

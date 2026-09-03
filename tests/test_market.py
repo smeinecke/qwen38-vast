@@ -1,10 +1,7 @@
 """Tests for hostai.market: query, filtering, scoring, and hardware rank."""
 
-import json
-from unittest import mock
 
 import pytest
-from click.testing import CliRunner
 
 from hostai import market, utils
 from hostai.profiles import (
@@ -250,6 +247,76 @@ def test_build_search_query_bid_price_ignored_when_none(config):
     query, max_dph = market.build_search_query(config, profiles, make_profile())
     assert "dph_total <= 0.8" in query
     assert max_dph == 0.8
+
+
+def test_score_offers_perf_mode_without_history_uses_conservative_fallback(config):
+    """Unknown GPUs in perf mode must still be scored in $/token units."""
+    config.market.scoring_mode = "perf"
+    config.market.scoring_prompt_weight = 0.0
+    config.market.scoring_decode_weight = 1.0
+    offers = [
+        {"id": 1, "gpu_name": "RTX 4090", "dph_total": 0.5},
+        {"id": 2, "gpu_name": "RTX 3090", "dph_total": 0.3},
+    ]
+    scored = market.score_offers(offers, config, {})
+    # Both use the same conservative fallback, so the cheaper GPU should still
+    # win because the score is (dph/3600) * (1/tps_fallback).
+    assert scored[0]["id"] == 2
+    assert all("_hostai_score" in o for o in scored)
+
+
+def test_score_offers_perf_mode_known_better_than_unknown(config):
+    """A known fast GPU should beat an unknown GPU with only a small price premium."""
+    config.market.scoring_mode = "perf"
+    config.market.scoring_prompt_weight = 0.0
+    config.market.scoring_decode_weight = 1.0
+    config.market.min_historical_samples = 1
+    offers = [
+        {"id": 1, "gpu_name": "RTX 4090", "dph_total": 0.5},
+        {"id": 2, "gpu_name": "RTX 3090", "dph_total": 0.45},
+    ]
+    stats = {"rtx4090": {"decode_tps": 2000, "decode_samples": 1}}
+    scored = market.score_offers(offers, config, stats)
+    # RTX 4090 cost/token = 0.5/3600/2000 ~ 6.9e-8.
+    # RTX 3090 unknown fallback 50 tps => 0.45/3600/50 = 2.5e-6, much worse.
+    assert scored[0]["id"] == 1
+
+
+def test_offer_download_estimate_cache_states_differ(config):
+    """Cold, cached, and unknown cache states must give distinct download sizes."""
+    offer = {"inet_down": 1000, "disk_bw": 1000, "inet_down_cost": 0.01}
+    cold = market.offer_download_estimate(offer, config, cache_state=market.CACHE_STATE_COLD)
+    cached = market.offer_download_estimate(offer, config, cache_state=market.CACHE_STATE_CACHED)
+    unknown = market.offer_download_estimate(offer, config, cache_state=market.CACHE_STATE_UNKNOWN)
+    assert cold[0] > unknown[0] > cached[0]
+    assert cold[2] > unknown[2] > cached[2]
+
+
+def test_session_scoring_uses_cache_state(config):
+    """A persistent volume should reduce the session score by skipping the model download."""
+    config.market.scoring_mode = "session"
+    config.vast.volume_id = "vol-123"
+    config.vast.volume_mount_path = "/models"
+    offer = {"id": 1, "gpu_name": "RTX 4090", "dph_total": 0.5, "inet_down": 1000, "disk_bw": 1000, "inet_down_cost": 0.0}
+    scored_cached = market.score_offers([dict(offer)], config, {}, session_seconds=300)
+
+    config.vast.volume_id = ""
+    config.vast.volume_mount_path = ""
+    scored_cold = market.score_offers([dict(offer)], config, {}, session_seconds=300)
+
+    assert scored_cached[0]["_hostai_score"].score < scored_cold[0]["_hostai_score"].score
+    assert scored_cached[0]["_hostai_score"].startup_seconds < scored_cold[0]["_hostai_score"].startup_seconds
+
+
+def test_session_scoring_total_cost_units(config):
+    """Session scoring must return total cost, not cost per token."""
+    config.market.scoring_mode = "session"
+    offer = {"id": 1, "gpu_name": "RTX 4090", "dph_total": 0.5, "inet_down": 1000, "disk_bw": 1000, "inet_down_cost": 0.0}
+    stats = {"rtx4090": {"decode_tps": 1000, "decode_samples": 1}}
+    scored = market.score_offers([offer], config, stats, session_seconds=3600)
+    # Total cost for one hour at $0.5/h plus a small startup cost.
+    assert scored[0]["_hostai_score"].score >= 0.5
+    assert scored[0]["_hostai_score"].score < 1.0
 
 
 def test_parse_duration_to_seconds():

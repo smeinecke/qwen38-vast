@@ -3,16 +3,13 @@
 import json
 from unittest import mock
 
-import click
 import requests
-from click.testing import CliRunner
 
 from hostai.commands.down import (
     _parse_rsync_transferred_bytes,
     _pause_or_destroy,
     _save_and_upload_slot_cache,
     _slot_save,
-    cmd_down,
 )
 
 
@@ -51,7 +48,7 @@ def test_save_and_upload_slot_cache_happy_path(config, running_state, tmp_path):
     with mock.patch("requests.post", return_value=mock.Mock(status_code=200, text=json.dumps(payload), json=lambda: payload)):
         with mock.patch("hostai.commands.down._install_cache_key_on_vast", return_value=True):
             with mock.patch("hostai.commands.down._fetch_llama_commit", return_value="abc123"):
-                with mock.patch("hostai.commands.down.ssh.run_remote", return_value=fake_completed()) as run:
+                with mock.patch("hostai.commands.down.ssh.run_remote", return_value=fake_completed()):
                     with mock.patch("hostai.commands.down.ssh.scp_to", return_value=fake_completed()):
                         with mock.patch("hostai.commands.down._upload_slot_cache_from_vast", return_value=(True, 12345)):
                             result = _save_and_upload_slot_cache(
@@ -135,3 +132,37 @@ def test_pause_or_destroy_404_becomes_already_absent(config, running_state, tmp_
         msg = _pause_or_destroy(config, running_state, pause=False, run_dir=run_dir)
 
     assert "already_absent" in msg
+
+
+def test_pause_or_destroy_removes_active_state(config, running_state, tmp_path):
+    """A successful or already-absent destroy must leave no active state.json."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    running_state.started_epoch = 0
+    running_state.dph = 1.0
+    running_state.status = "running"
+    running_state.save()  # create the active state file
+    assert running_state.state_file.exists()
+
+    with mock.patch("hostai.commands.down.vast.destroy", return_value=None):
+        _ = _pause_or_destroy(config, running_state, pause=False, run_dir=run_dir)
+
+    assert not running_state.state_file.exists()
+    assert running_state.status == "destroyed"
+    assert (run_dir / "metadata.json").exists()
+
+
+def test_pause_or_destroy_pause_retains_state(config, running_state, tmp_path):
+    """A pause must retain the active state file so it can be resumed."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    running_state.started_epoch = 0
+    running_state.dph = 1.0
+    running_state.status = "running"
+    running_state.save()
+
+    with mock.patch("hostai.commands.down.vast.pause", return_value=None):
+        _ = _pause_or_destroy(config, running_state, pause=True, run_dir=run_dir)
+
+    assert running_state.state_file.exists()
+    assert running_state.status == "paused"

@@ -13,6 +13,7 @@ import requests
 
 from hostai import api, cache, ssh, utils, vast
 from hostai.commands import _common
+from hostai.commands.monitor import stop_monitor
 from hostai.config import Config
 from hostai.state import State, init_run_dir, runs_dir, state_dir
 
@@ -285,7 +286,7 @@ def _save_and_upload_slot_cache(
             state.save()
             raise click.ClickException("slot cache upload failed and require_save is set; instance not destroyed")
     state.save()
-    return details if ok else None
+    return details
 
 
 def _archive_session(config: Config, state: State, run_dir: Path, no_archive: bool) -> None:
@@ -490,20 +491,26 @@ def down_instance(
 
     snapshot_bytes = int(slot_details.get("n_written", 0)) if slot_details else 0
     transferred = slot_details.get("cache_bytes_transferred") if slot_details else None
+    cache_upload_failed = bool(slot_details and not slot_details.get("uploaded"))
+    cache_delta_seed_used = False
+    if transferred is not None and snapshot_bytes and snapshot_bytes > 0 and transferred < snapshot_bytes * 0.95:
+        cache_delta_seed_used = True
+
     tail = {
         "down_started_epoch": down_start_epoch,
         "down_ended_epoch": utils.now_epoch(),
         "shutdown_tail_seconds": shutdown_tail_seconds,
         "estimated_shutdown_tail_cost_usd": round(shutdown_cost, 6),
         "cache_save_ms": slot_details.get("save_ms", 0) if slot_details else 0,
-        "slot_snapshot_bytes": snapshot_bytes,
-        "cache_bytes_transferred": transferred,
-        "telemetry_archive_duration_s": round(archive_duration, 3),
-        "pause_or_destroy_duration_s": round(pause_or_destroy_duration, 3),
+        "cache_snapshot_bytes": snapshot_bytes,
+        "cache_transfer_bytes": transferred if transferred is not None else 0,
+        "cache_transfer_duration_seconds": round(slot_details["upload_duration_s"], 3) if slot_details and "upload_duration_s" in slot_details else 0,
+        "cache_delta_seed_used": cache_delta_seed_used,
+        "cache_upload_failed": cache_upload_failed,
+        "telemetry_archive_duration_seconds": round(archive_duration, 3),
+        "pause_or_destroy_duration_seconds": round(pause_or_destroy_duration, 3),
         "reason": reason or "manual",
     }
-    if slot_details and "upload_duration_s" in slot_details:
-        tail["cache_upload_duration_s"] = round(slot_details["upload_duration_s"], 3)
     if transferred and snapshot_bytes and snapshot_bytes > 0:
         tail["cache_delta_ratio"] = round(transferred / snapshot_bytes, 6)
 
@@ -554,3 +561,4 @@ def cmd_down(config: Config, yes: bool, no_archive: bool, no_cache: bool, pause:
     )
     from hostai.commands.watchdog import stop_watchdog
     stop_watchdog(config)
+    stop_monitor(config)

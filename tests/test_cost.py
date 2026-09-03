@@ -1,10 +1,8 @@
 """Tests for hostai.commands.cost."""
 
 import json
-from unittest import mock
-from click.testing import CliRunner
 
-import pytest
+from click.testing import CliRunner
 
 from hostai.commands.cost import _count_starts_per_month, _model_fetch_estimate, cmd_volume_break_even
 

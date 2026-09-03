@@ -10,6 +10,7 @@ dependencies = [
     "aiohttp>=3.14.3",
     "asyncssh>=2.24.0",
     "click>=8.5.0",
+    "jinja2>=3.1.6",
     "python-dotenv>=1.2.3",
     "requests>=2.34.2",
     "rich>=15.0.0",
@@ -63,6 +64,9 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "--cov=hostai --cov-report=term-missing"
+markers = [
+    "slow: test that may take a while or download data from the network",
+]
 
 [tool.bandit]
 exclude_dirs = ["tests"]

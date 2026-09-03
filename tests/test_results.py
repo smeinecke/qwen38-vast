@@ -1,9 +1,7 @@
 """Tests for hostai.commands.results with mocked benchmark directories."""
 
 import json
-from unittest import mock
 
-import click
 from click.testing import CliRunner
 
 from hostai.commands.results import _load_rows, _render_csv, _render_table, cmd_results

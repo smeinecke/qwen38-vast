@@ -3,7 +3,6 @@
 from pathlib import Path
 from unittest import mock
 
-import pytest
 from click.testing import CliRunner
 
 from hostai.commands.validate_repo import cmd_validate

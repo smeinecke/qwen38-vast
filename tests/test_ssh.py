@@ -4,6 +4,8 @@ import socket
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 from hostai import ssh
 from hostai.ssh import CompletedProcess, resolve_ssh_endpoint, run_remote
 
@@ -63,6 +65,62 @@ def test_is_tunnel_healthy_refused(config, running_state):
     running_state.local_port = 18080
     with mock.patch("socket.create_connection", side_effect=socket.error):
         assert ssh.is_tunnel_healthy(config, running_state) is False
+
+
+def test_ensure_tunnel_checks_auto_selected_port(config, running_state):
+    class FakeThread:
+        def __init__(self, *, target, args, daemon):
+            _ = target, daemon
+            self.args = args
+
+        def start(self):
+            local_port = self.args[4]
+            ready = self.args[6]
+            ssh._TUNNELS[local_port] = {"stop": self.args[7]}
+            ready.set()
+
+        def join(self, timeout=None):
+            _ = timeout
+
+        def is_alive(self):
+            return False
+
+    running_state.local_port = 18080
+    with (
+        mock.patch("hostai.ssh.utils.port_is_free", return_value=False),
+        mock.patch("hostai.ssh.utils.find_free_port", return_value=18081),
+        mock.patch("hostai.ssh.clear_known_hosts"),
+        mock.patch("hostai.ssh.threading.Thread", FakeThread),
+        mock.patch("hostai.ssh._local_port_is_open", return_value=True) as port_open,
+    ):
+        assert ssh.ensure_tunnel(config, running_state) == 18081
+
+    port_open.assert_called_once_with(18081, timeout=5)
+    ssh._TUNNELS.pop(18081, None)
+
+
+def test_ensure_tunnel_surfaces_worker_error(config, running_state):
+    class FakeThread:
+        def __init__(self, *, target, args, daemon):
+            _ = target, daemon
+            self.args = args
+
+        def start(self):
+            ready = self.args[6]
+            outcome = self.args[8]
+            outcome["error"] = RuntimeError("login rejected")
+            ready.set()
+
+        def join(self, timeout=None):
+            _ = timeout
+
+    with (
+        mock.patch("hostai.ssh.utils.port_is_free", return_value=True),
+        mock.patch("hostai.ssh.clear_known_hosts"),
+        mock.patch("hostai.ssh.threading.Thread", FakeThread),
+        pytest.raises(RuntimeError, match="SSH tunnel failed: login rejected"),
+    ):
+        ssh.ensure_tunnel(config, running_state)
 
 
 def test_run_remote_success():

@@ -2,8 +2,8 @@
 
 from unittest import mock
 
-import pytest
 import click
+import pytest
 from click.testing import CliRunner
 
 from hostai.commands.lookup import _filter_offers, _resolve_query, cmd_lookup

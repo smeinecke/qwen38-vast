@@ -1,10 +1,8 @@
 """Tests for hostai.commands.cache_cmd with mocked SSH/cache APIs."""
 
 import json
-from pathlib import Path
 from unittest import mock
 
-import click
 from click.testing import CliRunner
 
 from hostai.commands.cache_cmd import cmd_cache_copy, cmd_cache_setup

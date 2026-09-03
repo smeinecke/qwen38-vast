@@ -3,7 +3,6 @@
 from types import SimpleNamespace
 from unittest import mock
 
-import pytest
 from click.testing import CliRunner
 
 from hostai.commands.watchdog import (
@@ -105,7 +104,13 @@ def test_run_once_idle_timeout_triggers_down(config):
         Client.return_value = make_client({"llamacpp:prompt_tokens_total": 10}, [])
         with mock.patch("hostai.commands.watchdog.down_instance") as down:
             with mock.patch("hostai.commands.watchdog.time.time", return_value=100):
-                _run_once(config, state, {"llamacpp:prompt_tokens_total": 10}, 0, None)
+                _, _, _, _, inact1 = _run_once(
+                    config, state, {"llamacpp:prompt_tokens_total": 10}, 0, None
+                )
+                _run_once(
+                    config, state, {"llamacpp:prompt_tokens_total": 10}, 0, None,
+                    consecutive_inactive=inact1,
+                )
 
     down.assert_called_once()
     assert down.call_args.kwargs["reason"] == "idle-timeout"
@@ -142,7 +147,13 @@ def test_run_once_max_runtime_triggers_down_when_idle(config):
         Client.return_value = make_client({"llamacpp:prompt_tokens_total": 10}, [])
         with mock.patch("hostai.commands.watchdog.down_instance") as down:
             with mock.patch("hostai.commands.watchdog.time.time", return_value=100):
-                _run_once(config, state, {"llamacpp:prompt_tokens_total": 10}, 0, 60)
+                _, _, _, _, inact1 = _run_once(
+                    config, state, {"llamacpp:prompt_tokens_total": 10}, 0, 60
+                )
+                _run_once(
+                    config, state, {"llamacpp:prompt_tokens_total": 10}, 0, 60,
+                    consecutive_inactive=inact1,
+                )
 
     down.assert_called_once()
     assert down.call_args.kwargs["reason"] == "max-runtime"
@@ -162,7 +173,7 @@ def test_run_once_unknown_activity_resets_idle_timer(config):
         Client.return_value = make_client(metrics_error=True)
         with mock.patch("hostai.commands.watchdog.down_instance") as down:
             with mock.patch("hostai.commands.watchdog.time.time", return_value=100):
-                current, last_activity, done, failures = _run_once(
+                current, last_activity, done, failures, _ = _run_once(
                     config, state, {}, 0, None, consecutive_failures=0
                 )
 
@@ -238,8 +249,10 @@ def test_run_once_temporary_api_failure_recovers(config):
         Client.return_value = client
         with mock.patch("hostai.commands.watchdog.down_instance") as down:
             with mock.patch("hostai.commands.watchdog.time.time", return_value=100):
-                _, _, done1, failures1 = _run_once(config, state, {}, 0, None)
-                _, _, done2, failures2 = _run_once(config, state, {}, 0, None, consecutive_failures=failures1)
+                _, _, done1, failures1, _ = _run_once(config, state, {}, 0, None)
+                _, _, done2, failures2, _ = _run_once(
+                    config, state, {}, 0, None, consecutive_failures=failures1
+                )
 
     assert done1 is False
     assert done2 is False
@@ -321,3 +334,131 @@ def test_maybe_start_watchdog_respects_config(config):
     with mock.patch("hostai.commands.watchdog.cmd_watchdog_start") as start:
         maybe_start_watchdog(config, state)
         start.callback.assert_called_once_with(config)
+
+
+def test_run_once_active_request_prevents_idle_destroy(config):
+    """A processing slot must never be treated as idle, even past the timeout."""
+    config.vast.idle_timeout_seconds = 60
+    config.vast.max_runtime_seconds = None
+
+    state = mock.Mock()
+    state.instance_id = 42
+    state.started_epoch = 0
+    state.exists = True
+
+    with mock.patch("hostai.commands.watchdog.api.LlamaClient") as Client:
+        Client.return_value = make_client(
+            {"llamacpp:prompt_tokens_total": 10},
+            [{"id": 0, "state": 1}],
+        )
+        with mock.patch("hostai.commands.watchdog.down_instance") as down:
+            with mock.patch("hostai.commands.watchdog.time.time", return_value=100):
+                for inact in (0, 1, 2):
+                    _, _, done, _, _ = _run_once(
+                        config, state, {"llamacpp:prompt_tokens_total": 10}, 0, None,
+                        consecutive_inactive=inact,
+                    )
+                    assert done is False
+
+    down.assert_not_called()
+
+
+def test_run_once_changing_counters_prevent_idle_destroy(config):
+    """Counter changes indicate activity and must reset the idle clock."""
+    config.vast.idle_timeout_seconds = 60
+    config.vast.max_runtime_seconds = None
+
+    state = mock.Mock()
+    state.instance_id = 42
+    state.started_epoch = 0
+    state.exists = True
+
+    with mock.patch("hostai.commands.watchdog.api.LlamaClient") as Client:
+        client = make_client({"llamacpp:prompt_tokens_total": 10}, [])
+        Client.return_value = client
+        with mock.patch("hostai.commands.watchdog.down_instance") as down:
+            with mock.patch("hostai.commands.watchdog.time.time", return_value=100):
+                _run_once(config, state, {"llamacpp:prompt_tokens_total": 5}, 0, None)
+                _run_once(config, state, {"llamacpp:prompt_tokens_total": 10}, 0, None)
+
+    down.assert_not_called()
+
+
+def test_run_once_slots_endpoint_failure_does_not_destroy(config):
+    """A failing /slots endpoint must put the watchdog in an unknown/fail-safe state."""
+    config.vast.idle_timeout_seconds = 60
+    config.vast.max_runtime_seconds = None
+
+    state = mock.Mock()
+    state.instance_id = 42
+    state.started_epoch = 0
+    state.exists = True
+
+    with mock.patch("hostai.commands.watchdog.api.LlamaClient") as Client:
+        Client.return_value = make_client({"llamacpp:prompt_tokens_total": 10}, slots_error=True)
+        with mock.patch("hostai.commands.watchdog.down_instance") as down:
+            with mock.patch("hostai.commands.watchdog.time.time", return_value=100):
+                for _ in range(5):
+                    _, _, done, _, _ = _run_once(config, state, {}, 0, None)
+                    assert done is False
+
+    down.assert_not_called()
+
+
+def test_run_once_repeated_observability_failure_remains_fail_safe(config):
+    """Many consecutive metric failures must not eventually trigger idle destroy."""
+    config.vast.idle_timeout_seconds = 60
+    config.vast.max_runtime_seconds = None
+
+    state = mock.Mock()
+    state.instance_id = 42
+    state.started_epoch = 0
+    state.exists = True
+
+    with mock.patch("hostai.commands.watchdog.api.LlamaClient") as Client:
+        Client.return_value = make_client(metrics_error=True)
+        with mock.patch("hostai.commands.watchdog.down_instance") as down:
+            with mock.patch("hostai.commands.watchdog.time.time", return_value=100):
+                failures = 0
+                for _ in range(10):
+                    _, _, done, failures, _ = _run_once(
+                        config, state, {}, 0, None, consecutive_failures=failures
+                    )
+                    assert done is False
+
+    down.assert_not_called()
+
+
+def test_run_once_activity_resuming_resets_idle_state(config):
+    """Activity after inactivity must reset the consecutive-inactive counter."""
+    config.vast.idle_timeout_seconds = 60
+    config.vast.max_runtime_seconds = None
+
+    state = mock.Mock()
+    state.instance_id = 42
+    state.started_epoch = 0
+    state.exists = True
+
+    base = {"llamacpp:prompt_tokens_total": 10}
+    with mock.patch("hostai.commands.watchdog.api.LlamaClient") as Client:
+        Client.return_value = make_client(base, [])
+        with mock.patch("hostai.commands.watchdog.down_instance") as down:
+            with mock.patch("hostai.commands.watchdog.time.time", return_value=100):
+                _, _, _, _, inact1 = _run_once(config, state, base, 0, None)
+                assert inact1 == 1
+
+                active_client = make_client({"llamacpp:prompt_tokens_total": 15}, [])
+                Client.return_value = active_client
+                _, _, _, _, inact2 = _run_once(
+                    config, state, base, 0, None, consecutive_inactive=inact1
+                )
+                assert inact2 == 0
+
+                Client.return_value = make_client({"llamacpp:prompt_tokens_total": 15}, [])
+                _, _, done, _, inact3 = _run_once(
+                    config, state, {"llamacpp:prompt_tokens_total": 15}, 0, None
+                )
+                assert done is False
+                assert inact3 == 1
+
+    down.assert_not_called()

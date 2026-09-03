@@ -66,14 +66,28 @@ def _resolve_monitor_targets(
     current: State,
 ) -> List[Profile]:
     # A running instance is the authoritative source of context/profile.
+    # Use all monitor-searchable profiles that are compatible with the running
+    # workload (same context and monitor group) so the monitor does not fall
+    # back to the default profile silently.
     if current.exists and current.instance_id and current.profile:
         active = profiles.resolve_profile(current.profile)
         if active:
-            # The state may carry a context override (e.g. ctx_size).  Keep the
-            # local profile metadata but pin the context to the running one.
             ctx = current.ctx_size or active.ctx_size
             active = dataclasses.replace(active, ctx_size=ctx)
-            return [active]
+            if active.monitor_group:
+                targets = [
+                    p for p in profiles.all_monitor_profiles(ctx)
+                    if p.monitor_group == active.monitor_group
+                ]
+                # The exact active profile is always a candidate even when it
+                # has monitor_search=false, because we need to compare against
+                # the same hardware class.
+                if active not in targets:
+                    targets.insert(0, active)
+            else:
+                targets = [active]
+            if targets:
+                return targets
 
     if profile:
         p = profiles.resolve_profile(profile)
@@ -161,15 +175,16 @@ def _ranked_best_for_monitor(
         max_dph = config.market.max_dph
 
     # The context/profile comparison is guaranteed by selecting the right local
-    # profile(s) above.  Do not rely on the Vast ``ctx_size`` field, which does
-    # not reflect the llama.cpp context size configured by HostAI.
+    # profile(s) above.  Still enforce an exact-context check when the Vast
+    # offer carries a non-zero ctx_size so a wrong-context offer cannot trigger.
+    running_ctx = current.ctx_size if (current.exists and current.instance_id) else None
     matches = market.filter_eligible_offers(
         candidates,
         max_dph=max_dph,
         offer=None,
         current_gpu=current_gpu,
         profiles=profiles,
-        ctx_size=None,
+        ctx_size=running_ctx,
     )
     if not matches:
         return None
@@ -355,6 +370,49 @@ def cmd_monitor_status(config: Config):
     else:
         click.echo("[monitor] not running (stale pid file)")
         pid_file.unlink(missing_ok=True)
+
+
+def maybe_start_monitor(config: Config, state: State) -> None:
+    """Start the price monitor daemon after hostai up when auto_start is enabled."""
+    if not config.monitor.auto_start:
+        return
+    if not state.instance_id:
+        return
+    pid_file = _monitor_pid_file(config)
+    if pid_file.exists():
+        try:
+            pid = int(pid_file.read_text().strip())
+            if _monitor_is_running(pid):
+                return
+        except (ValueError, OSError):
+            pass
+    _log_monitor(config, f"auto-starting monitor for instance {state.instance_id}")
+    if cmd_monitor_start.callback is not None:
+        cmd_monitor_start.callback(config, profile=None, group=None, interval=None, threshold=None)
+
+
+def stop_monitor(config: Config) -> None:
+    """Stop the monitor daemon if it is running."""
+    pid_file = _monitor_pid_file(config)
+    if not pid_file.exists():
+        return
+    try:
+        pid = int(pid_file.read_text().strip())
+    except (ValueError, OSError):
+        pid_file.unlink(missing_ok=True)
+        return
+    if not _monitor_is_running(pid):
+        pid_file.unlink(missing_ok=True)
+        return
+    if cmd_monitor_stop.callback is not None:
+        cmd_monitor_stop.callback(config)
+
+
+def _log_monitor(config: Config, message: str) -> None:
+    log_file = _monitor_log_file(config)
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    with log_file.open("a", encoding="utf-8") as f:
+        f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {message}\n")
 
 
 @cmd_monitor.command("logs", help="Tail the monitor daemon log.")

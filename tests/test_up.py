@@ -1,14 +1,13 @@
 """Tests for hostai.commands.up helpers and CLI validation."""
 
 import json
-from types import SimpleNamespace
 from unittest import mock
 
 import click
 import pytest
 from click.testing import CliRunner
 
-from hostai.commands.up import _do_fresh, cmd_up
+from hostai.commands.up import _do_fresh, _extra_args, cmd_up
 
 
 def make_offer(**overrides):
@@ -302,3 +301,21 @@ def test_do_fresh_search_query_caps_at_bid(config, project_dir):
     query = select.call_args.args[2]
     assert "dph_total <= 0.35" in query
     assert select.call_args.kwargs["offer_type"] == "bid"
+
+
+def test_extra_args_uses_cache_shm_minimum(config):
+    config.cache.enabled = True
+    config.cache.use_shm = True
+    config.cache.shm_min_gb = 32
+    config.vast.shm_size_gb = None
+
+    assert _extra_args(config) == "--shm-size=32g"
+    assert _extra_args(config, no_cache=True) == ""
+
+
+def test_extra_args_prefers_explicit_shm_size(config):
+    config.cache.use_shm = True
+    config.cache.shm_min_gb = 32
+    config.vast.shm_size_gb = 48
+
+    assert _extra_args(config) == "--shm-size=48g"
