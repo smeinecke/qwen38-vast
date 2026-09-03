@@ -23,7 +23,7 @@
 
 ## Container disk and model storage
 
-- The default `market.disk_gb` is 35, sized for the Q4_K_P main model (~16.7 GiB) + FastMTP draft (~0.84 GiB) + ~5 GiB image/runtime overhead + safety margin.
-- Do not put `disk_space>=N` constraints in `profiles.json` queries. `market.build_search_query` derives `disk_space>=N` from `resolved_disk_gb(profile, config)` so searches, lookups, and monitor checks stay consistent.
+- The default `market.disk_gb` is 35, sized for the Q4_K_P main model (~16.7 GiB = 17.92 decimal GB) + FastMTP-32K draft (~0.84 GiB = 0.90 decimal GB) + ~5 GB image/runtime overhead + safety margin.  You can override per-profile with `disk_gb` in `profiles.json`.
+- Do not put `disk_space>=N` constraints in `profiles.json` queries. `market.build_search_query` derives `disk_space>=N` from `resolved_disk_gb(profile, config)` so searches, lookups, monitor checks, and cost/startup estimates stay consistent.
 - `start.sh` now logs per-stage disk usage (`after-preflight`, `after-main-model`, `after-draft-model`, `before-serve`) to `/dev/shm/qwen38/log/disk-usage.log`. `hostai up` copies this plus a final snapshot to `run-*/disk-telemetry.json` after a successful cold start.
 - The container image must be rebuilt after changes to `start.sh`.

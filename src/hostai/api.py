@@ -149,15 +149,27 @@ class LlamaClient:
 
         return response.text
 
-    def get_metrics(self) -> Dict[str, float]:
-        """GET /metrics and parse it into {metric_name: value}."""
+    def get_metrics(self, raise_on_error: bool = False) -> Dict[str, float]:
+        """GET /metrics and parse it into {metric_name: value}.
+
+        When *raise_on_error* is True, a failed or non-200 request raises a
+        RuntimeError so callers can distinguish an unreachable endpoint from
+        an empty metrics payload.
+        """
         text = self.get_metrics_text()
         if text is None:
+            if raise_on_error:
+                raise RuntimeError("/metrics request failed or returned non-200")
             return {}
         return _parse_prom(text)
 
-    def slots(self) -> List[Dict[str, Any]]:
-        """GET /slots. Returns a list of slot objects or [] on failure."""
+    def slots(self, raise_on_error: bool = False) -> List[Dict[str, Any]]:
+        """GET /slots. Returns a list of slot objects or [] on failure.
+
+        When *raise_on_error* is True, a failed or non-200 request raises a
+        RuntimeError so callers can distinguish an unreachable endpoint from
+        an empty slot list.
+        """
         try:
             response = requests.get(
                 self._url("/slots"),
@@ -165,17 +177,25 @@ class LlamaClient:
                 verify=self._verify,
                 timeout=(2, 10),
             )
-        except requests.RequestException:
+        except requests.RequestException as exc:
+            if raise_on_error:
+                raise RuntimeError("/slots request failed") from exc
             return []
 
         if response.status_code != 200:
+            if raise_on_error:
+                raise RuntimeError(f"/slots returned {response.status_code}")
             return []
 
         try:
             payload = response.json()
             if isinstance(payload, list):
                 return payload
-        except (json.JSONDecodeError, ValueError):
+            if raise_on_error:
+                raise RuntimeError("/slots returned a non-list payload")
+        except (json.JSONDecodeError, ValueError) as exc:
+            if raise_on_error:
+                raise RuntimeError("/slots response was not valid JSON") from exc
             pass
 
         return []

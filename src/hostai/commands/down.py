@@ -58,6 +58,43 @@ def _slot_save(config: Config, state: State, slot_id: Optional[int] = None) -> O
     }
 
 
+_RSYNC_SIZE_UNITS = {
+    "B": 1,
+    "K": 1024,
+    "M": 1024 ** 2,
+    "G": 1024 ** 3,
+    "T": 1024 ** 4,
+    "P": 1024 ** 5,
+}
+
+
+def _parse_rsync_transferred_bytes(stdout: str) -> Optional[int]:
+    """Extract the actual bytes rsync transferred from --stats/--info=stats2 output.
+
+    When a previous ``current.bin`` is delta-seeded, this will be far smaller
+    than the slot snapshot size.
+    """
+    if not stdout:
+        return None
+    # rsync --stats2 prints a line like:
+    #   Total bytes sent: 838.46K
+    # or, without stats2, a final line like:
+    #   sent 838.46K bytes  received 79 bytes ...
+    for pattern in (
+        r"Total bytes sent:\s+([\d.,]+)\s*([KMGTPE]?)B?",
+        r"\bsent\s+([\d.,]+)\s*([KMGTPE]?)\s*bytes?\b",
+    ):
+        m = re.search(pattern, stdout, re.IGNORECASE)
+        if m:
+            try:
+                num = float(m.group(1).replace(",", ""))
+            except ValueError:
+                continue
+            unit = m.group(2).upper()
+            return int(num * _RSYNC_SIZE_UNITS.get(unit, 1))
+    return None
+
+
 def _upload_slot_cache_from_vast(
     ssh_url: str,
     config: Config,
@@ -65,11 +102,18 @@ def _upload_slot_cache_from_vast(
     remote_dir: str,
     known_hosts: Path,
     upload_log: Optional[Path] = None,
-) -> bool:
-    """Push current.bin/json to the cache server (rsync or rclone)."""
+) -> tuple[bool, Optional[int]]:
+    """Push current.bin/json to the cache server (rsync or rclone).
+
+    Returns ``(success, transferred_bytes)``.  For rsync the transferred bytes
+    are parsed from the command output so delta-seeded uploads report the
+    incremental amount, not the full snapshot size.  For rclone the value is
+    ``None`` because rclone does not expose the same delta statistics in this
+    path.
+    """
     cache_configured = config.cache.host or config.cache.rclone_url or config.cache.rclone_remote
     if not cache_configured:
-        return False
+        return False, None
 
     if config.cache.rclone:
         script = cache.rclone_upload_script(config, slot_dir, remote_dir)
@@ -77,7 +121,8 @@ def _upload_slot_cache_from_vast(
         if upload_log is not None:
             upload_log.parent.mkdir(parents=True, exist_ok=True)
             upload_log.write_text(res.stdout or "")
-        return res.returncode == 0 and "ok" in (res.stdout or "")
+        ok = res.returncode == 0 and "ok" in (res.stdout or "")
+        return ok, None
 
     script = """set -Eeuo pipefail
 umask 077
@@ -119,7 +164,9 @@ echo "ok"
     if upload_log is not None:
         upload_log.parent.mkdir(parents=True, exist_ok=True)
         upload_log.write_text(res.stdout or "")
-    return res.returncode == 0 and "ok" in (res.stdout or "")
+    ok = res.returncode == 0 and "ok" in (res.stdout or "")
+    transferred = _parse_rsync_transferred_bytes(res.stdout or "") if ok else None
+    return ok, transferred
 
 
 def _save_and_upload_slot_cache(
@@ -219,8 +266,9 @@ def _save_and_upload_slot_cache(
 
     upload_log = run_dir / "cache-upload.log"
     upload_start = time.monotonic()
-    ok = _upload_slot_cache_from_vast(state.ssh_url, config, slot_dir, remote_dir, known_hosts, upload_log)
+    ok, transferred = _upload_slot_cache_from_vast(state.ssh_url, config, slot_dir, remote_dir, known_hosts, upload_log)
     details["uploaded"] = ok
+    details["cache_bytes_transferred"] = transferred
     details["upload_duration_s"] = time.monotonic() - upload_start
     details["n_saved"] = n_saved
     details["n_written"] = n_written
@@ -440,23 +488,32 @@ def down_instance(
     shutdown_tail_seconds = max(0, utils.now_epoch() - down_start_epoch)
     shutdown_cost = (state.dph or 0.0) * shutdown_tail_seconds / 3600.0
 
+    snapshot_bytes = int(slot_details.get("n_written", 0)) if slot_details else 0
+    transferred = slot_details.get("cache_bytes_transferred") if slot_details else None
     tail = {
         "down_started_epoch": down_start_epoch,
         "down_ended_epoch": utils.now_epoch(),
         "shutdown_tail_seconds": shutdown_tail_seconds,
         "estimated_shutdown_tail_cost_usd": round(shutdown_cost, 6),
         "cache_save_ms": slot_details.get("save_ms", 0) if slot_details else 0,
-        "cache_bytes_uploaded": slot_details.get("n_written", 0) if slot_details else 0,
+        "slot_snapshot_bytes": snapshot_bytes,
+        "cache_bytes_transferred": transferred,
         "telemetry_archive_duration_s": round(archive_duration, 3),
         "pause_or_destroy_duration_s": round(pause_or_destroy_duration, 3),
         "reason": reason or "manual",
     }
     if slot_details and "upload_duration_s" in slot_details:
         tail["cache_upload_duration_s"] = round(slot_details["upload_duration_s"], 3)
+    if transferred and snapshot_bytes and snapshot_bytes > 0:
+        tail["cache_delta_ratio"] = round(transferred / snapshot_bytes, 6)
 
     (run_dir / "shutdown-tail.json").write_text(json.dumps(tail, indent=2, ensure_ascii=False) + "\n")
     state.set("shutdown_tail", tail)
-    state.save()
+    # Update the run metadata so the shutdown tail is recorded in the
+    # archived run, but do not recreate live state.json after a destroy.
+    state.save_metadata(run_dir, status="paused" if pause else "destroyed")
+    if pause:
+        state.save()
 
     _client_log(run_dir, f"{outcome} | tail={shutdown_tail_seconds}s cost=${shutdown_cost:.6f} reason={reason or 'manual'}")
 

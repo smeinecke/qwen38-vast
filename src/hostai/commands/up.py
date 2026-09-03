@@ -81,12 +81,18 @@ def cmd_up(
     if scoring_mode:
         config.market.scoring_mode = scoring_mode
 
-    bid_price = bid if bid is not None else config.vast.bid_price
-    if interruptible or bid_price is not None:
+    # Interruptible mode is enabled by CLI flag, config flag, or an explicit bid.
+    use_interruptible = interruptible or config.vast.interruptible or bid is not None or config.vast.bid_price is not None
+    if use_interruptible:
+        bid_price = bid if bid is not None else config.vast.bid_price
         if bid_price is None:
             bid_price = max_price if max_price is not None else config.market.max_dph
-        if bid_price <= 0:
-            raise click.ClickException("interruptible instances require a positive --bid or max_dph")
+        if bid_price is None or bid_price <= 0:
+            raise click.ClickException(
+                "interruptible mode requires a positive bid price: set --bid, [vast].bid_price, or [market].max_dph"
+            )
+    else:
+        bid_price = None
 
     session_seconds = None
     if expected_session is not None:
@@ -559,11 +565,20 @@ def _do_fresh(
     disk_gb = market.resolved_disk_gb(profile, config)
     interruptible = bid_price is not None
 
-    query, max_dph = market.build_search_query(config, profiles, profile, max_price=max_price, unverified=unverified, offer=offer)
+    query, max_dph = market.build_search_query(config, profiles, profile, max_price=max_price, unverified=unverified, offer=offer, bid_price=bid_price)
     click.echo(f"[profile] {profile.name} | sm_{image.cuda_arch} | ctx={ctx_size} | image={selected_image} | disk={disk_gb}GB")
     click.echo(f"[search]  {query}")
 
     offer_type = "bid" if interruptible else "on-demand"
+    configured_max_dph = max_price if max_price is not None else config.market.max_dph
+    if interruptible and bid_price is not None:
+        effective_cap = min(configured_max_dph, bid_price)
+        click.echo(
+            f"[search]  mode={offer_type} configured_max_dph=${configured_max_dph:.4f}/h "
+            f"bid=${bid_price:.4f}/h effective_cap=${effective_cap:.4f}/h"
+        )
+    else:
+        click.echo(f"[search]  mode={offer_type} max_dph=${configured_max_dph:.4f}/h")
     offer_data = market.select_offer(
         config,
         profiles,

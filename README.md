@@ -283,9 +283,11 @@ avoid duplicate Vast API searches.
 
 `hostai monitor` compares the **hourly Vast rental price of the currently running
 instance** (`dph_total`) with currently rentable Vast offers. A candidate must
-use the **same context size** and its concrete GPU must have an equal-or-higher
-rank in `profiles.json -> monitor_hardware.gpu_ranks`. Search uses the same
-configured disk size, so the comparison is not just the bare GPU price.
+match the **active or selected local profile** (same context size, model, and
+disk constraints) and its concrete GPU must have an equal-or-higher rank in
+`profiles.json -> monitor_hardware.gpu_ranks`. Search uses the same configured
+disk size, so the comparison is not just the bare GPU price.  Interruptible
+instances are compared against bid offers at their stored bid price.
 
 One-shot check:
 
@@ -503,12 +505,14 @@ Additional search and scoring controls live in `hostai.toml` under `[market]`
 and `[vast]`:
 
 - `disk_gb` — default container disk in GB; can also be set per-profile with `disk_gb`.
-  The default `35` is sized for the Q4_K_P main model (~16.7 GiB) plus FastMTP
-  draft (~0.84 GiB), ~5 GiB of image/runtime overhead, and a safety margin.
-  The `disk_space>=N` host-eligibility constraint is derived from this value
-  automatically, so do not hard-code `disk_space` in profile queries.
+  The default `35` is sized for the Q4_K_P main model (~16.7 GiB = 17.92 decimal GB),
+  the FastMTP-32K draft (~0.84 GiB = 0.90 decimal GB), ~5 GB of image/runtime
+  overhead, and a safety margin.  The `disk_space>=N` host-eligibility constraint
+  is derived from this value automatically, so do not hard-code `disk_space` in
+  profile queries.
 - `max_inet_down_cost` / `max_inet_up_cost` — reject paid traffic beyond these
-  USD/GB limits; set to `0.0` to require free traffic
+  USD/GB limits; set to `0.0` to require free traffic.  These limits are also
+  used in `session` scoring to include transfer cost in startup/session cost.
 - `scoring_mode` — `dph` (default), `perf`, or `session`
 - `scoring_prompt_weight` / `scoring_decode_weight` — balance prompt vs decode
   TPS when scoring in `perf` or `session` mode
@@ -601,9 +605,10 @@ number of historical samples in `[market]`.
 ## Persistent model volume break-even
 
 `hostai cost volume-break-even` estimates whether a persistent model volume is
-cheaper than re-downloading the model and image on every start.  It uses the
-current (or configured) `dph`, bandwidth, and the number of recent starts from
-`.hostai-runs`.
+cheaper than re-downloading the model weights on every start.  It only credits
+savings for the main model and any draft/MTP files; Docker image pulls,
+container startup, and unrelated init are not avoided.  It uses the current (or
+configured) `dph`, bandwidth, and the number of recent starts from `.hostai-runs`.
 
 ```bash
 uv run hostai cost volume-break-even --volume-gb 100 --volume-cost-month 5.00

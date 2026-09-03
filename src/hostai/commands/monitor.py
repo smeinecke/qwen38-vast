@@ -2,10 +2,16 @@
 
 The monitor reuses the same query building, storage allocation, eligibility
 filtering, and hardware-rank logic as ``hostai up``.  It only alerts for an
-offer that is the same context size, uses an equal-or-better GPU, and has a
-lower hourly price.
+offer that uses the active/equivalent local profile, an equal-or-better GPU,
+and has a lower hourly price.
+
+The comparison context comes from HostAI profile configuration, not from Vast
+offer fields.  When an instance is running, the active profile and context size
+from ``state.json`` take precedence over the configured default so the monitor
+compares apples-to-apples.
 """
 
+import dataclasses
 import os
 import shutil
 import signal
@@ -57,41 +63,67 @@ def _resolve_monitor_targets(
     profiles: Profiles,
     profile: Optional[str],
     group: Optional[str],
+    current: State,
 ) -> List[Profile]:
+    # A running instance is the authoritative source of context/profile.
+    if current.exists and current.instance_id and current.profile:
+        active = profiles.resolve_profile(current.profile)
+        if active:
+            # The state may carry a context override (e.g. ctx_size).  Keep the
+            # local profile metadata but pin the context to the running one.
+            ctx = current.ctx_size or active.ctx_size
+            active = dataclasses.replace(active, ctx_size=ctx)
+            return [active]
+
     if profile:
         p = profiles.resolve_profile(profile)
-        if not p:
-            raise click.ClickException(f"unknown profile '{profile}'")
-        return [p]
+        if p and p.monitor_search:
+            return [p]
+        raise click.ClickException(f"unknown or monitor-disabled profile '{profile}'")
+
     if config.monitor.profile:
         p = profiles.resolve_profile(config.monitor.profile)
-        if p:
+        if p and p.monitor_search:
             return [p]
+
     group = group or config.monitor.group
     if group:
-        targets = [p for p in profiles.profiles if p.monitor_group == group]
+        targets = [p for p in profiles.profiles if p.monitor_group == group and p.monitor_search]
         if not targets:
             raise click.ClickException(f"no profiles in monitor group '{group}'")
         return targets
+
     p = profiles.resolve_profile(config.hostai.default_profile)
-    if p:
+    if p and p.monitor_search:
         return [p]
-    raise click.ClickException("no profile configured")
+
+    raise click.ClickException("no monitorable profile configured")
 
 
 def _search_profiles(
     config: Config,
     profiles: Profiles,
     targets: List[Profile],
+    current: State,
 ) -> List[Dict[str, Any]]:
-    """Search a list of profiles and merge the results."""
+    """Search a list of profiles and merge the results.
+
+    If a running instance is active, its bid price and current dph constrain
+    the search so the monitor only compares against offers that could actually
+    be rented at the same economics.
+    """
+    bid_price = current.bid_price if (current.exists and current.bid_price is not None) else None
+    max_price = current.dph if (current.exists and current.instance_id and current.dph is not None and current.dph > 0) else None
+    offer_type = "bid" if bid_price is not None else "on-demand"
+
     all_offers: List[Dict[str, Any]] = []
     for p in targets:
         query, max_dph = market.build_search_query(
             config,
             profiles,
             p,
-            max_price=None,
+            max_price=max_price,
+            bid_price=bid_price,
             unverified=config.market.allow_unverified,
             offer=None,
         )
@@ -103,7 +135,7 @@ def _search_profiles(
                 storage=disk_gb,
                 max_dph=max_dph,
                 offer=None,
-                offer_type="on-demand",
+                offer_type=offer_type,
                 limit=10,
             )
         except Exception:
@@ -123,19 +155,21 @@ def _ranked_best_for_monitor(
         return None
 
     current_gpu = current.gpu
-    ctx_size = current.ctx_size or 0
     if current.exists and current.dph is not None:
         max_dph = current.dph
     else:
         max_dph = config.market.max_dph
 
+    # The context/profile comparison is guaranteed by selecting the right local
+    # profile(s) above.  Do not rely on the Vast ``ctx_size`` field, which does
+    # not reflect the llama.cpp context size configured by HostAI.
     matches = market.filter_eligible_offers(
         candidates,
         max_dph=max_dph,
         offer=None,
         current_gpu=current_gpu,
         profiles=profiles,
-        ctx_size=ctx_size,
+        ctx_size=None,
     )
     if not matches:
         return None
@@ -150,11 +184,11 @@ def _ranked_best_for_monitor(
 @click.pass_obj
 def cmd_monitor_once(config: Config, profile: Optional[str], group: Optional[str]):
     profiles = Profiles.from_file(config.root_dir / config.hostai.profiles_file)
-    targets = _resolve_monitor_targets(config, profiles, profile, group)
     current = State.load(state_dir(config.root_dir) / "state.json")
+    targets = _resolve_monitor_targets(config, profiles, profile, group, current)
     current_dph = current.dph if current.exists else None
 
-    all_offers = _search_profiles(config, profiles, targets)
+    all_offers = _search_profiles(config, profiles, targets, current)
     best = _ranked_best_for_monitor(config, profiles, current, all_offers)
     if best is None:
         click.echo("no matching offers")
@@ -182,14 +216,15 @@ def cmd_monitor_watch(
     sec = interval if interval is not None else config.monitor.interval
     pct = threshold if threshold is not None else config.monitor.threshold_pct
     profiles = Profiles.from_file(config.root_dir / config.hostai.profiles_file)
-    targets = _resolve_monitor_targets(config, profiles, profile, group)
+    current = State.load(state_dir(config.root_dir) / "state.json")
+    targets = _resolve_monitor_targets(config, profiles, profile, group, current)
     label = group or ", ".join(p.name for p in targets)
     click.echo(f"[monitor] watching '{label}' every {sec}s (threshold {pct}%)")
     try:
         while True:
             current = State.load(state_dir(config.root_dir) / "state.json")
             current_dph = current.dph if current.exists else None
-            all_offers = _search_profiles(config, profiles, targets)
+            all_offers = _search_profiles(config, profiles, targets, current)
             best = _ranked_best_for_monitor(config, profiles, current, all_offers)
             if best:
                 best_dph = best.get("dph_total", 0)

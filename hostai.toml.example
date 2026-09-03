@@ -7,10 +7,13 @@ profiles_file = "profiles.json"
 
 [market]
 max_dph = 0.80
-# Container disk (GB).  For the default Q4_K_P main model (16.7 GiB) plus the
-# FastMTP draft (0.84 GiB) plus ~5 GiB of image/runtime overhead and a safety
-# margin, 35 GB is the conservative target.  Override per-profile with disk_gb.
+# Container disk (GB).  35 GB is the default for the Q4_K_P main model
+# (~16.7 GiB = 17.92 decimal GB), the FastMTP-32K draft (~0.84 GiB = 0.90
+# decimal GB), ~5 GB of image/runtime overhead, and a safety margin.  You can
+# override per-profile with "disk_gb" in profiles.json.
 disk_gb = 35
+# Reject offers that charge more than this USD per GB for download/upload.
+# Set to 0.0 to require free traffic.  Also included in session-cost scoring.
 max_inet_down_cost = 0.001
 max_inet_up_cost = 0.001
 # Scoring: dph | perf | session

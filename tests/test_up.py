@@ -81,6 +81,13 @@ def _write_test_profiles(project_dir, with_disk_gb=None):
         "market_policy": {"require_free_traffic": False},
     }
     (project_dir / "hostai.profiles.toml").write_text(json.dumps(profiles))
+    return profiles
+
+
+def _prep_config_for_cli(config, project_dir):
+    _write_test_profiles(project_dir)
+    config.hostai.profiles_file = "hostai.profiles.toml"
+    config.image.base = "example/hostai"
 
 
 def test_do_fresh_uses_resolved_profile_disk(config, project_dir):
@@ -193,3 +200,105 @@ def test_do_fresh_allows_recreate_when_instance_is_exited(config, project_dir):
         with mock.patch("hostai.commands.up._resolve_profile", side_effect=RuntimeError("later step")):
             with pytest.raises(RuntimeError, match="later step"):
                 _do_fresh(config, "test", None, None, None, False, False, False, False, None)
+
+
+def test_cmd_up_config_interruptible_uses_bid_price(config, project_dir):
+    """[vast] interruptible = true with a bid_price must select bid offers."""
+    _prep_config_for_cli(config, project_dir)
+    config.vast.interruptible = True
+    config.vast.bid_price = 0.35
+
+    with mock.patch("hostai.commands.up._do_fresh") as do_fresh:
+        runner = CliRunner()
+        result = runner.invoke(cmd_up, ["--dry-run"], obj=config)
+
+    assert result.exit_code == 0, result.output
+    assert do_fresh.call_args.kwargs["bid_price"] == 0.35
+
+
+def test_cmd_up_config_interruptible_no_bid_falls_back_to_max_dph(config, project_dir):
+    """[vast] interruptible = true without a bid must fall back to [market].max_dph."""
+    _prep_config_for_cli(config, project_dir)
+    config.vast.interruptible = True
+    config.vast.bid_price = None
+    config.market.max_dph = 0.8
+
+    with mock.patch("hostai.commands.up._do_fresh") as do_fresh:
+        runner = CliRunner()
+        result = runner.invoke(cmd_up, ["--dry-run"], obj=config)
+
+    assert result.exit_code == 0, result.output
+    assert do_fresh.call_args.kwargs["bid_price"] == 0.8
+
+
+def test_cmd_up_cli_bid_overrides_config_bid(config, project_dir):
+    """--bid takes precedence over [vast].bid_price."""
+    _prep_config_for_cli(config, project_dir)
+    config.vast.bid_price = 0.25
+
+    with mock.patch("hostai.commands.up._do_fresh") as do_fresh:
+        runner = CliRunner()
+        result = runner.invoke(cmd_up, ["--bid", "0.50", "--dry-run"], obj=config)
+
+    assert result.exit_code == 0, result.output
+    assert do_fresh.call_args.kwargs["bid_price"] == 0.50
+
+
+def test_cmd_up_config_interruptible_false_with_bid_still_bid(config, project_dir):
+    """A configured bid_price implies interruptible even when the flag is false."""
+    _prep_config_for_cli(config, project_dir)
+    config.vast.interruptible = False
+    config.vast.bid_price = 0.30
+
+    with mock.patch("hostai.commands.up._do_fresh") as do_fresh:
+        runner = CliRunner()
+        result = runner.invoke(cmd_up, ["--dry-run"], obj=config)
+
+    assert result.exit_code == 0, result.output
+    assert do_fresh.call_args.kwargs["bid_price"] == 0.30
+
+
+def test_cmd_up_on_demand_default_no_bid(config, project_dir):
+    """Without --interruptible, [vast].interruptible, or a bid, launch is on-demand."""
+    _prep_config_for_cli(config, project_dir)
+    config.vast.interruptible = False
+    config.vast.bid_price = None
+
+    with mock.patch("hostai.commands.up._do_fresh") as do_fresh:
+        runner = CliRunner()
+        result = runner.invoke(cmd_up, ["--dry-run"], obj=config)
+
+    assert result.exit_code == 0, result.output
+    assert do_fresh.call_args.kwargs["bid_price"] is None
+
+
+def test_cmd_up_config_interruptible_no_price_fails(config, project_dir):
+    """[vast] interruptible = true with no price source must fail cleanly."""
+    _prep_config_for_cli(config, project_dir)
+    config.vast.interruptible = True
+    config.vast.bid_price = None
+    config.market.max_dph = 0.0
+
+    runner = CliRunner()
+    result = runner.invoke(cmd_up, ["--dry-run"], obj=config)
+    assert result.exit_code != 0
+    assert "interruptible mode requires a positive bid price" in result.output
+
+
+def test_do_fresh_search_query_caps_at_bid(config, project_dir):
+    """Interruptible search must use dph_total <= bid_price."""
+    _write_test_profiles(project_dir)
+    config.hostai.profiles_file = "hostai.profiles.toml"
+    config.image.base = "example/hostai"
+    config.market.max_dph = 0.8
+
+    with (
+        mock.patch("hostai.commands.up.market.select_offer", return_value=make_offer()) as select,
+        mock.patch("hostai.commands.up.create_instance_from_offer", return_value={"new_contract": 123}),
+        mock.patch("hostai.commands.up._do_fresh_core"),
+    ):
+        _do_fresh(config, "test", None, None, None, False, False, False, False, None, bid_price=0.35)
+
+    query = select.call_args.args[2]
+    assert "dph_total <= 0.35" in query
+    assert select.call_args.kwargs["offer_type"] == "bid"

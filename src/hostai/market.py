@@ -93,6 +93,7 @@ def build_search_query(
     max_price: Optional[float] = None,
     unverified: bool = False,
     offer: Optional[int] = None,
+    bid_price: Optional[float] = None,
 ) -> Tuple[str, float]:
     """Build a Vast query string from profile and config.
 
@@ -101,12 +102,18 @@ def build_search_query(
     single source of truth for the ``disk_space`` host-eligibility constraint.
     Any ``disk_space`` clause already present in the profile query is replaced.
 
+    For interruptible/bid launches, the search ceiling is ``min(max_dph,
+    bid_price)`` so the returned offers can actually be rented at the resolved
+    bid.
+
     This keeps ``hostai up`` and the monitor on the same search semantics.
     """
     if max_price is not None and max_price < 0:
         raise click.ClickException("--max-price must be non-negative")
 
     max_dph = max_price if max_price is not None else config.market.max_dph
+    if bid_price is not None:
+        max_dph = min(max_dph, bid_price)
     query = config.hostai.gpu_query_override or profile.gpu_query
     disk_gb = resolved_disk_gb(profile, config)
 
@@ -165,6 +172,7 @@ def offer_download_estimate(
 
     # Convert Vast's Mbps into seconds for the full payload.
     if inet_down > 0:
+        # Vast reports inet_down in Mbps; convert to megabits and divide.
         net_seconds = (size_gb * 8 * 1000) / inet_down
     else:
         net_seconds = float("inf")
@@ -176,7 +184,16 @@ def offer_download_estimate(
     else:
         disk_seconds = float("inf")
 
-    download_seconds = max(MIN_STARTUP_SECONDS, min(net_seconds, disk_seconds))
+    # Startup is a bottleneck model: the model cannot be served until both the
+    # network transfer and the local disk processing have completed.  Use the
+    # slower of the two while still respecting a fixed minimum startup floor.
+    # If one of the two is unknown, the finite one drives the estimate; if both
+    # are unknown, fall back to the minimum startup floor.
+    finite_seconds = [s for s in (net_seconds, disk_seconds) if s != float("inf")]
+    if finite_seconds:
+        download_seconds = max(MIN_STARTUP_SECONDS, *finite_seconds)
+    else:
+        download_seconds = MIN_STARTUP_SECONDS
 
     inet_down_cost = float(offer.get("inet_down_cost", 0) or 0)
     transfer_cost = size_gb * inet_down_cost

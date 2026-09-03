@@ -194,12 +194,62 @@ def test_score_offers_session_mode_prefers_short_startup(config):
     assert scored[0]["id"] == 2
 
 
-def test_offer_download_estimate_prefers_network_bandwidth(config):
-    offer = {"inet_down": 1000, "disk_bw": 200}
+def test_offer_download_estimate_uses_bottleneck(config):
+    """Startup must wait for the slower of network transfer and disk processing."""
+    config.market.model_download_gb = 18.83
+    config.market.image_size_gb = 5.0
+    # Fast network, slow disk: disk is the bottleneck.
+    offer = {"inet_down": 1000, "disk_bw": 10}
     size, seconds, _ = market.offer_download_estimate(offer, config)
-    # 18.83 GB model + 5 GB image at 1000 Mbps ~ (23.83*8*1000)/1000 = 191s plus extraction slower
-    assert size == 23.83
-    assert seconds > 0
+    net_seconds = (size * 8 * 1000) / 1000
+    disk_seconds = (size * 1024 / 10) * 2
+    assert seconds == pytest.approx(max(30.0, net_seconds, disk_seconds), rel=1e-3)
+    assert seconds > net_seconds
+
+    # Fast disk, slow network: network is the bottleneck.
+    offer = {"inet_down": 10, "disk_bw": 1000}
+    size, seconds, _ = market.offer_download_estimate(offer, config)
+    net_seconds = (size * 8 * 1000) / 10
+    disk_seconds = (size * 1024 / 1000) * 2
+    assert seconds == pytest.approx(max(30.0, net_seconds, disk_seconds), rel=1e-3)
+    assert seconds > disk_seconds
+
+    # Missing bandwidth data falls back to the minimum startup floor.
+    offer = {"inet_down": 0, "disk_bw": 0}
+    size, seconds, _ = market.offer_download_estimate(offer, config)
+    assert seconds == 30.0
+
+
+def test_build_search_query_bid_price_caps_max_dph(config):
+    """A bid price below max_dph must lower the search ceiling."""
+    config.market.max_dph = 0.8
+    config.market.disk_gb = 35
+    profiles = Profiles(
+        schema_version=1,
+        images=[],
+        profiles=[make_profile()],
+        monitor_hardware=MonitorHardware(),
+        market_policy=MarketPolicy(require_free_traffic=False),
+    )
+    query, max_dph = market.build_search_query(config, profiles, make_profile(), bid_price=0.35)
+    assert "dph_total <= 0.35" in query
+    assert max_dph == 0.35
+
+
+def test_build_search_query_bid_price_ignored_when_none(config):
+    """Without a bid, max_dph is the configured ceiling."""
+    config.market.max_dph = 0.8
+    config.market.disk_gb = 35
+    profiles = Profiles(
+        schema_version=1,
+        images=[],
+        profiles=[make_profile()],
+        monitor_hardware=MonitorHardware(),
+        market_policy=MarketPolicy(require_free_traffic=False),
+    )
+    query, max_dph = market.build_search_query(config, profiles, make_profile())
+    assert "dph_total <= 0.8" in query
+    assert max_dph == 0.8
 
 
 def test_parse_duration_to_seconds():

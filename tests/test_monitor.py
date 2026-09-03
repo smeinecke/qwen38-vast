@@ -14,57 +14,125 @@ from hostai.commands.monitor import (
     cmd_monitor_once,
 )
 from hostai.profiles import HardwareRank, MonitorHardware, Profile, Profiles
+from hostai.state import State
 
 
-def make_profile(name="test", group="", disk_gb=None, query="gpu_name == RTX_4090"):
+def make_profile(name="test", group="", disk_gb=None, query="gpu_name == RTX_4090", ctx_size=32768, monitor_search=True):
     return Profile(
         name=name,
         image="a",
-        ctx_size=32768,
+        ctx_size=ctx_size,
         gpu_query=query,
         monitor_group=group or None,
         disk_gb=disk_gb,
+        monitor_search=monitor_search,
     )
 
 
-def test_resolve_monitor_targets_from_profile(config):
-    profiles = mock.Mock()
-    profiles.profiles = []
-    p = make_profile("test")
-    profiles.resolve_profile.return_value = p
-    targets = _resolve_monitor_targets(config, profiles, "test", None)
+def _make_profiles(*profiles):
+    return Profiles(
+        schema_version=1,
+        images=[],
+        profiles=list(profiles),
+        monitor_hardware=MonitorHardware(policy="same_or_better", gpu_ranks=[]),
+        market_policy=mock.Mock(require_free_traffic=False, max_inet_down_cost=0.0, max_inet_up_cost=0.0),
+    )
+
+
+def _state(project_dir, **data):
+    state_file = project_dir / ".hostai-vast" / "state.json"
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    state_file.write_text(json.dumps(data))
+    return State.load(state_file)
+
+
+def test_resolve_monitor_targets_from_profile(config, project_dir):
+    profiles = _make_profiles(make_profile("test"))
+    current = _state(project_dir)
+    targets = _resolve_monitor_targets(config, profiles, "test", None, current)
     assert [t.name for t in targets] == ["test"]
 
 
-def test_resolve_monitor_targets_from_group(config):
-    profiles = mock.Mock()
-    p = make_profile("test", group="cheap")
-    profiles.profiles = [p]
+def test_resolve_monitor_targets_rejects_monitor_disabled(config, project_dir):
+    profiles = _make_profiles(make_profile("test", monitor_search=False))
+    current = _state(project_dir)
+    with pytest.raises(click.ClickException, match="unknown or monitor-disabled"):
+        _resolve_monitor_targets(config, profiles, "test", None, current)
+
+
+def test_resolve_monitor_targets_from_group(config, project_dir):
+    profiles = _make_profiles(make_profile("test", group="cheap"))
     config.monitor.group = "cheap"
-    targets = _resolve_monitor_targets(config, profiles, None, None)
+    current = _state(project_dir)
+    targets = _resolve_monitor_targets(config, profiles, None, None, current)
     assert [t.name for t in targets] == ["test"]
 
 
-def test_resolve_monitor_targets_unknown_group(config):
-    profiles = mock.Mock()
-    profiles.profiles = []
+def test_resolve_monitor_targets_unknown_group(config, project_dir):
+    profiles = _make_profiles()
     config.monitor.group = "missing"
+    current = _state(project_dir)
     with pytest.raises(click.ClickException, match="no profiles"):
-        _resolve_monitor_targets(config, profiles, None, None)
+        _resolve_monitor_targets(config, profiles, None, None, current)
 
 
-def test_search_profiles_uses_profile_disk_and_storage(config):
+def test_resolve_monitor_targets_prefers_active_state(config, project_dir):
+    """A running 128k instance must not fall back to the default 64k profile."""
+    p64 = make_profile(name="default", ctx_size=65536)
+    p128 = make_profile(name="big", ctx_size=131072)
+    profiles = _make_profiles(p64, p128)
+    config.hostai.default_profile = "default"
+
+    current = _state(project_dir, profile="big", ctx_size=131072, instance_id=123, dph=0.5)
+
+    targets = _resolve_monitor_targets(config, profiles, None, None, current)
+    assert [t.name for t in targets] == ["big"]
+    assert targets[0].ctx_size == 131072
+
+
+def test_resolve_monitor_targets_active_uses_ctx_override(config, project_dir):
+    """The active profile context is updated from state when it differs."""
+    p = make_profile(name="big", ctx_size=131072)
+    profiles = _make_profiles(p)
+
+    current = _state(project_dir, profile="big", ctx_size=262144, instance_id=123, dph=0.5)
+
+    targets = _resolve_monitor_targets(config, profiles, None, None, current)
+    assert targets[0].ctx_size == 262144
+
+
+def test_search_profiles_uses_profile_disk_and_storage(config, project_dir):
     """Monitor searches must pass the resolved disk size to the market layer."""
     p = make_profile("test", disk_gb=200)
-    profiles = mock.Mock()
-    profiles.market_policy.require_free_traffic = False
+    profiles = _make_profiles(p)
+    current = _state(project_dir)
 
     with mock.patch("hostai.commands.monitor.market.build_search_query", return_value=("query", 1.0)) as build:
         with mock.patch("hostai.commands.monitor.market.search_offers", return_value=[]) as search:
-            _search_profiles(config, profiles, [p])
+            _search_profiles(config, profiles, [p], current)
 
-    assert build.call_args.kwargs == {"max_price": None, "unverified": config.market.allow_unverified, "offer": None}
+    assert build.call_args.kwargs["max_price"] is None
+    assert build.call_args.kwargs["bid_price"] is None
+    assert build.call_args.kwargs["unverified"] == config.market.allow_unverified
+    assert build.call_args.kwargs["offer"] is None
     assert search.call_args.kwargs["storage"] == 200
+    assert search.call_args.kwargs["offer_type"] == "on-demand"
+
+
+def test_search_profiles_passes_bid_price_for_interruptible_instance(config, project_dir):
+    """A running bid instance must search bid offers using its bid price."""
+    p = make_profile("test")
+    profiles = _make_profiles(p)
+
+    current = _state(project_dir, instance_id=123, dph=0.3, bid_price=0.35)
+
+    with mock.patch("hostai.commands.monitor.market.build_search_query", return_value=("query", 0.3)) as build:
+        with mock.patch("hostai.commands.monitor.market.search_offers", return_value=[]) as search:
+            _search_profiles(config, profiles, [p], current)
+
+    assert build.call_args.kwargs["max_price"] == 0.3
+    assert build.call_args.kwargs["bid_price"] == 0.35
+    assert search.call_args.kwargs["offer_type"] == "bid"
 
 
 def test_ranked_best_for_monitor_enforces_hardware_rank(config):
@@ -135,6 +203,18 @@ def test_ranked_best_for_monitor_respects_zero_max_dph(config):
     ]
     best = _ranked_best_for_monitor(config, profiles, current, candidates)
     assert best is None
+
+
+def test_ranked_best_for_monitor_ignores_vast_ctx_size(config):
+    """Offers with a mismatching Vast ctx_size must not be rejected."""
+    profiles = _make_profiles(make_profile("test", ctx_size=32768))
+    current = mock.Mock(gpu="RTX 4090", dph=0.5, ctx_size=32768, exists=True)
+    candidates = [
+        {"id": 1, "gpu_name": "RTX 4090", "dph_total": 0.3, "ctx_size": 65536},
+    ]
+    best = _ranked_best_for_monitor(config, profiles, current, candidates)
+    assert best is not None
+    assert best["id"] == 1
 
 
 def test_cmd_monitor_once_no_offers(config, project_dir):

@@ -8,6 +8,7 @@ import requests
 from click.testing import CliRunner
 
 from hostai.commands.down import (
+    _parse_rsync_transferred_bytes,
     _pause_or_destroy,
     _save_and_upload_slot_cache,
     _slot_save,
@@ -52,7 +53,7 @@ def test_save_and_upload_slot_cache_happy_path(config, running_state, tmp_path):
             with mock.patch("hostai.commands.down._fetch_llama_commit", return_value="abc123"):
                 with mock.patch("hostai.commands.down.ssh.run_remote", return_value=fake_completed()) as run:
                     with mock.patch("hostai.commands.down.ssh.scp_to", return_value=fake_completed()):
-                        with mock.patch("hostai.commands.down._upload_slot_cache_from_vast", return_value=True):
+                        with mock.patch("hostai.commands.down._upload_slot_cache_from_vast", return_value=(True, 12345)):
                             result = _save_and_upload_slot_cache(
                                 config,
                                 running_state,
@@ -91,6 +92,22 @@ def test_save_and_upload_slot_cache_no_ssh(config, running_state, tmp_path):
         known_hosts=tmp_path / "known_hosts",
     )
     assert result is None
+
+
+def test_parse_rsync_transferred_bytes_with_units():
+    stdout = "...\nTotal bytes sent: 838.46K\n...\n"
+    assert _parse_rsync_transferred_bytes(stdout) == int(838.46 * 1024)
+
+    stdout = "...\nsent 12.5M bytes  received 100 bytes\n"
+    assert _parse_rsync_transferred_bytes(stdout) == int(12.5 * 1024 * 1024)
+
+    stdout = "...\nTotal bytes sent: 1234\n"
+    assert _parse_rsync_transferred_bytes(stdout) == 1234
+
+
+def test_parse_rsync_transferred_bytes_no_match():
+    assert _parse_rsync_transferred_bytes("") is None
+    assert _parse_rsync_transferred_bytes("no stats here") is None
 
 
 def test_pause_or_destroy_destroy(config, running_state, tmp_path):
