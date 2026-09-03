@@ -1,19 +1,17 @@
 """Tests for hostai.cache helpers with mocked SSH/subprocess calls."""
 
 import json
-from pathlib import Path
 from unittest import mock
-
-import pytest
 
 from hostai import cache
 from hostai.cache import (
     ensure_cache_key,
     install_cache_key_on_vast,
-    remote_cache_dir,
     rclone_prefetch_script,
     rclone_remote_name,
     rclone_upload_script,
+    remote_cache_dir,
+    rsync_prefetch_script,
     upload_cache,
     validate_cache,
     validate_cache_config,
@@ -186,6 +184,18 @@ def test_rclone_remote_name_configured(config):
     assert rclone_remote_name(config) == "mywebdav"
 
 
+def _bash_n(script: str) -> None:
+    """Assert that *script* is syntactically valid bash."""
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "script.sh"
+        path.write_text(script)
+        subprocess.run(["bash", "-n", str(path)], check=True, text=True)
+
+
 def test_rclone_prefetch_script_contains_rclone_copyto(config):
     config.cache.rclone = True
     config.cache.rclone_url = "https://cache.example.com/"
@@ -196,6 +206,206 @@ def test_rclone_prefetch_script_contains_rclone_copyto(config):
     assert "RCLONE_CONFIG_HOSTAI_URL" in script
     assert "pass_plain=" in script
     assert "rclone obscure" in script
+
+
+def test_rclone_prefetch_script_is_valid_bash(config):
+    config.cache.rclone = True
+    config.cache.rclone_url = "https://cache.example.com/"
+    script = rclone_prefetch_script(config, "/var/lib/qwen38/slots", "qwen-slot-cache/default/sig")
+    _bash_n(script)
+
+
+def test_rclone_prefetch_script_has_speed_monitoring(config):
+    config.cache.rclone = True
+    config.cache.rclone_url = "https://cache.example.com/"
+    script = rclone_prefetch_script(config, "/var/lib/qwen38/slots", "qwen-slot-cache/default/sig")
+    assert "209715200" in script
+    assert "total_bytes" in script
+    assert "rclone size" in script
+    assert "rclone --help" in script
+    assert "final_size" in script
+    assert "too_slow" in script
+    assert "trap cleanup EXIT" in script
+
+
+def test_rsync_prefetch_script_contains_rsync(config):
+    script = rsync_prefetch_script(config, "/var/lib/qwen38/slots", "qwen-slot-cache/default/sig")
+    assert "rsync -av" in script
+    assert ".current.bin.part" in script
+    assert "ssh -n" in script
+
+
+def test_rsync_prefetch_script_is_valid_bash(config):
+    script = rsync_prefetch_script(config, "/var/lib/qwen38/slots", "qwen-slot-cache/default/sig")
+    _bash_n(script)
+
+
+def test_rsync_prefetch_script_has_speed_monitoring(config):
+    script = rsync_prefetch_script(config, "/var/lib/qwen38/slots", "qwen-slot-cache/default/sig")
+    assert "209715200" in script
+    assert "total_bytes" in script
+    assert "stat -c %s" in script
+    assert "final_size" in script
+    assert "too_slow" in script
+    assert "trap cleanup EXIT" in script
+
+
+def _run_rclone_prefetch(
+    config,
+    tmp_path,
+    mode,
+    total_bytes,
+    remote_dir="qwen-slot-cache/default/sig",
+    json=True,
+):
+    """Run the rclone prefetch script with a fake rclone and a no-op sleep.
+
+    This makes the 20 second monitoring loop execute quickly so slow/ETA
+    cases can be tested without waiting 20 real seconds.
+    """
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    slot_dir = tmp_path / "slot"
+    slot_dir.mkdir()
+
+    fake_rclone = tmp_path / "fake_rclone.py"
+    fake_rclone.write_text(
+        textwrap.dedent(
+            f"""\
+            #!{sys.executable}
+            import json
+            import os
+            import sys
+            import time
+
+            def main():
+                args = sys.argv[1:]
+                if not args:
+                    return 1
+                if args == ["--help"]:
+                    print("--inplace")
+                    print("--max-duration")
+                    print("--json")
+                    return 0
+                if args[0] == "obscure":
+                    _ = sys.stdin.read()
+                    print("obscured")
+                    return 0
+                if args[0] == "size":
+                    total = int(os.environ.get("TOTAL_BYTES", "0"))
+                    if "--json" in args:
+                        if os.environ.get("RCLONE_NO_JSON"):
+                            print("unknown flag: --json", file=sys.stderr)
+                            return 2
+                        print(json.dumps({{"count": 1 if total > 0 else 0, "bytes": total}}))
+                    else:
+                        print(f"Total objects: {{1 if total > 0 else 0}}")
+                        print(f"Total size: {{total}} Byte ({{total}} Bytes)")
+                    return 0
+                if args[0] == "copyto":
+                    non_opts = [a for a in args if not a.startswith("--")]
+                    if len(non_opts) < 3:
+                        return 2
+                    src, dst = non_opts[-2], non_opts[-1]
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    if dst.endswith("current.json") or "/current.json" in src:
+                        with open(dst, "w") as f:
+                            f.write("{{}}")
+                        return 0
+                    run_mode = os.environ.get("RCLONE_MODE", "ok")
+                    if run_mode == "ok":
+                        total = int(os.environ.get("TOTAL_BYTES", "0"))
+                        with open(dst, "wb") as f:
+                            f.truncate(total)
+                        return 0
+                    if run_mode == "slow":
+                        with open(dst, "wb") as f:
+                            f.write(b"a" * 100)
+                        while True:
+                            time.sleep(0.1)
+                    if run_mode == "eta":
+                        with open(dst, "wb") as f:
+                            f.truncate(300_000_000)
+                        while True:
+                            time.sleep(0.1)
+                return 1
+
+            if __name__ == "__main__":
+                sys.exit(main())
+            """
+        )
+    )
+    fake_rclone.chmod(0o755)
+
+    rclone_wrapper = bin_dir / "rclone"
+    rclone_wrapper.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        f"os.execv(sys.executable, [sys.executable, str({str(fake_rclone)!r})] + sys.argv[1:])\n"
+    )
+    rclone_wrapper.chmod(0o755)
+
+    sleep_wrapper = bin_dir / "sleep"
+    sleep_wrapper.write_text(f"#!{sys.executable}\nimport sys\nsys.exit(0)\n")
+    sleep_wrapper.chmod(0o755)
+
+    config.cache.rclone = True
+    config.cache.rclone_url = "https://cache.example.com/"
+    config.cache.rclone_password = "secret"
+    script = rclone_prefetch_script(config, str(slot_dir), remote_dir)
+
+    env = os.environ.copy()
+    env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
+    env["TOTAL_BYTES"] = str(total_bytes)
+    env["RCLONE_MODE"] = mode
+    if not json:
+        env["RCLONE_NO_JSON"] = "1"
+
+    result = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+    return result, slot_dir
+
+
+def test_rclone_prefetch_fast_ok(config, tmp_path):
+    result, slot_dir = _run_rclone_prefetch(config, tmp_path, "ok", 12345)
+    assert result.returncode == 0, result.stderr
+    assert "ok" in result.stdout
+    assert (slot_dir / "current.bin").exists()
+    assert (slot_dir / "current.bin").stat().st_size == 12345
+
+
+def test_rclone_prefetch_text_fallback_ok(config, tmp_path):
+    """Older rclone without --json still parses the text Byte(s) output."""
+    result, slot_dir = _run_rclone_prefetch(config, tmp_path, "ok", 12345, json=False)
+    assert result.returncode == 0, result.stderr
+    assert "ok" in result.stdout
+    assert (slot_dir / "current.bin").exists()
+    assert (slot_dir / "current.bin").stat().st_size == 12345
+
+
+def test_rclone_prefetch_slow_aborts_and_cleans(config, tmp_path):
+    result, slot_dir = _run_rclone_prefetch(config, tmp_path, "slow", 12345)
+    assert result.returncode == 1
+    assert "too slow" in result.stderr
+    assert not (slot_dir / "current.bin").exists()
+
+
+def test_rclone_prefetch_eta_aborts_and_cleans(config, tmp_path):
+    # 10 GiB total; 300 MiB in 20 s projects to an ETA > 5 minutes.
+    result, slot_dir = _run_rclone_prefetch(config, tmp_path, "eta", 10_737_418_240)
+    assert result.returncode == 1
+    assert "ETA exceeds 5 minutes" in result.stderr
+    assert not (slot_dir / "current.bin").exists()
 
 
 def test_rclone_upload_script_contains_rclone_copyto(config):
