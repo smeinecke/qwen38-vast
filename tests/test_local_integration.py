@@ -145,3 +145,91 @@ def test_local_up_shm_size_configurable(project_dir):
     extra = provider._build_extra_args(None, 35)
     assert "--shm-size" in extra
     assert "2g" in extra
+
+
+@pytest.mark.skipif(not _has_docker(), reason="docker not available")
+@pytest.mark.skipif(not _image_exists("hostai-test:latest"), reason="integration image not built")
+def test_local_up_with_small_shm(project_dir, local_env, monkeypatch):
+    """A /dev/shm smaller than the cache minimum disables slot cache gracefully."""
+    runner = CliRunner(env=local_env)
+    monkeypatch.chdir(project_dir)
+
+    (project_dir / ".hostai-vast").mkdir(parents=True, exist_ok=True)
+    (project_dir / ".hostai-runs").mkdir(parents=True, exist_ok=True)
+
+    # Pass a small shm size and enable cache use_shm so the preflight trips.
+    # Point the cache at the container itself so the cache code path runs far
+    # enough to evaluate /dev/shm before the (empty) cache fetch fails.
+    env = dict(local_env)
+    env["HOSTAI_LOCAL_SHM_SIZE_GB"] = "1"
+    env["HOSTAI_SLOT_CACHE_USE_SHM"] = "1"
+    env["HOSTAI_SHM_MIN_GB"] = "2"
+    env["HOSTAI_SLOT_CACHE_HOST"] = "127.0.0.1"
+    env["HOSTAI_SLOT_CACHE_USER"] = "root"
+    runner = CliRunner(env=env)
+
+    before = _container_count()
+    result = runner.invoke(
+        cli,
+        ["up", "--unsecure", "v100-128k"],
+        catch_exceptions=False,
+        obj=None,
+    )
+    assert result.exit_code == 0, result.output
+    assert "[cache] /dev/shm is too small; disabling slot cache for this host" in result.output
+
+    down_result = runner.invoke(cli, ["down", "--yes"], catch_exceptions=False, obj=None)
+    assert down_result.exit_code == 0, down_result.output
+    assert _container_count() == before
+
+
+@pytest.mark.skipif(not _has_docker(), reason="docker not available")
+@pytest.mark.skipif(not _image_exists("hostai-test:latest"), reason="integration image not built")
+def test_local_up_socket_delay_regression(project_dir, local_env, monkeypatch):
+    """A 15-second socket delay is covered by a 60-second global boot deadline."""
+    env = dict(local_env)
+    env["START_TIMEOUT"] = "60"
+    env["HOSTAI_FAULT_SOCKET_DELAY_SECONDS"] = "15"
+    runner = CliRunner(env=env)
+    monkeypatch.chdir(project_dir)
+
+    before = _container_count()
+    result = runner.invoke(
+        cli,
+        ["up", "--unsecure", "--no-cache", "v100-128k"],
+        catch_exceptions=False,
+        obj=None,
+    )
+    assert result.exit_code == 0, result.output
+    assert "[boot:end-to-end] /health OK" in result.output
+    assert _container_count() == before + 1
+
+    down_result = runner.invoke(cli, ["down", "--yes"], catch_exceptions=False, obj=None)
+    assert down_result.exit_code == 0, down_result.output
+    assert _container_count() == before
+
+
+@pytest.mark.skipif(not _has_docker(), reason="docker not available")
+@pytest.mark.skipif(not _image_exists("hostai-test:latest"), reason="integration image not built")
+def test_local_up_socket_timeout_regression(project_dir, local_env, monkeypatch):
+    """A socket delay that exceeds the global deadline fails with a precise stage error and cleans up."""
+    env = dict(local_env)
+    env["START_TIMEOUT"] = "30"
+    env["HOSTAI_FAULT_SOCKET_DELAY_SECONDS"] = "60"
+    runner = CliRunner(env=env)
+    monkeypatch.chdir(project_dir)
+
+    before = _container_count()
+    result = runner.invoke(
+        cli,
+        ["up", "--unsecure", "--no-cache", "v100-128k"],
+        catch_exceptions=False,
+        obj=None,
+    )
+    # The CLI catches provisioning errors and exits non-zero.
+    assert result.exit_code != 0
+    assert ("[boot:end-to-end] timeout" in result.output
+            or "timeout" in result.output.lower())
+
+    # Cleanup should remove the container.
+    assert _container_count() == before

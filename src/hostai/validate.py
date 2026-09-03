@@ -1,10 +1,21 @@
-"""Repository validation for hostai."""
+"""Repository validation for hostai.
+
+This module also records structured validation metadata in
+``.hostai-vast/validation.json`` so a later `hostai up` or `hostai validate
+--compare` can detect drift between the last known-good local run and the
+current working tree.
+"""
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
+import json
 import re
+import subprocess
+import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from hostai import market
 from hostai.config import Config
@@ -133,6 +144,141 @@ def validate_repo(root_dir: Path, config: Optional[Config] = None) -> List[str]:
         pass
 
     return errors
+
+
+@dataclasses.dataclass
+class ValidationRecord:
+    """Structured result of a validation run."""
+
+    timestamp: str
+    result: str  # "ok" or "failed"
+    duration_seconds: float
+    git_commit: str
+    dirty: bool
+    image_digest: str
+    profile_hash: str
+    errors: List[str]
+    extras: Dict[str, Any] = dataclasses.field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return dataclasses.asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ValidationRecord":
+        return cls(**data)
+
+
+def _validation_path(root_dir: Path) -> Path:
+    path = root_dir / ".hostai-vast" / "validation.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _git_info(root_dir: Path) -> tuple:
+    """Return (commit, dirty) for the repository at *root_dir* or ("", True)."""
+    try:
+        commit = subprocess.run(
+            ["git", "-C", str(root_dir), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        ).stdout.strip()
+    except Exception:
+        commit = ""
+    try:
+        status = subprocess.run(
+            ["git", "-C", str(root_dir), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        ).stdout.strip()
+    except Exception:
+        status = "?"
+    return commit, bool(status)
+
+
+def _image_digest(image: str = "hostai-test:latest") -> str:
+    """Return the image digest for *image*, or an empty string."""
+    try:
+        raw = subprocess.run(
+            ["docker", "image", "inspect", image, "--format={{index .RepoDigests 0}}"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        ).stdout.strip()
+    except Exception:
+        raw = ""
+    return raw or f"{image}:built-locally"
+
+
+def _profile_hash(root_dir: Path) -> str:
+    """Return a hash of the profiles used for this validation."""
+    profiles = root_dir / "profiles.json"
+    if not profiles.exists():
+        return ""
+    return hashlib.sha256(profiles.read_bytes()).hexdigest()[:16]
+
+
+def record_validation(
+    root_dir: Path,
+    result: str,
+    duration: float,
+    errors: List[str],
+    image: str = "hostai-test:latest",
+) -> ValidationRecord:
+    """Record a validation run and return the record."""
+    commit, dirty = _git_info(root_dir)
+    record = ValidationRecord(
+        timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        result=result,
+        duration_seconds=duration,
+        git_commit=commit,
+        dirty=dirty,
+        image_digest=_image_digest(image),
+        profile_hash=_profile_hash(root_dir),
+        errors=errors,
+    )
+    _validation_path(root_dir).write_text(json.dumps(record.to_dict(), indent=2))
+    return record
+
+
+def load_last_validation(root_dir: Path) -> Optional[ValidationRecord]:
+    path = _validation_path(root_dir)
+    if not path.exists():
+        return None
+    try:
+        return ValidationRecord.from_dict(json.loads(path.read_text()))
+    except Exception:
+        return None
+
+
+def validation_digest(record: ValidationRecord) -> str:
+    """Return a stable digest that can be compared between validation runs."""
+    hasher = hashlib.sha256()
+    hasher.update(record.git_commit.encode())
+    hasher.update(str(record.dirty).encode())
+    hasher.update(record.image_digest.encode())
+    hasher.update(record.profile_hash.encode())
+    return hasher.hexdigest()[:16]
+
+
+def compare_validations(current: ValidationRecord, previous: ValidationRecord) -> List[str]:
+    """Return a list of human-readable drift messages between two records."""
+    diffs: List[str] = []
+    if current.git_commit != previous.git_commit:
+        diffs.append(
+            f"git commit changed: {previous.git_commit[:12]} -> {current.git_commit[:12]}"
+        )
+    if current.dirty != previous.dirty:
+        diffs.append(f"working tree dirty state changed: {previous.dirty} -> {current.dirty}")
+    if current.image_digest != previous.image_digest:
+        diffs.append(f"integration image changed: {previous.image_digest} -> {current.image_digest}")
+    if current.profile_hash != previous.profile_hash:
+        diffs.append(f"profiles.json changed: {previous.profile_hash} -> {current.profile_hash}")
+    return diffs
 
 
 def is_valid(root_dir: Path) -> bool:

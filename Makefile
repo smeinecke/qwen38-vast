@@ -27,6 +27,11 @@ fix: reformat-ruff fix-ruff
 test:
 	pytest tests
 
+# Build the integration test image and run the local provider acceptance tests
+test-local:
+	docker build -f tests/integration/Dockerfile.test -t hostai-test:latest .
+	uv run pytest -q -m "not slow" tests/test_local_integration.py
+
 test-cov:
 	pytest tests \
 		--cov=hostai \

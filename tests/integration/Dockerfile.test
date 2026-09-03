@@ -3,8 +3,10 @@
 # Minimal local integration image for hostai LocalProvider.
 #
 # This image simulates the production qwen38-vast runtime without a real GPU or
-# model.  It runs sshd and a fake llama-server, so `hostai up` with
-# HOSTAI_PROVIDER=local can exercise the full SSH/tunnel/API lifecycle.
+# model.  It runs the real production sshd/entrypoint/start.sh path but swaps
+# expensive binaries (hf, llama-server, nvidia-smi) for deterministic test
+# fixtures, so `hostai up` with HOSTAI_PROVIDER=local exercises the full
+# SSH/tunnel/startup/cache lifecycle without a GPU or network downloads.
 
 FROM ubuntu:24.04
 
@@ -18,27 +20,30 @@ RUN apt-get update \
          python3-pip \
          curl \
          netcat-openbsd \
+         rsync \
+         rclone \
+         socat \
     && rm -rf /var/lib/apt/lists/* \
     && rm -f /etc/ssh/ssh_host_* \
     && mkdir -p /run/sshd /root/.ssh /etc/ssh/sshd_config.d /etc/qwen38/ssh \
     && chmod 0700 /root/.ssh
 
 # Fake command-line tools that start.sh and the hostai client expect.
+# They are placed in /usr/local/bin earlier than real packages would be.
 COPY tests/integration/fake-hf /usr/local/bin/hf
 COPY tests/integration/fake-nvidia-smi /usr/local/bin/nvidia-smi
 COPY tests/integration/fake-llama-server /usr/local/bin/fake-llama-server
-RUN chmod 0755 /usr/local/bin/hf /usr/local/bin/nvidia-smi /usr/local/bin/fake-llama-server
-
-# The hostai client expects the server binary to be named llama-server and
-# support --version.  The real binary is replaced by a wrapper.
 COPY tests/integration/llama-server-wrapper /usr/local/bin/llama-server
-RUN chmod 0755 /usr/local/bin/llama-server
+RUN chmod 0755 /usr/local/bin/hf /usr/local/bin/nvidia-smi /usr/local/bin/fake-llama-server /usr/local/bin/llama-server
 
-# SSH initialization and container supervisor.
+# The real production startup scripts.  Fake binaries above let them run
+# without a GPU or downloading ~20 GB of model weights.
 COPY hostai-init-ssh.sh /usr/local/bin/hostai-init-ssh.sh
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh.real
+COPY start.sh /usr/local/bin/start.sh
 COPY tests/integration/entrypoint.test.sh /usr/local/bin/entrypoint.sh
-COPY tests/integration/start.test.sh /usr/local/bin/start.sh
-RUN chmod 0755 /usr/local/bin/hostai-init-ssh.sh /usr/local/bin/entrypoint.sh /usr/local/bin/start.sh
+RUN chmod 0755 /usr/local/bin/hostai-init-ssh.sh /usr/local/bin/entrypoint.sh \
+    /usr/local/bin/entrypoint.sh.real /usr/local/bin/start.sh
 
 # Bake an empty authorized_keys placeholder; the runtime injects the test key.
 RUN touch /etc/qwen38/ssh/authorized_keys && chmod 0644 /etc/qwen38/ssh/authorized_keys
@@ -65,6 +70,7 @@ RUN printf '%s\n' \
 
 ENV HOSTAI_TMPFS_BASE=/dev/shm/qwen38 \
     HOSTAI_LOG_DIR=/dev/shm/qwen38/log \
+    HOSTAI_CERTS_DIR=/dev/shm/qwen38/certs \
     PYTHONUNBUFFERED=1
 
 WORKDIR /models

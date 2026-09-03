@@ -38,4 +38,18 @@
 - Build the integration test image with:
     docker build -f tests/integration/Dockerfile.test -t hostai-test:latest .
 - Run the integration acceptance test with `uv run pytest -q -m "not slow" tests/test_local_integration.py`.
-- The integration image uses `tests/integration/fake-llama-server` and is gated on Docker and the `hostai-test:latest` image.
+- The integration image uses the real `start.sh` and `entrypoint.sh` but swaps expensive binaries (`hf`, `llama-server`, `nvidia-smi`) for fixtures in `tests/integration`.
+- Deterministic fault injection is available through these environment variables (forwarded by `up.py` to the container):
+  - `HOSTAI_FAULT_SSHD_DELAY_SECONDS=<int>`: delay sshd startup inside the container
+  - `HOSTAI_FAULT_SOCKET_DELAY_SECONDS=<int>`: delay `llama-server` socket bind
+  - `HOSTAI_FAULT_HEALTH_DELAY_SECONDS=<int>`: return 503 from `/health` for N seconds
+  - `HOSTAI_FAULT_llama_EXIT_AFTER_SECONDS=<int>`: exit the fake server after N seconds
+  - `HOSTAI_FAULT_METRICS_UNAVAILABLE=1`, `HOSTAI_FAULT_SLOTS_UNAVAILABLE=1`
+- The `VastProvider` refuses construction unless `config.provider.backend == "vast"`, preventing accidental production Vast API calls when `HOSTAI_PROVIDER=local` or tests are running.
+
+## Validation gate
+
+- Run `hostai validate` to check the repository layout and record a `.hostai-vast/validation.json` digest.
+- Run `hostai validate --production` to also require Docker, the integration image, and pass `tests/test_local_integration.py`.
+- Run `hostai validate --compare` to compare the current state against the last recorded validation and warn about drift (git commit, image digest, `profiles.json`).
+- Use this gate before a real Vast rental to confirm the local integration image still boots cleanly and the working tree matches the last validated state.

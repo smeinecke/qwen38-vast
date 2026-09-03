@@ -103,7 +103,7 @@ class LlamaClient:
 
         return "ok" in text.lower()
 
-    def wait_for_health(self, timeout: float = 1200, quiet: bool = False) -> bool:
+    def wait_for_health(self, timeout: float = 1200, quiet: bool = False, stage_label: str = "api") -> bool:
         """Poll health with 1s initial interval and exponential backoff up to 5s."""
         if timeout <= 0:
             return self.health()
@@ -114,6 +114,9 @@ class LlamaClient:
 
         while True:
             if self.health():
+                if not quiet:
+                    elapsed = time.monotonic() - start
+                    print(f"[boot:{stage_label}] /health OK after {elapsed:.1f}s", flush=True)
                 return True
 
             elapsed = time.monotonic() - start
@@ -299,6 +302,6 @@ def is_api_ready(config: Config, state: State) -> bool:
     return LlamaClient(config, state).health()
 
 
-def wait_for_api(config: Config, state: State, timeout: float) -> bool:
+def wait_for_api(config: Config, state: State, timeout: float, stage_label: str = "end-to-end") -> bool:
     """Standalone blocking wait for llama-server /health."""
-    return LlamaClient(config, state).wait_for_health(timeout, quiet=False)
+    return LlamaClient(config, state).wait_for_health(timeout, quiet=False, stage_label=stage_label)

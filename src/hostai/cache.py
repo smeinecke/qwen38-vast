@@ -599,6 +599,8 @@ def install_cache_key_on_vast(state: State, config: Config) -> bool:
             state.ssh_url,
             f"mkdir -p {remote_dir} && chmod 700 {remote_dir}",
             known_hosts=known_hosts,
+            state=state,
+            config=config,
             timeout=30,
         )
         if mkdir_res.returncode != 0:
@@ -612,6 +614,8 @@ def install_cache_key_on_vast(state: State, config: Config) -> bool:
             key_path,
             remote_key_path,
             known_hosts=known_hosts,
+            state=state,
+            config=config,
             timeout=60,
         )
         if scp_res.returncode != 0:

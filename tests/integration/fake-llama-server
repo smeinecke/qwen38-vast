@@ -1,11 +1,27 @@
 #!/usr/bin/env python3
-"""Minimal fake llama-server for LocalProvider integration tests.
+"""Comprehensive fake llama-server for LocalProvider integration tests.
 
 Supports both Unix-socket (secure) and TCP (unsecure) mode and serves the
-endpoints that hostai's up/status flow requires:
+endpoints that hostai's up/status/watchdog flow requires:
   GET /health
   GET /v1/models
-  POST /v1/chat/completions
+  GET /props  (chat template)
+  GET /metrics
+  GET /slots
+  POST /slots/<id>?action=save|restore
+  POST /completion
+  POST /v1/chat/completions (with optional streaming)
+
+It accepts the same command-line arguments as ``llama-server`` and ignores the
+ones that do not matter for the integration smoke test.
+
+Fault-injection environment variables (all optional):
+  HOSTAI_FAULT_HEALTH_DELAY_SECONDS=<int>   Return 503 from /health for N seconds.
+  HOSTAI_FAULT_SOCKET_DELAY_SECONDS=<int>   Wait N seconds before binding the socket/port.
+  HOSTAI_FAULT_llama_EXIT_AFTER_SECONDS=<int> Exit the server after N seconds.
+  HOSTAI_FAULT_METRICS_UNAVAILABLE=1        /metrics returns 503.
+  HOSTAI_FAULT_SLOTS_UNAVAILABLE=1          /slots returns 503.
+  HOSTAI_FAULT_COMPLETION_DELAY_MS=<int>    Delay /completion by N milliseconds.
 """
 
 import argparse
@@ -14,55 +30,77 @@ import os
 import socket
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 
-def load_cert_pair():
-    cert_dir = Path(os.environ.get("HOSTAI_CERTS_DIR", "/dev/shm/qwen38/certs"))
-    cert = (cert_dir / "server.crt").read_text() if (cert_dir / "server.crt").exists() else None
-    key = (cert_dir / "server.key").read_text() if (cert_dir / "server.key").exists() else None
-    return cert, key
+# Deterministic model metadata returned by /props.
+DEFAULT_CHAT_TEMPLATE = (
+    "{% for message in messages %}{{ message.role }}: {{ message.content }}\n{% endfor %}"
+    "assistant:"
+)
+
+
+class ServerState:
+    def __init__(self):
+        self.started_at = time.monotonic()
+        self.request_count = 0
+        self.token_count = 0
+        self.slots: list = []
+        self.slot_counter = 0
+        self._lock = threading.Lock()
+        self._ready = threading.Event()
+
+    def mark_ready(self):
+        self._ready.set()
+
+    def is_ready(self):
+        health_delay = int(os.environ.get("HOSTAI_FAULT_HEALTH_DELAY_SECONDS", "0"))
+        if not health_delay:
+            return self._ready.is_set()
+        return time.monotonic() - self.started_at >= health_delay
+
+    def record_completion(self, prompt_tokens: int, completion_tokens: int):
+        with self._lock:
+            self.request_count += 1
+            self.token_count += completion_tokens + prompt_tokens
+            # Keep slots deterministic: one idle, one processing, or empty.
+            if not self.slots:
+                self.slots = [
+                    {"id": 0, "state": "idle", "used": 0},
+                ]
+            else:
+                for slot in self.slots:
+                    slot["used"] += prompt_tokens + completion_tokens
+
+
+STATE = ServerState()
+
+
+def _env_int(name: str, default: int = 0) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _maybe_exit_after():
+    delay = _env_int("HOSTAI_FAULT_llama_EXIT_AFTER_SECONDS", 0)
+    if delay > 0:
+        def _kill():
+            time.sleep(delay)
+            print(f"[fake-llama-server] FAULT: exiting after {delay}s")
+            os._exit(70)
+        threading.Thread(target=_kill, daemon=True).start()
 
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print(f"[fake-llama-server] {fmt % args}")
 
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        if parsed.path == "/health":
-            self._json_response(200, {"status": "ok"})
-        elif parsed.path == "/v1/models":
-            self._json_response(200, {"object": "list", "data": [{
-                "id": "qwen3.8-27b",
-                "object": "model",
-                "created": 0,
-                "owned_by": "hostai-test",
-            }]})
-        else:
-            self._json_response(404, {"error": "not found"})
-
-    def do_POST(self):
-        parsed = urlparse(self.path)
-        if parsed.path == "/v1/chat/completions":
-            length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length).decode()) if length else {}
-            model = body.get("model", "unknown")
-            content = "This is a fake response from the hostai integration test server."
-            self._json_response(200, {
-                "id": "chatcmpl-test",
-                "object": "chat.completion",
-                "created": 0,
-                "model": model,
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 10, "total_tokens": 11},
-            })
-        else:
-            self._json_response(404, {"error": "not found"})
-
-    def _json_response(self, status, payload):
+    def _send_json(self, status: int, payload):
         data = json.dumps(payload).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -70,68 +108,267 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _send_text(self, status: int, text: str, content_type: str = "text/plain"):
+        data = text.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path == "/health":
+            if STATE.is_ready():
+                self._send_json(200, {"status": "ok"})
+            else:
+                self._send_text(503, "not ready")
+        elif path == "/v1/models":
+            self._send_json(200, {
+                "object": "list",
+                "data": [{
+                    "id": self.server.model_id,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "hostai-test",
+                }],
+            })
+        elif path in ("/props", "/v1/props"):
+            self._send_json(200, {
+                "default_generation_settings": {
+                    "chat_template": self.server.chat_template,
+                    "ctx_size": self.server.ctx_size,
+                },
+                "chat_template": self.server.chat_template,
+            })
+        elif path == "/metrics":
+            if os.environ.get("HOSTAI_FAULT_METRICS_UNAVAILABLE") == "1":
+                self._send_text(503, "metrics unavailable")
+            else:
+                self._send_text(200, _prometheus_metrics())
+        elif path == "/slots":
+            if os.environ.get("HOSTAI_FAULT_SLOTS_UNAVAILABLE") == "1":
+                self._send_text(503, "slots unavailable")
+            else:
+                self._send_json(200, _slots_state())
+        else:
+            self._send_json(404, {"error": "not found"})
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        length = int(self.headers.get("Content-Length", 0))
+        body_bytes = self.rfile.read(length) if length else b"{}"
+        try:
+            body = json.loads(body_bytes.decode())
+        except json.JSONDecodeError:
+            body = {}
+
+        delay_ms = _env_int("HOSTAI_FAULT_COMPLETION_DELAY_MS", 0)
+        if delay_ms:
+            time.sleep(delay_ms / 1000.0)
+
+        if path.startswith("/slots/"):
+            parts = path.split("/")
+            slot_id = int(parts[2]) if len(parts) > 2 else 0
+            query = parse_qs(parsed.query)
+            action = query.get("action", [""])[0]
+            if action in ("save", "restore"):
+                _slot_action(slot_id, action)
+                self._send_json(200, {"ok": True})
+            else:
+                self._send_json(400, {"error": "bad action"})
+        elif path in ("/completion", "/v1/completions"):
+            self._handle_completion(body)
+        elif path == "/v1/chat/completions":
+            stream = bool(body.get("stream", False))
+            if stream:
+                self._handle_chat_stream(body)
+            else:
+                self._handle_chat(body)
+        else:
+            self._send_json(404, {"error": "not found"})
+
+    def _handle_completion(self, body):
+        prompt = body.get("prompt", [])
+        prompt_tokens = len(prompt) if isinstance(prompt, list) else 1
+        completion_tokens = 10
+        STATE.record_completion(prompt_tokens, completion_tokens)
+        self._send_json(200, {
+            "content": "This is a fake response from the hostai integration test server.",
+            "tokens": list(range(prompt_tokens, prompt_tokens + completion_tokens)),
+            "stop": True,
+            "slot_id": 0,
+            "timing": {"prompt_n": prompt_tokens, "predicted_n": completion_tokens},
+        })
+
+    def _handle_chat(self, body):
+        messages = body.get("messages", [])
+        prompt_tokens = sum(len(m.get("content", "")) for m in messages) or 1
+        completion_tokens = 10
+        STATE.record_completion(prompt_tokens, completion_tokens)
+        model = body.get("model", self.server.model_id)
+        content = "This is a fake response from the hostai integration test server."
+        self._send_json(200, {
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            },
+        })
+
+    def _handle_chat_stream(self, body):
+        content = "This is a fake response from the hostai integration test server."
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        model = body.get("model", self.server.model_id)
+        for i, word in enumerate(content.split()):
+            delta = {"choices": [{"delta": {"content": (word + " ") if i < len(content.split()) - 1 else word}}]}
+            self.wfile.write(f"data: {json.dumps(delta)}\n\n".encode())
+        usage = {"usage": {"prompt_tokens": 1, "completion_tokens": 10, "total_tokens": 11}}
+        self.wfile.write(f"data: {json.dumps(usage)}\n\n".encode())
+        self.wfile.write(b"data: [DONE]\n\n")
+
+
+def _prometheus_metrics() -> str:
+    return f"""# HELP llama_requests_total Total requests
+# TYPE llama_requests_total counter
+llama_requests_total {STATE.request_count}
+# HELP llama_tokens_total Total tokens
+# TYPE llama_tokens_total counter
+llama_tokens_total {STATE.token_count}
+# HELP llama_prompt_tokens_total Prompt tokens
+# TYPE llama_prompt_tokens_total counter
+llama_prompt_tokens_total {STATE.token_count}
+# HELP llama_tokens_cached_total Cached tokens
+# TYPE llama_tokens_cached_total counter
+llama_tokens_cached_total 0
+"""
+
+
+def _slots_state() -> list:
+    if not STATE.slots:
+        return [{"id": 0, "state": "idle", "used": 0}]
+    return STATE.slots
+
+
+def _slot_action(slot_id: int, action: str):
+    with STATE._lock:
+        for slot in STATE.slots:
+            if slot["id"] == slot_id:
+                slot["state"] = "idle" if action == "save" else "idle"
+                return
+        STATE.slots.append({"id": slot_id, "state": "idle", "used": 0})
+
 
 class UnixSocketHTTPServer(ThreadingHTTPServer):
     address_family = socket.AF_UNIX
 
     def server_bind(self):
-        # unlink stale socket
         if isinstance(self.server_address, str) and os.path.exists(self.server_address):
             os.unlink(self.server_address)
         super().server_bind()
 
 
-def wait_for_certs(sock_path):
-    cert_dir = Path(os.environ.get("HOSTAI_CERTS_DIR", "/dev/shm/qwen38/certs"))
+def _wait_for_certs(cert_dir: Path):
     cert_file = cert_dir / "server.crt"
     key_file = cert_dir / "server.key"
-    # In unsecure mode there are no certs; in secure mode the hostai client
-    # delivers them after sshd is up.  Wait a reasonable time.
-    if not cert_file.exists() or not key_file.exists():
-        print("[fake-llama-server] waiting for TLS certs...")
-        for _ in range(60):
-            if cert_file.exists() and key_file.exists():
-                break
-            threading.Event().wait(1)
+    for _ in range(120):
+        if cert_file.exists() and key_file.exists():
+            return
+        time.sleep(1)
+    print("[fake-llama-server] warning: TLS certs did not arrive; continuing without them")
+
+
+def _parse_known_args(argv):
+    """Extract the few arguments we actually care about; ignore the rest."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--version", action="store_true")
+    parser.add_argument("--model", default="qwen3.8-27b")
+    parser.add_argument("--ctx-size", type=int, default=65536)
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--path", default=None)
+    parser.add_argument("--api-key", default="")
+    parser.add_argument("--slot-save-path", default="/var/lib/qwen38/slots")
+    # Accept and ignore all other flags so the full start.sh argument list passes.
+    known, _ = parser.parse_known_args(argv)
+    return known
+
+
+def _sleep_with_log(seconds: int, reason: str):
+    if seconds <= 0:
+        return
+    print(f"[fake-llama-server] FAULT: {reason} for {seconds}s")
+    for i in range(seconds):
+        print(f"[fake-llama-server] {reason} ... {i + 1}/{seconds}")
+        time.sleep(1)
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--version", action="store_true", help="print version and exit")
-    parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8080)
-    parser.add_argument("--path", default="/dev/shm/qwen38/llama.sock")
-    parser.add_argument("--socket", default=None)
-    args = parser.parse_args()
+    args = _parse_known_args(sys.argv[1:])
 
     if args.version:
         print("fake-llama-server version 0.0.1 (hostai integration test)")
-        sys.exit(0)
+        return 0
+
+    _maybe_exit_after()
 
     unsecure = os.environ.get("HOSTAI_UNSECURE") == "1"
-    if unsecure or os.environ.get("HOSTAI_LOCAL_UNSECURE") == "1":
-        # TCP mode
-        print(f"[fake-llama-server] listening on {args.host}:{args.port}")
-        server = ThreadingHTTPServer((args.host, args.port), Handler)
-        server.serve_forever()
-    else:
-        # Unix socket mode
-        socket_path = args.socket or args.path
-        Path(socket_path).parent.mkdir(parents=True, exist_ok=True)
-        wait_for_certs(socket_path)
-        cert, key = load_cert_pair()
-        if cert and key:
-            print("[fake-llama-server] TLS cert found; using HTTPS over Unix socket")
-        else:
-            print("[fake-llama-server] no TLS cert found; using HTTP over Unix socket")
+    socket_path = args.path
+
+    if not unsecure:
+        # The real server uses a .sock value for --host in secure mode.
+        if args.host.endswith(".sock"):
+            socket_path = args.host
+        if not socket_path:
+            socket_path = "/dev/shm/qwen38/llama.sock"
+
+    if socket_path:
+        sock_dir = Path(socket_path).parent
+        sock_dir.mkdir(parents=True, exist_ok=True)
+        if not unsecure:
+            cert_dir = Path(os.environ.get("HOSTAI_CERTS_DIR", "/dev/shm/qwen38/certs"))
+            _wait_for_certs(cert_dir)
+
+    _sleep_with_log(_env_int("HOSTAI_FAULT_SOCKET_DELAY_SECONDS"), "delaying socket bind")
+
+    server = None
+    if socket_path:
         print(f"[fake-llama-server] listening on Unix socket {socket_path}")
         server = UnixSocketHTTPServer(socket_path, Handler)
-        try:
-            server.serve_forever()
-        finally:
-            if os.path.exists(socket_path):
-                os.unlink(socket_path)
+        server.model_id = args.model
+        server.ctx_size = args.ctx_size
+        server.chat_template = DEFAULT_CHAT_TEMPLATE
+    else:
+        bind_host = args.host if args.host else "0.0.0.0"
+        print(f"[fake-llama-server] listening on {bind_host}:{args.port}")
+        server = ThreadingHTTPServer((bind_host, args.port), Handler)
+        server.model_id = args.model
+        server.ctx_size = args.ctx_size
+        server.chat_template = DEFAULT_CHAT_TEMPLATE
+
+    # Mark healthy immediately (or after the health delay elapses on first request).
+    STATE.mark_ready()
+    try:
+        server.serve_forever()
+    finally:
+        if socket_path and os.path.exists(socket_path):
+            os.unlink(socket_path)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

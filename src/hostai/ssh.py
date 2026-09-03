@@ -8,6 +8,7 @@ remote TCP port.
 from __future__ import annotations
 
 import asyncio
+import shlex
 import socket
 import threading
 import time
@@ -26,9 +27,11 @@ from hostai.state import State
 _TUNNELS: Dict[int, Dict[str, Any]] = {}
 
 # Vast hosts can accept a probe connection before sshd is responsive enough to
-# complete another login. Keep the tunnel's own limits below the caller wait so
-# the worker reports a useful result before the outer startup guard expires.
-_TUNNEL_CONNECT_TIMEOUT = 40
+# complete another login. The per-stage connect timeout is derived from the
+# caller's overall boot timeout so a slow second SSH handshake does not fail
+# simply because an internal cap was too low.
+TUNNEL_MIN_CONNECT_TIMEOUT = 10.0
+TUNNEL_MAX_CONNECT_TIMEOUT = 120.0
 _TUNNEL_START_TIMEOUT = 45
 
 
@@ -359,6 +362,43 @@ def _default_remote_dest(state: State) -> str:
     return "127.0.0.1:8080" if state.unsecure else "/dev/shm/qwen38/llama.sock"
 
 
+def _connect_timeout_for_stage(total_timeout: float) -> float:
+    """Return a per-stage SSH connect timeout that scales with the global deadline.
+
+    The handshake must be allowed at least ``TUNNEL_MIN_CONNECT_TIMEOUT``
+    seconds, but never more than ``TUNNEL_MAX_CONNECT_TIMEOUT`` so a stuck
+    connection is reported before the overall boot deadline expires.
+    """
+    return max(TUNNEL_MIN_CONNECT_TIMEOUT, min(total_timeout, TUNNEL_MAX_CONNECT_TIMEOUT))
+
+
+def is_remote_socket_present(
+    ssh_url: str,
+    socket_path: str,
+    *,
+    known_hosts: Path,
+    identity: Optional[Path] = None,
+    config: Optional[Config] = None,
+    state: Optional[State] = None,
+    timeout: float = 10.0,
+) -> bool:
+    """Return True when *socket_path* exists as a socket on the remote host."""
+    if not ssh_url:
+        return False
+    if identity is None and (config or state):
+        identity = _default_identity(config, state)
+    res = run_remote(
+        ssh_url,
+        f"test -S {shlex.quote(socket_path)} && echo present",
+        known_hosts=known_hosts,
+        identity=identity,
+        config=config,
+        state=state,
+        timeout=timeout,
+    )
+    return res.returncode == 0 and "present" in (res.stdout or "")
+
+
 async def _start_tunnel_worker(
     user: str,
     host: str,
@@ -429,6 +469,32 @@ def _tunnel_is_running(state: State) -> bool:
     return False
 
 
+def _boot_log(stage: str, elapsed: float, message: str) -> None:
+    """Emit a structured boot-stage diagnostic line."""
+    print(f"[boot:{stage}] {message} after {elapsed:.1f}s", flush=True)
+
+
+def _wait_for_remote_socket(
+    ssh_url: str,
+    socket_path: str,
+    *,
+    known_hosts: Path,
+    identity: Optional[Path] = None,
+    config: Optional[Config] = None,
+    state: Optional[State] = None,
+    timeout: float = 30.0,
+) -> bool:
+    """Poll until *socket_path* exists on the remote host, logging progress."""
+    if not ssh_url:
+        return False
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
+        if is_remote_socket_present(ssh_url, socket_path, known_hosts=known_hosts, identity=identity, config=config, state=state, timeout=5):
+            return True
+        time.sleep(1)
+    return False
+
+
 def ensure_tunnel(
     config: Config,
     state: State,
@@ -464,7 +530,7 @@ def ensure_tunnel(
     clear_known_hosts(host, port, known_hosts)
 
     identity = _default_identity(config, state)
-    connect_timeout = max(10.0, min(timeout, _TUNNEL_CONNECT_TIMEOUT))
+    connect_timeout = _connect_timeout_for_stage(timeout)
 
     start = time.monotonic()
     loop = asyncio.new_event_loop()
@@ -477,24 +543,49 @@ def ensure_tunnel(
         daemon=True,
     )
     thread.start()
-    ready.wait(timeout=timeout)
-    elapsed = time.monotonic() - start
+    ready.wait(timeout=connect_timeout + 5)
+    ssh_elapsed = time.monotonic() - start
     if not ready.is_set():
         stop.set()
         thread.join(timeout=5)
-        raise RuntimeError(f"[boot:tunnel-ssh] timeout after {elapsed:.1f}s")
+        raise RuntimeError(f"[boot:tunnel-ssh] timeout after {ssh_elapsed:.1f}s")
 
     if "error" in outcome:
         err = outcome["error"]
+        _boot_log("tunnel-ssh", ssh_elapsed, f"failed: {err}")
         stop.set()
         thread.join(timeout=5)
         raise RuntimeError(f"[boot:tunnel-ssh] failed: {err}")
+    _boot_log("tunnel-ssh", ssh_elapsed, "connected")
 
     # Wait for the local port to accept connections.
     if not _local_port_is_open(local_port, timeout=5):
+        forward_elapsed = time.monotonic() - start
+        _boot_log("tunnel-forward", forward_elapsed, f"local port {local_port} is not accepting connections")
         stop.set()
         thread.join(timeout=5)
         raise RuntimeError("[boot:tunnel-forward] local port is not accepting connections")
+    forward_elapsed = time.monotonic() - start
+    _boot_log("tunnel-forward", forward_elapsed, f"local port {local_port} accepting connections")
+
+    # For Unix-socket forwarding, verify the remote socket actually exists.
+    if remote_dest.startswith("/"):
+        if not _wait_for_remote_socket(
+            state.ssh_url,
+            remote_dest,
+            known_hosts=known_hosts,
+            identity=identity,
+            config=config,
+            state=state,
+            timeout=max(5.0, timeout - (time.monotonic() - start) - 2),
+        ):
+            socket_elapsed = time.monotonic() - start
+            _boot_log("remote-socket", socket_elapsed, f"{remote_dest} did not appear")
+            stop.set()
+            thread.join(timeout=5)
+            raise RuntimeError(f"[boot:remote-socket] {remote_dest} did not appear")
+        socket_elapsed = time.monotonic() - start
+        _boot_log("remote-socket", socket_elapsed, f"{remote_dest} present")
 
     _TUNNELS[local_port]["state"] = state
     _TUNNELS[local_port]["thread"] = thread

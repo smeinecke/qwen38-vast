@@ -92,6 +92,7 @@ def test_ensure_tunnel_checks_auto_selected_port(config, running_state):
         mock.patch("hostai.ssh.clear_known_hosts"),
         mock.patch("hostai.ssh.threading.Thread", FakeThread),
         mock.patch("hostai.ssh._local_port_is_open", return_value=True) as port_open,
+        mock.patch("hostai.ssh._wait_for_remote_socket", return_value=True),
     ):
         assert ssh.ensure_tunnel(config, running_state) == 18081
 

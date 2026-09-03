@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import secrets
 import time
 from pathlib import Path
@@ -238,6 +239,12 @@ def _env_dict(
     if config.model.cache_type_v and config.model.cache_type_v != "default":
         env["CACHE_TYPE_V"] = config.model.cache_type_v
 
+    # Forward deterministic fault-injection variables so integration tests can
+    # exercise boot deadlines without changing production start.sh.
+    for key, value in os.environ.items():
+        if key.startswith("HOSTAI_FAULT_") or key.startswith("HOSTAI_TEST_"):
+            env[key] = value
+
     # Vast maps container port 22 to a public host port in args/entrypoint mode.
     env["-p 22:22"] = "1"
 
@@ -303,13 +310,13 @@ def _emit_instance_logs(config: Config, instance_id: int, seen: Dict[str, Set[st
 def _wait_for_ssh_endpoint(config: Config, state: State, timeout: int) -> None:
     if not state.instance_id:
         raise click.ClickException("no instance id in state")
-    start = _now_epoch()
+    start = time.monotonic()
     last_status = 0
     seen_log_lines: Dict[str, Set[str]] = {"container": set(), "daemon": set()}
     while True:
-        now = _now_epoch()
-        if now - start > timeout:
-            raise click.ClickException("timeout waiting for SSH endpoint")
+        elapsed = time.monotonic() - start
+        if elapsed > timeout:
+            raise click.ClickException(f"[boot:ssh-endpoint] timeout after {elapsed:.1f}s")
         inst = _provider(config).get_instance(state.instance_id)
         if not inst:
             click.echo("[boot] waiting for instance to appear...")
@@ -323,10 +330,10 @@ def _wait_for_ssh_endpoint(config: Config, state: State, timeout: int) -> None:
             state.ssh_url = endpoint["ssh_url"]
             state.status = "ssh-ready"
             state.save()
-            click.echo(f"[ssh] endpoint discovered: {state.ssh_url}")
+            click.echo(f"[boot:ssh-endpoint] {state.ssh_url} ready after {elapsed:.1f}s")
             return
-        if now - last_status >= 15:
-            last_status = now
+        if elapsed - last_status >= 15:
+            last_status = elapsed
             host = inst.get("public_ipaddr") or inst.get("public_ip") or "?"
             ports = inst.get("ports") or {}
             tcp = ports.get("22/tcp") or []
@@ -763,9 +770,10 @@ def _do_fresh_core(
     _wait_for_ssh_endpoint(config, state, config.ssh.start_timeout)
 
     known_hosts = state.state_file.parent / "known_hosts"
+    ssh_start = time.monotonic()
     if not ssh.wait_for_ssh(state.ssh_url, known_hosts=known_hosts, config=config, state=state, timeout=300):
-        raise click.ClickException("SSH daemon did not become reachable")
-    click.echo("[ssh] connection ready")
+        raise click.ClickException("[boot:ssh-command] timeout")
+    click.echo(f"[boot:ssh-command] ready after {time.monotonic() - ssh_start:.1f}s")
 
     # runtime preflight
     result = ssh.run_remote(
@@ -856,7 +864,7 @@ def _do_fresh_core(
     # wait for API
     client = LlamaClient(config, state)
     if not wait_for_api(config, state, config.ssh.start_timeout):
-        raise click.ClickException("llama-server did not become healthy")
+        raise click.ClickException("[boot:end-to-end] timeout waiting for /health")
 
     # restore slot cache
     if cache_enabled:
@@ -982,7 +990,7 @@ def _do_restart(
 
     client = LlamaClient(config, state)
     if not wait_for_api(config, state, config.ssh.start_timeout):
-        raise click.ClickException("llama-server did not become healthy")
+        raise click.ClickException("[boot:end-to-end] timeout waiting for /health")
 
     # restore slot cache on restart
     if cache_enabled:

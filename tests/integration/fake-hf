@@ -1,6 +1,74 @@
-#!/usr/bin/env bash
-# Fake `hf` CLI for integration tests: always claim success.
-set -euo pipefail
+#!/usr/bin/env python3
+"""Fake `hf` CLI for integration tests.
 
-echo "[fake-hf] args: $*"
-exit 0
+Supports the exact subset of arguments used by ``start.sh``:
+
+    hf download <repo> <filename> --revision <rev> --local-dir <dir>
+
+It creates small deterministic placeholder files, optionally simulates a
+ download delay or failure, and emits realistic progress output.
+
+Fault injection environment variables:
+  HOSTAI_FAULT_HF_DELAY_SECONDS=<int>   sleep before creating the file
+  HOSTAI_FAULT_HF_FAIL=<any>            exit with an error after printing
+"""
+
+import argparse
+import os
+import sys
+import time
+from pathlib import Path
+
+
+def _parse_args(argv):
+    parser = argparse.ArgumentParser(prog="hf")
+    sub = parser.add_subparsers(dest="command")
+    dl = sub.add_parser("download", help="download a file from a repo")
+    dl.add_argument("repo")
+    dl.add_argument("filename")
+    dl.add_argument("--revision", default="main")
+    dl.add_argument("--local-dir", required=True)
+    return parser.parse_args(argv)
+
+
+def _placeholder_bytes(filename: str, size: int = 1024 * 1024) -> bytes:
+    """Return deterministic placeholder bytes for *filename*."""
+    header = f"# hostai integration test placeholder for {filename}\n".encode()
+    block = b"\x00" * 4096
+    repeats = max(1, (size - len(header)) // len(block))
+    return header + block * repeats
+
+
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    args = _parse_args(argv)
+
+    if args.command != "download":
+        print(f"[fake-hf] unsupported command: {args.command}", file=sys.stderr)
+        return 1
+
+    if os.environ.get("HOSTAI_FAULT_HF_FAIL"):
+        print(f"[fake-hf] FAULT: simulated failure for {args.filename}", file=sys.stderr)
+        return 1
+
+    delay = int(os.environ.get("HOSTAI_FAULT_HF_DELAY_SECONDS", "0"))
+    if delay:
+        print(f"[fake-hf] simulating {delay}s download for {args.filename}")
+        for i in range(delay):
+            print(f"[fake-hf] downloading... {i + 1}/{delay}s")
+            time.sleep(1)
+
+    local_dir = Path(args.local_dir)
+    local_dir.mkdir(parents=True, exist_ok=True)
+    target = local_dir / args.filename
+
+    # Create a small deterministic placeholder (1 MiB) so disk-usage telemetry
+    # and file existence checks are meaningful.
+    target.write_bytes(_placeholder_bytes(args.filename))
+    print(f"[fake-hf] downloaded {args.repo}/{args.filename}@{args.revision} -> {target}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

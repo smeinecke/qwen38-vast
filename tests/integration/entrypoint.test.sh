@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 # PID-1 supervisor for the local integration test image.
+# This is a test-only derivative of the production entrypoint that adds
+# deterministic fault-injection hooks for exercising HostAI's boot deadlines.
 set -Eeuo pipefail
+
+# Optional deterministic fault injection.
+HOSTAI_FAULT_SSHD_DELAY_SECONDS="${HOSTAI_FAULT_SSHD_DELAY_SECONDS:-0}"
+if [[ "$HOSTAI_FAULT_SSHD_DELAY_SECONDS" =~ ^[0-9]+$ ]] && (( HOSTAI_FAULT_SSHD_DELAY_SECONDS > 0 )); then
+  echo "[fault] delaying sshd startup by ${HOSTAI_FAULT_SSHD_DELAY_SECONDS}s"
+  sleep "$HOSTAI_FAULT_SSHD_DELAY_SECONDS"
+fi
 
 /usr/local/bin/hostai-init-ssh.sh
 
@@ -42,6 +51,7 @@ start_sshd() {
 
 start_sshd
 
+# If start.sh exits, keep the container alive so hostai can diagnose.
 /usr/local/bin/start.sh > >(tee -a /var/log/qwen38/server.log) 2>&1 &
 server_pid=$!
 
@@ -50,14 +60,12 @@ while (( shutting_down == 0 )); do
   if [[ "${ended_pid:-}" == "$server_pid" ]]; then
     echo >&2 "[serve] start.sh exited; keeping container alive for diagnostics"
     server_pid=""
-    # Keep the container running so hostai can debug via ssh.
     sleep 1
   elif [[ "${ended_pid:-}" == "$sshd_pid" ]]; then
     echo >&2 "[ssh] sshd exited; restarting"
     sshd_pid=""
     start_sshd
   fi
-  # Defensive checks in case wait -p is not available.
   if [[ -n "$sshd_pid" ]] && ! kill -0 "$sshd_pid" 2>/dev/null; then
     sshd_pid=""
     start_sshd
