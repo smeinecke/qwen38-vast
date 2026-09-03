@@ -12,3 +12,4 @@ htmlcov/
 .hostai-cache/
 hostai.toml
 ssh/authorized_keys.generated
+logs/
