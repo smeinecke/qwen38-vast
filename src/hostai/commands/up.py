@@ -46,6 +46,7 @@ def _log(message: str, err: bool = False) -> None:
 @click.option("--unverified", is_flag=True, help="Also consider unverified/unknown hosts.")
 @click.option("--unsecure", is_flag=True, help="Use legacy TCP/no-TLS mode.")
 @click.option("--no-cache", is_flag=True, help="Disable slot cache.")
+@click.option("--keep-on-failure", is_flag=True, help="Do not destroy the instance if provisioning fails.")
 @click.option("--abort-if-shm-too-small", is_flag=True, help="Fail if /dev/shm is too small.")
 @click.option("--offer", type=int, help="Use a specific offer ID.")
 @click.option("--restart", is_flag=True, help="Restart an existing paused instance.")
@@ -70,6 +71,7 @@ def cmd_up(
     unverified: bool,
     unsecure: bool,
     no_cache: bool,
+    keep_on_failure: bool,
     abort_if_shm_too_small: bool,
     offer: Optional[int],
     restart: bool,
@@ -94,6 +96,9 @@ def cmd_up(
 
     if scoring_mode:
         config.market.scoring_mode = scoring_mode
+
+    if keep_on_failure:
+        config.vast.keep_on_failure = True
 
     # Interruptible mode is enabled by CLI flag, config flag, or an explicit bid.
     use_interruptible = (
@@ -385,6 +390,7 @@ def _env_dict(
         env["HOSTAI_SLOT_CACHE_SESSION"] = session
         env["HOSTAI_SLOT_CACHE_MAX_GB"] = str(config.cache.max_gb)
         env["HOSTAI_SLOT_CACHE_USE_SHM"] = "1" if config.cache.use_shm else "0"
+        env["HOSTAI_SLOT_CACHE_MIN_GB"] = str(config.cache.shm_min_gb)
         env["HOSTAI_SLOT_CACHE_LOCAL_DIR"] = slot_dir
         if config.cache.rclone:
             env["HOSTAI_SLOT_CACHE_RCLONE"] = "1"
@@ -1139,6 +1145,11 @@ def _do_fresh_core(
         proxy_port = ssh.ensure_tunnel(config, state)
         _log(f"[tunnel] localhost:{proxy_port}")
 
+    # Reload state after the proxy/tunnel process has written its metadata
+    # (proxy_pid, upstream_socket, etc.) so the rest of provisioning and the
+    # final ready state are consistent with the running proxy.
+    state = State.load(state.state_file)
+
     # Build client API URL. When the proxy is active it is local HTTP; in the
     # non-tokenized legacy path we still speak directly to the remote TLS port.
     client_scheme = "http" if config.proxy.tokenized_only else api_scheme
@@ -1328,6 +1339,9 @@ def _do_restart(
     else:
         proxy_port = ssh.ensure_tunnel(config, state)
         _log(f"[tunnel] localhost:{proxy_port}")
+
+    # Reload state after the proxy/tunnel process has updated its metadata.
+    state = State.load(state.state_file)
 
     state.save()
     client_scheme = "http" if config.proxy.tokenized_only else api_scheme

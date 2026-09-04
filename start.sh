@@ -23,7 +23,23 @@ UBATCH_SIZE="${UBATCH_SIZE:-512}"
 REASONING_EFFORT="${REASONING_EFFORT:-xhigh}"
 USE_FASTMTP="${USE_FASTMTP:-1}"
 HOSTAI_PROFILE="${HOSTAI_PROFILE:-custom}"
-SLOT_SAVE_PATH="${HOSTAI_SLOT_CACHE_LOCAL_DIR:-${SLOT_SAVE_PATH:-/var/lib/qwen38/slots}}"
+
+# Slot cache location. The client may suggest a path via HOSTAI_SLOT_CACHE_LOCAL_DIR,
+# but if that points to /dev/shm and the actual free space is below the minimum,
+# fall back to disk so llama-server can save large slot states reliably.
+SLOT_SAVE_PATH_DEFAULT="${SLOT_SAVE_PATH:-/var/lib/qwen38/slots}"
+SLOT_SAVE_PATH="${HOSTAI_SLOT_CACHE_LOCAL_DIR:-$SLOT_SAVE_PATH_DEFAULT}"
+if [[ "$SLOT_SAVE_PATH" == /dev/shm/* ]]; then
+  slot_min_gb="${HOSTAI_SLOT_CACHE_MIN_GB:-${HOSTAI_SHM_MIN_GB:-32}}"
+  if [[ "$slot_min_gb" =~ ^[0-9]+$ ]]; then
+    shm_avail=$(df -P -B1 /dev/shm | awk 'NR==2{print $4}')
+    min_bytes=$((slot_min_gb * 1024 * 1024 * 1024))
+    if [[ "$shm_avail" -lt "$min_bytes" ]]; then
+      echo "[cache] /dev/shm free=${shm_avail}B is below min=${min_bytes}B; using disk slot cache"
+      SLOT_SAVE_PATH="/var/lib/qwen38/slots"
+    fi
+  fi
+fi
 CACHE_TYPE_K="${CACHE_TYPE_K:-}"
 CACHE_TYPE_V="${CACHE_TYPE_V:-}"
 

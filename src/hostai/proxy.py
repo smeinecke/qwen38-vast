@@ -642,19 +642,19 @@ async def run_proxy(config: Config, state: State) -> None:
     connection alive as long as it is running. When tokenized-only is enabled it
     tokenizes /v1/chat/completions; otherwise it passes traffic through.
     """
-    if not state.unsecure:
-        local_socket = ssh.ensure_unix_tunnel(config, state)
-        _logger.info("proxy SSH unix tunnel on %s", local_socket)
-    else:
-        local_port = ssh.ensure_tunnel(config, state)
-        _logger.info("proxy SSH TCP tunnel on localhost:%d", local_port)
-
     # Record the proxy pid so hostai down can stop it.
     state.data["proxy_pid"] = os.getpid()
     state.save()
 
     socket_path = Path(config.proxy.socket_path) if config.proxy.socket_path else _default_socket_path(state)
     port = config.proxy.port or config.ssh.local_port or 0
+
+    # Pre-register the upstream Unix socket path so the proxy can create its
+    # aiohttp app immediately.  The SSH tunnel (and remote socket) is set up
+    # concurrently below; the proxy returns 503 until the model is ready.
+    upstream_socket = state.data.get("upstream_socket") or str(state.state_file.parent / "upstream.sock")
+    state.data["upstream_socket"] = upstream_socket
+    state.save()
 
     tokenizer = Tokenizer(config)
     proxy = TokenizedProxy(config, state, tokenizer, socket_path, port)
@@ -665,6 +665,15 @@ async def run_proxy(config: Config, state: State) -> None:
     server_task = asyncio.create_task(proxy.run())
 
     try:
+        if not state.unsecure:
+            # The tunnel setup can take minutes while the remote model loads, so
+            # run it in a thread so the web server can bind its local port now.
+            local_socket = await asyncio.to_thread(ssh.ensure_unix_tunnel, config, state)
+            _logger.info("proxy SSH unix tunnel on %s", local_socket)
+        else:
+            local_port = await asyncio.to_thread(ssh.ensure_tunnel, config, state)
+            _logger.info("proxy SSH TCP tunnel on localhost:%d", local_port)
+
         await _bootstrap_proxy(proxy, config, state, server_task)
     except Exception as exc:
         _logger.error("proxy bootstrap failed: %s", exc)
