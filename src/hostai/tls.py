@@ -66,6 +66,7 @@ def deliver_cert(
     identity: Optional[Path] = None,
     config: Optional[Config] = None,
     state: Optional[State] = None,
+    timeout: float = 60.0,
 ) -> bool:
     """Deliver server.crt and server.key to /dev/shm/qwen38/certs over SSH.
 
@@ -94,6 +95,7 @@ def deliver_cert(
         config=config,
         state=state,
         capture=True,
+        timeout=timeout,
     )
     if result.returncode != 0:
         return False
@@ -109,6 +111,7 @@ def deliver_cert(
             state=state,
             input_data=local_text,
             capture=True,
+            timeout=timeout,
         )
         if result.returncode != 0:
             return False
@@ -122,6 +125,7 @@ def deliver_cert(
         config=config,
         state=state,
         capture=True,
+        timeout=timeout,
     )
     return result.returncode == 0
 

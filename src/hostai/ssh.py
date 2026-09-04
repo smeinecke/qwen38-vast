@@ -165,7 +165,7 @@ async def _run_remote(
     ) as conn:
         result = await conn.run(
             command,
-            stdin=input_data,
+            input=input_data,
             timeout=timeout,
         )
         return CompletedProcess(

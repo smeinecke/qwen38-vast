@@ -856,6 +856,36 @@ def _do_fresh_core(
     if result.returncode != 0:
         raise click.ClickException(f"remote llama-server preflight failed: {result.stderr}")
 
+    # TLS: deliver certificates as soon as SSH is ready, before the slower cache
+    # and slot-cache steps, so the remote start.sh does not time out waiting.
+    if not state.unsecure:
+        tls_dir = tls.ensure_local_tls_dir(config.root_dir)
+        tls.generate_cert(tls_dir)
+        click.echo("[tls] delivering certificates to container")
+        tls_deadline = time.monotonic() + min(120.0, float(config.ssh.start_timeout or 1200))
+        tls_delivered = False
+        while not tls_delivered:
+            if tls.deliver_cert(
+                state.ssh_url,
+                tls_dir,
+                known_hosts=known_hosts,
+                config=config,
+                state=state,
+                timeout=60,
+            ):
+                tls_delivered = True
+                break
+            if time.monotonic() >= tls_deadline:
+                raise click.ClickException("TLS certificate delivery failed")
+            click.echo("[tls] delivery attempt failed; retrying in 5s", err=True)
+            time.sleep(5)
+        state.tls_ca = tls_dir / "ca.crt"
+        state.save()
+        click.echo("[tls] certificates delivered")
+        api_scheme = "https"
+    else:
+        api_scheme = "http"
+
     # cache setup
     cache_enabled = state.slot_cache_enabled
     if cache_enabled and not cache.validate_cache_config(config):
@@ -913,18 +943,6 @@ def _do_fresh_core(
     # tunnel
     local_port = ssh.ensure_tunnel(config, state)
     click.echo(f"[tunnel] localhost:{local_port}")
-
-    # TLS
-    if not state.unsecure:
-        tls_dir = tls.ensure_local_tls_dir(config.root_dir)
-        tls.generate_cert(tls_dir)
-        if not tls.deliver_cert(state.ssh_url, tls_dir, known_hosts=known_hosts, config=config, state=state):
-            raise click.ClickException("TLS certificate delivery failed")
-        state.tls_ca = tls_dir / "ca.crt"
-        state.save()
-        api_scheme = "https"
-    else:
-        api_scheme = "http"
 
     api_url = f"{api_scheme}://127.0.0.1:{local_port}"
     base_url = f"{api_url}/v1"
@@ -1012,6 +1030,36 @@ def _do_restart(
     if not ssh.wait_for_ssh(state.ssh_url, known_hosts=known_hosts, config=config, state=state, timeout=300):
         raise click.ClickException("SSH daemon did not become reachable")
 
+    # TLS: deliver certificates as soon as SSH is ready, before slower cache setup.
+    if not state.unsecure:
+        tls_dir = tls.ensure_local_tls_dir(config.root_dir)
+        if not (tls_dir / "server.crt").exists():
+            tls.generate_cert(tls_dir)
+        click.echo("[tls] delivering certificates to container")
+        tls_deadline = time.monotonic() + min(120.0, float(config.ssh.start_timeout or 1200))
+        tls_delivered = False
+        while not tls_delivered:
+            if tls.deliver_cert(
+                state.ssh_url,
+                tls_dir,
+                known_hosts=known_hosts,
+                config=config,
+                state=state,
+                timeout=60,
+            ):
+                tls_delivered = True
+                break
+            if time.monotonic() >= tls_deadline:
+                raise click.ClickException("TLS certificate delivery failed")
+            click.echo("[tls] delivery attempt failed; retrying in 5s", err=True)
+            time.sleep(5)
+        state.tls_ca = tls_dir / "ca.crt"
+        state.save()
+        click.echo("[tls] certificates delivered")
+        api_scheme = "https"
+    else:
+        api_scheme = "http"
+
     # cache setup for restart
     cache_enabled = state.slot_cache_enabled and not no_cache
     if cache_enabled and not cache.validate_cache_config(config):
@@ -1043,17 +1091,6 @@ def _do_restart(
 
     local_port = ssh.ensure_tunnel(config, state)
     click.echo(f"[tunnel] localhost:{local_port}")
-
-    if not state.unsecure:
-        tls_dir = tls.ensure_local_tls_dir(config.root_dir)
-        if not (tls_dir / "server.crt").exists():
-            tls.generate_cert(tls_dir)
-        if not tls.deliver_cert(state.ssh_url, tls_dir, known_hosts=known_hosts, config=config, state=state):
-            raise click.ClickException("TLS certificate delivery failed")
-        state.tls_ca = tls_dir / "ca.crt"
-        api_scheme = "https"
-    else:
-        api_scheme = "http"
 
     state.save()
     api_url = f"{api_scheme}://127.0.0.1:{local_port}"
