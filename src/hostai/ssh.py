@@ -620,6 +620,208 @@ def is_tunnel_healthy(config: Config, state: State, timeout: int = 3) -> bool:
     return _local_port_is_open(local_port, timeout)
 
 
+_UNI_TUNNELS: Dict[str, Dict[str, Any]] = {}
+
+
+def _unix_tunnel_is_running(local_path: str) -> bool:
+    return local_path in _UNI_TUNNELS
+
+
+async def _start_unix_tunnel_worker(
+    local_path: str,
+    user: str,
+    host: str,
+    port: int,
+    remote_dest: str,
+    identity: Optional[Path],
+    connect_timeout: float,
+    ready: threading.Event,
+    stop: threading.Event,
+    outcome: Dict[str, Any],
+) -> None:
+    try:
+        known_hosts = outcome.get("known_hosts")
+        kwargs = _connect_kwargs(known_hosts, identity)
+        kwargs["connect_timeout"] = connect_timeout
+        kwargs["login_timeout"] = connect_timeout
+        async with asyncssh.connect(host, port=port, username=user, **kwargs) as conn:
+            forwarder = conn.forward_local_path(local_path, remote_dest)
+            async with forwarder as listener:
+                _UNI_TUNNELS[local_path] = {
+                    "conn": conn,
+                    "listener": listener,
+                    "stop": stop,
+                    "remote_dest": remote_dest,
+                }
+                ready.set()
+                while not stop.is_set():
+                    await asyncio.sleep(0.5)
+    except Exception as exc:
+        outcome["error"] = exc
+        ready.set()
+    finally:
+        _UNI_TUNNELS.pop(local_path, None)
+        try:
+            Path(local_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _unix_tunnel_thread_runner(
+    loop: asyncio.AbstractEventLoop,
+    local_path: str,
+    user: str,
+    host: str,
+    port: int,
+    remote_dest: str,
+    identity: Optional[Path],
+    connect_timeout: float,
+    ready: threading.Event,
+    stop: threading.Event,
+    outcome: Dict[str, Any],
+) -> None:
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(
+        _start_unix_tunnel_worker(
+            local_path, user, host, port, remote_dest, identity, connect_timeout, ready, stop, outcome
+        )
+    )
+    loop.close()
+
+
+def _unix_socket_is_open(local_path: str, timeout: int = 3) -> bool:
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect(local_path)
+            return True
+    except OSError:
+        return False
+
+
+def ensure_unix_tunnel(
+    config: Config,
+    state: State,
+    remote_dest: Optional[str] = None,
+    timeout: Optional[float] = None,
+) -> str:
+    """Start or reuse an SSH local Unix socket forward to a remote Unix socket.
+
+    Returns the local Unix socket path. The path is stored in
+    ``state.data["upstream_socket"]``.
+    """
+    if not state.ssh_url:
+        raise RuntimeError("no ssh_url in state; cannot establish tunnel")
+
+    remote_dest = remote_dest or _default_remote_dest(state)
+    if not remote_dest.startswith("/"):
+        raise RuntimeError(f"ensure_unix_tunnel only supports remote Unix sockets, got {remote_dest}")
+
+    timeout = timeout if timeout is not None else config.ssh.start_timeout
+    if timeout is None or timeout <= 0:
+        timeout = _TUNNEL_START_TIMEOUT
+
+    local_path = state.data.get("upstream_socket") or str(state.state_file.parent / "upstream.sock")
+
+    # Reuse an existing healthy tunnel.
+    if _unix_tunnel_is_running(local_path) and _unix_socket_is_open(local_path, timeout=3):
+        state.data["upstream_socket"] = local_path
+        state.local_port = 0
+        state.tunnel_pid = 0
+        state.save()
+        return local_path
+
+    # Stop a stale tunnel before starting a new one.
+    if _unix_tunnel_is_running(local_path):
+        stop_unix_tunnel(local_path)
+
+    Path(local_path).unlink(missing_ok=True)
+
+    user, host, port = _parse_url(state.ssh_url)
+    known_hosts = state.state_file.parent / "known_hosts"
+    known_hosts.parent.mkdir(parents=True, exist_ok=True)
+    clear_known_hosts(host, port, known_hosts)
+
+    identity = _default_identity(config, state)
+    connect_timeout = _connect_timeout_for_stage(timeout)
+
+    start = time.monotonic()
+    loop = asyncio.new_event_loop()
+    ready = threading.Event()
+    stop = threading.Event()
+    outcome: Dict[str, Any] = {"known_hosts": known_hosts}
+    thread = threading.Thread(
+        target=_unix_tunnel_thread_runner,
+        args=(loop, local_path, user, host, port, remote_dest, identity, connect_timeout, ready, stop, outcome),
+        daemon=True,
+    )
+    thread.start()
+    ready.wait(timeout=connect_timeout + 5)
+    ssh_elapsed = time.monotonic() - start
+    if not ready.is_set():
+        stop.set()
+        thread.join(timeout=5)
+        raise RuntimeError(f"[boot:unix-tunnel-ssh] timeout after {ssh_elapsed:.1f}s")
+
+    if "error" in outcome:
+        err = outcome["error"]
+        _boot_log("unix-tunnel-ssh", ssh_elapsed, f"failed: {err}")
+        stop.set()
+        thread.join(timeout=5)
+        raise RuntimeError(f"[boot:unix-tunnel-ssh] failed: {err}")
+    _boot_log("unix-tunnel-ssh", ssh_elapsed, "connected")
+
+    if not _unix_socket_is_open(local_path, timeout=5):
+        forward_elapsed = time.monotonic() - start
+        _boot_log("unix-tunnel-forward", forward_elapsed, f"local socket {local_path} is not accepting connections")
+        stop.set()
+        thread.join(timeout=5)
+        raise RuntimeError("[boot:unix-tunnel-forward] local socket is not accepting connections")
+    forward_elapsed = time.monotonic() - start
+    _boot_log("unix-tunnel-forward", forward_elapsed, f"local socket {local_path} accepting connections")
+
+    if not _wait_for_remote_socket(
+        state.ssh_url,
+        remote_dest,
+        known_hosts=known_hosts,
+        identity=identity,
+        config=config,
+        state=state,
+        timeout=max(5.0, timeout - (time.monotonic() - start) - 2),
+    ):
+        socket_elapsed = time.monotonic() - start
+        _boot_log("remote-socket", socket_elapsed, f"{remote_dest} did not appear")
+        stop.set()
+        thread.join(timeout=5)
+        raise RuntimeError(f"[boot:remote-socket] {remote_dest} did not appear")
+    socket_elapsed = time.monotonic() - start
+    _boot_log("remote-socket", socket_elapsed, f"{remote_dest} present")
+
+    _UNI_TUNNELS[local_path]["state"] = state
+    _UNI_TUNNELS[local_path]["thread"] = thread
+    _UNI_TUNNELS[local_path]["stop"] = stop
+    _UNI_TUNNELS[local_path]["identity"] = identity
+    state.data["upstream_socket"] = local_path
+    state.local_port = 0
+    state.tunnel_pid = 0
+    state.save()
+    return local_path
+
+
+def stop_unix_tunnel(local_path: str) -> None:
+    """Stop a managed Unix socket SSH tunnel."""
+    info = _UNI_TUNNELS.pop(local_path, None)
+    if info and "stop" in info:
+        info["stop"].set()
+        thread = info.get("thread")
+        if thread and thread.is_alive():
+            thread.join(timeout=5)
+    try:
+        Path(local_path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _local_port_is_open(local_port: int, timeout: int) -> bool:
     """Return whether a specific local tunnel port accepts TCP connections."""
     try:

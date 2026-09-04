@@ -10,7 +10,7 @@ import re
 import ssl
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 from aiohttp import web
@@ -85,10 +85,21 @@ def _default_socket_path(state: State) -> Path:
     return state.state_file.parent / "proxy.sock"
 
 
-def _upstream_url(config: Config, state: State) -> str:
+def _resolve_upstream(state: State) -> Tuple[str, Optional[str]]:
+    """Return (upstream_base_url, upstream_unix_socket_path).
+
+    The base URL is used as the host/authority in HTTP requests; when the
+    upstream is a Unix domain socket the connector sends the request there
+    instead of resolving the hostname.
+    """
+    unix_socket = state.data.get("upstream_socket") or ""
     if state.unsecure:
-        return f"http://127.0.0.1:{state.local_port}"
-    return f"https://127.0.0.1:{state.local_port}"
+        if unix_socket:
+            return "http://localhost", unix_socket
+        return f"http://127.0.0.1:{state.local_port}", None
+    if unix_socket:
+        return "https://localhost", unix_socket
+    return f"https://127.0.0.1:{state.local_port}", None
 
 
 def _ssl_context(state: State) -> ssl.SSLContext:
@@ -103,6 +114,75 @@ def _ssl_context(state: State) -> ssl.SSLContext:
     ctx.verify_mode = ssl.CERT_REQUIRED
     ctx.load_verify_locations(str(state.tls_ca))
     return ctx
+
+
+class UnixTLSConnector(aiohttp.UnixConnector):
+    """Unix domain socket connector that can also wrap the socket in TLS.
+
+    The standard :class:`aiohttp.UnixConnector` does not support ``ssl``, which
+    makes it impossible to speak HTTPS over a Unix socket. This subclass adds
+    TLS wrapping by duplicating the connected socket and re-creating the
+    transport with :meth:`BaseConnector._wrap_existing_connection`.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        *,
+        ssl: ssl.SSLContext | bool | None = True,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(path=path, **kwargs)
+        self._ssl = ssl
+
+    async def _create_connection(
+        self,
+        req: Any,
+        traces: List[Any],
+        timeout: Any,
+    ) -> Any:
+        from aiohttp.client_exceptions import UnixClientConnectorError
+        from aiohttp.helpers import ceil_timeout
+
+        try:
+            async with ceil_timeout(
+                timeout.sock_connect, ceil_threshold=timeout.ceil_threshold
+            ):
+                transport, proto = await self._loop.create_unix_connection(
+                    self._factory, self._path
+                )
+        except OSError as exc:
+            raise UnixClientConnectorError(
+                self.path, req.connection_key, exc
+            ) from exc
+
+        if not req.is_ssl():
+            return proto
+
+        rawsock = transport.get_extra_info("socket")
+        if rawsock is None:
+            transport.close()
+            raise RuntimeError("Unix transport does not expose socket instance")
+
+        # Duplicate the file descriptor so we can close the plaintext transport
+        # and re-open it as a TLS connection over the same Unix socket.
+        rawsock = rawsock.dup()
+        transport.close()
+
+        ssl_context = self._get_ssl_context(req)  # type: ignore[attr-defined]
+        if ssl_context is None:
+            rawsock.close()
+            raise RuntimeError("could not build SSL context for Unix socket")
+
+        wrapped_transport, wrapped_proto = await self._wrap_existing_connection(  # type: ignore[attr-defined]
+            self._factory,
+            req=req,
+            timeout=timeout,
+            sock=rawsock,
+            ssl=ssl_context,
+            server_hostname=req.host,
+        )
+        return wrapped_proto
 
 
 class TokenizedProxy:
@@ -121,7 +201,7 @@ class TokenizedProxy:
         self.tokenizer = tokenizer
         self.socket_path = socket_path
         self.port = port
-        self.upstream = _upstream_url(config, state)
+        self.upstream, self.upstream_socket = _resolve_upstream(state)
         self.api_key = state.api_key or ""
         self.ssl_ctx = _ssl_context(state)
         self.session: Optional[aiohttp.ClientSession] = None
@@ -129,11 +209,18 @@ class TokenizedProxy:
         self.app.router.add_post("/v1/chat/completions", self._chat)
         self.app.router.add_get("/v1/models", self._models)
         self.app.router.add_get("/health", self._health)
+        # Generic pass-through for all other endpoints (slots, metrics, props, ...).
+        self.app.router.add_route("*", "/{path:.*}", self._generic)
         self.app.on_startup.append(self._on_startup)
         self.app.on_cleanup.append(self._on_cleanup)
 
     async def _on_startup(self, app: web.Application) -> None:
-        connector = aiohttp.TCPConnector(ssl=self.ssl_ctx, limit=20)
+        if self.upstream_socket:
+            connector: aiohttp.BaseConnector = UnixTLSConnector(
+                path=self.upstream_socket, ssl=self.ssl_ctx, limit=20
+            )
+        else:
+            connector = aiohttp.TCPConnector(ssl=self.ssl_ctx, limit=20)
         headers: Dict[str, str] = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -155,6 +242,10 @@ class TokenizedProxy:
             body = await request.json()
         except json.JSONDecodeError as exc:
             raise web.HTTPBadRequest(reason=f"invalid JSON: {exc}") from exc
+
+        if not self.config.proxy.tokenized_only:
+            # In non-tokenized mode pass the OpenAI request through as-is.
+            return await self._forward_to_upstream(request, "/v1/chat/completions")
 
         messages = body.get("messages")
         if not messages or not isinstance(messages, list):
@@ -355,6 +446,44 @@ class TokenizedProxy:
             return "stop"
         return None
 
+    async def _forward_to_upstream(
+        self,
+        request: web.Request,
+        upstream_path: str,
+    ) -> web.StreamResponse:
+        """Pass an arbitrary request through to the upstream server."""
+        if self.session is None:
+            raise web.HTTPServiceUnavailable(reason="proxy client not initialized")
+
+        headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
+        body = await request.read()
+
+        query = request.query_string
+        url = f"{self.upstream}{upstream_path}"
+        if query:
+            url = f"{url}?{query}"
+
+        try:
+            async with self.session.request(
+                request.method,
+                url,
+                headers=headers,
+                data=body,
+            ) as upstream_response:
+                response = web.StreamResponse(status=upstream_response.status)
+                response.headers.update(upstream_response.headers)
+                await response.prepare(request)
+                async for chunk in upstream_response.content.iter_any():
+                    await response.write(chunk)
+                await response.write_eof()
+                return response
+        except aiohttp.ClientError as exc:
+            raise web.HTTPBadGateway(reason=f"upstream request failed: {exc}") from exc
+
+    async def _generic(self, request: web.Request) -> web.StreamResponse:
+        """Catch-all reverse proxy for any endpoint not handled above."""
+        return await self._forward_to_upstream(request, request.path)
+
     async def _models(self, request: web.Request) -> web.Response:
         model_id = self.config.model.model or "local"
         return web.json_response(
@@ -399,6 +528,8 @@ class TokenizedProxy:
             await tcp_site.start()
             sites.append(tcp_site)
             _logger.info("proxy listening on tcp 127.0.0.1:%d", self.port)
+            self.state.local_port = self.port
+            self.state.save()
 
         try:
             while True:
@@ -412,15 +543,20 @@ class TokenizedProxy:
 
 async def _fetch_props_once(config: Config, state: State) -> Optional[Dict[str, Any]]:
     """Fetch /props from the upstream to obtain the remote chat template."""
-    upstream = _upstream_url(config, state)
+    upstream, upstream_socket = _resolve_upstream(state)
     ssl_ctx = _ssl_context(state)
     api_key = state.api_key or ""
     headers: Dict[str, str] = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     try:
+        connector: aiohttp.BaseConnector
+        if upstream_socket:
+            connector = UnixTLSConnector(path=upstream_socket, ssl=ssl_ctx)
+        else:
+            connector = aiohttp.TCPConnector(ssl=ssl_ctx)
         async with aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(ssl=ssl_ctx),
+            connector=connector,
             headers=headers,
             timeout=aiohttp.ClientTimeout(total=10),
         ) as session:
@@ -433,20 +569,25 @@ async def _fetch_props_once(config: Config, state: State) -> Optional[Dict[str, 
 
 
 async def run_proxy(config: Config, state: State) -> None:
-    """Start the local tokenized proxy for the active state.
+    """Start the local proxy for the active state.
 
-    The proxy owns its own SSH tunnel, so it keeps the connection alive as long
-    as it is running.
+    The proxy owns its own SSH tunnel to the remote Unix socket and keeps the
+    connection alive as long as it is running. When tokenized-only is enabled it
+    tokenizes /v1/chat/completions; otherwise it passes traffic through.
     """
-    local_port = ssh.ensure_tunnel(config, state)
-    _logger.info("proxy SSH tunnel on localhost:%d", local_port)
+    if not state.unsecure:
+        local_socket = ssh.ensure_unix_tunnel(config, state)
+        _logger.info("proxy SSH unix tunnel on %s", local_socket)
+    else:
+        local_port = ssh.ensure_tunnel(config, state)
+        _logger.info("proxy SSH TCP tunnel on localhost:%d", local_port)
 
     # Record the proxy pid so hostai down can stop it.
     state.data["proxy_pid"] = os.getpid()
     state.save()
 
     socket_path = Path(config.proxy.socket_path) if config.proxy.socket_path else _default_socket_path(state)
-    port = config.proxy.port or 0
+    port = config.proxy.port or config.ssh.local_port or 0
 
     chat_template: Optional[str] = None
     props = await _fetch_props_once(config, state)

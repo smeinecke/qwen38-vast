@@ -591,30 +591,30 @@ def _hostai_binary() -> Path:
     raise RuntimeError("could not find hostai executable")
 
 
-def _start_proxy(config: Config, state: State, api_scheme: str) -> None:
-    """Auto-start the local tokenized proxy after `up` is ready.
+def _start_proxy(config: Config, state: State, client_api_scheme: str = "http") -> Optional[int]:
+    """Auto-start the local OpenAI proxy.
 
-    When tokenized-only mode is enabled, the proxy is the OpenAI-compatible
-    endpoint. It runs as a detached child process so it survives after the
-    `up` command exits.
+    In tokenized-only mode it tokenizes /v1/chat/completions. In normal mode it
+    passes traffic through. The proxy owns the SSH connection to the remote
+    (Unix-socket upstream if secure) and stays up after `up` exits.
+
+    Returns the TCP port the proxy listens on for clients, or None when the
+    proxy is not needed (tokenized-only is false and there is no pass-through
+    configured).
     """
     if not config.proxy.tokenized_only:
-        return
+        return None
 
-    port = config.proxy.port
-    if port:
-        if not utils.port_is_free(port, host="127.0.0.1"):
-            click.echo(f"[proxy] WARNING: configured port {port} is in use; skipping", err=True)
-            return
-    else:
-        # Auto-pick a free localhost TCP port. The proxy will also listen on
-        # the Unix socket, but a TCP port is needed for typical OpenAI clients.
-        start = max((state.local_port or 18081) + 2, 18083)
+    port = config.proxy.port or config.ssh.local_port or 0
+    if port and not utils.port_is_free(port, host="127.0.0.1"):
+        click.echo(f"[proxy] WARNING: configured port {port} is in use; skipping", err=True)
+        return None
+    if not port:
         try:
-            port = utils.find_free_port(start=start, host="127.0.0.1")
+            port = utils.find_free_port(start=18083, host="127.0.0.1")
         except RuntimeError as exc:
             click.echo(f"[proxy] WARNING: no free TCP port: {exc}; skipping", err=True)
-            return
+            return None
     config.proxy.port = port
 
     env = os.environ.copy()
@@ -626,9 +626,9 @@ def _start_proxy(config: Config, state: State, api_scheme: str) -> None:
         proxy_bin = _hostai_binary()
     except RuntimeError as exc:
         click.echo(f"[proxy] WARNING: {exc}; skipping", err=True)
-        return
+        return None
 
-    click.echo(f"[proxy] auto-starting on http://127.0.0.1:{port}")
+    click.echo(f"[proxy] auto-starting on {client_api_scheme}://127.0.0.1:{port}")
     try:
         with open(log_path, "a", encoding="utf-8") as log_file:
             proc = subprocess.Popen(
@@ -641,29 +641,28 @@ def _start_proxy(config: Config, state: State, api_scheme: str) -> None:
             )
     except OSError as exc:
         click.echo(f"[proxy] WARNING: failed to start: {exc}; skipping", err=True)
-        return
+        return None
 
-    deadline = time.monotonic() + 60
+    deadline = time.monotonic() + 120
     while time.monotonic() < deadline:
         if not utils.port_is_free(port, host="127.0.0.1"):
             break
         time.sleep(0.2)
     else:
         click.echo(f"[proxy] WARNING: did not see proxy on port {port}; check {log_path}", err=True)
-        return
+        return None
 
-    # Reload state; the proxy has updated local_port/tunnel info and saved pid.
+    # Reload state; the proxy has updated local_port and saved pid.
     state = State.load(state.state_file)
     state.data["proxy_pid"] = proc.pid
+    state.local_port = port
     state.save()
 
-    if state.local_port:
-        api_url = f"{api_scheme}://127.0.0.1:{state.local_port}"
-        base_url = f"{api_url}/v1"
-    else:
-        api_url = base_url = ""
+    api_url = f"{client_api_scheme}://127.0.0.1:{port}"
+    base_url = f"{api_url}/v1"
     _write_env_file(config, state, api_url, base_url)
-    click.echo(f"[proxy] ready (pid {proc.pid}); OPENAI_BASE_URL=http://127.0.0.1:{port}/v1")
+    click.echo(f"[proxy] ready (pid {proc.pid}); OPENAI_BASE_URL={base_url}")
+    return port
 
 
 def _prefetch_slot_cache_to_vast(
@@ -1029,18 +1028,39 @@ def _do_fresh_core(
             state.data["slot_cache_prefetch"] = "empty"
         state.save()
 
-    # tunnel
-    local_port = ssh.ensure_tunnel(config, state)
-    click.echo(f"[tunnel] localhost:{local_port}")
+    # Start the local proxy if tokenized-only is enabled. The proxy owns the
+    # SSH tunnel to the remote Unix socket and provides the client-facing
+    # OpenAI endpoint on LOCAL_PORT (or [proxy].port).
+    if config.proxy.tokenized_only:
+        proxy_port = _start_proxy(config, state, client_api_scheme="http")
+        if not proxy_port:
+            raise click.ClickException("[proxy] failed to start")
+        click.echo(f"[tunnel] proxy on localhost:{proxy_port}")
+    else:
+        proxy_port = ssh.ensure_tunnel(config, state)
+        click.echo(f"[tunnel] localhost:{proxy_port}")
 
-    api_url = f"{api_scheme}://127.0.0.1:{local_port}"
-    base_url = f"{api_url}/v1"
-    _write_env_file(config, state, api_url, base_url)
+    # Build client API URL. When the proxy is active it is local HTTP; in the
+    # non-tokenized legacy path we still speak directly to the remote TLS port.
+    client_scheme = "http" if config.proxy.tokenized_only else api_scheme
+    client_api_url = f"{client_scheme}://127.0.0.1:{proxy_port}"
+    client_base_url = f"{client_api_url}/v1"
+    _write_env_file(config, state, client_api_url, client_base_url)
 
-    # wait for API
-    client = LlamaClient(config, state)
-    if not wait_for_api(config, state, config.ssh.start_timeout):
-        raise click.ClickException("[boot:end-to-end] timeout waiting for /health")
+    # Wait for the API to be reachable. In tokenized mode the proxy is the
+    # endpoint and only speaks HTTP, so use a temporary client state with
+    # unsecure=True to avoid requiring TLS for the local hop.
+    if config.proxy.tokenized_only:
+        client_state = State.load(state.state_file)
+        client_state.local_port = proxy_port
+        client_state.unsecure = True
+        client = LlamaClient(config, client_state)
+        if not wait_for_api(config, client_state, config.ssh.start_timeout):
+            raise click.ClickException("[boot:end-to-end] timeout waiting for /health via proxy")
+    else:
+        client = LlamaClient(config, state)
+        if not wait_for_api(config, state, config.ssh.start_timeout):
+            raise click.ClickException("[boot:end-to-end] timeout waiting for /health")
 
     # restore slot cache
     if cache_enabled:
@@ -1074,7 +1094,7 @@ def _do_fresh_core(
     click.echo(f"  GPU:       {state.gpu}")
     click.echo(f"  Cost:      ${float(state.dph):.4f}/h")
     click.echo(f"  Context:   {state.ctx_size}")
-    click.echo(f"  API:       {base_url}")
+    click.echo(f"  API:       {client_base_url}")
     click.echo(f"  Instance:  {state.instance_id}")
     click.echo(f"  Run log:   {run_dir}")
     if cache_enabled:
@@ -1082,7 +1102,6 @@ def _do_fresh_core(
     click.echo("\nRun: source .hostai-vast/env")
     click.echo("Stop: hostai down")
 
-    _start_proxy(config, state, api_scheme)
     maybe_start_watchdog(config, state)
     maybe_start_monitor(config, state)
 
@@ -1179,17 +1198,34 @@ def _do_restart(
                 state.data["slot_cache_prefetch"] = "empty"
             state.save()
 
-    local_port = ssh.ensure_tunnel(config, state)
-    click.echo(f"[tunnel] localhost:{local_port}")
+    # Start the local proxy if tokenized-only is enabled; otherwise open a
+    # direct SSH tunnel to the remote.
+    if config.proxy.tokenized_only:
+        proxy_port = _start_proxy(config, state, client_api_scheme="http")
+        if not proxy_port:
+            raise click.ClickException("[proxy] failed to start")
+        click.echo(f"[tunnel] proxy on localhost:{proxy_port}")
+    else:
+        proxy_port = ssh.ensure_tunnel(config, state)
+        click.echo(f"[tunnel] localhost:{proxy_port}")
 
     state.save()
-    api_url = f"{api_scheme}://127.0.0.1:{local_port}"
-    base_url = f"{api_url}/v1"
-    _write_env_file(config, state, api_url, base_url)
+    client_scheme = "http" if config.proxy.tokenized_only else api_scheme
+    client_api_url = f"{client_scheme}://127.0.0.1:{proxy_port}"
+    client_base_url = f"{client_api_url}/v1"
+    _write_env_file(config, state, client_api_url, client_base_url)
 
-    client = LlamaClient(config, state)
-    if not wait_for_api(config, state, config.ssh.start_timeout):
-        raise click.ClickException("[boot:end-to-end] timeout waiting for /health")
+    if config.proxy.tokenized_only:
+        client_state = State.load(state.state_file)
+        client_state.local_port = proxy_port
+        client_state.unsecure = True
+        client = LlamaClient(config, client_state)
+        if not wait_for_api(config, client_state, config.ssh.start_timeout):
+            raise click.ClickException("[boot:end-to-end] timeout waiting for /health via proxy")
+    else:
+        client = LlamaClient(config, state)
+        if not wait_for_api(config, state, config.ssh.start_timeout):
+            raise click.ClickException("[boot:end-to-end] timeout waiting for /health")
 
     # restore slot cache on restart
     if cache_enabled:
@@ -1210,9 +1246,8 @@ def _do_restart(
 
     click.echo("\nREADY")
     click.echo(f"  Profile:   {state.profile}")
-    click.echo(f"  API:       {base_url}")
+    click.echo(f"  API:       {client_base_url}")
     click.echo(f"  Instance:  {state.instance_id}")
 
-    _start_proxy(config, state, api_scheme)
     maybe_start_watchdog(config, state)
     maybe_start_monitor(config, state)
