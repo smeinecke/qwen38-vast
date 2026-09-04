@@ -93,7 +93,9 @@ def cmd_cost(config: Config):
 @click.option("--dph", type=float, default=None, help="GPU all-in $/h (default from state/market).")
 @click.option("--inet-down", type=float, default=None, help="Host download bandwidth in Mbps (default 500).")
 @click.option("--disk-bw", type=float, default=None, help="Host disk bandwidth in MB/s (default 200).")
-@click.option("--inet-down-cost", type=float, default=None, help="Download traffic cost in $/GB (default from state/market).")
+@click.option(
+    "--inet-down-cost", type=float, default=None, help="Download traffic cost in $/GB (default from state/market)."
+)
 @click.option("--starts-per-month", type=int, default=None, help="Override starts/month estimate.")
 @click.pass_obj
 def cmd_volume_break_even(
@@ -123,11 +125,7 @@ def cmd_volume_break_even(
     dph = dph if dph is not None else default_dph
     inet_down = inet_down if inet_down is not None else default_inet
     disk_bw = disk_bw if disk_bw is not None else default_disk
-    inet_down_cost = (
-        inet_down_cost
-        if inet_down_cost is not None
-        else config.market.max_inet_down_cost
-    )
+    inet_down_cost = inet_down_cost if inet_down_cost is not None else config.market.max_inet_down_cost
 
     model_gb = config.market.model_download_gb
     # The volume can only save what it can hold.  If it is smaller than the
@@ -156,9 +154,7 @@ def cmd_volume_break_even(
         offer, config, cache_state=market.CACHE_STATE_CACHED
     )
 
-    model_fetch_seconds, avoided_download_gb = _model_fetch_estimate(
-        effective_model_gb, inet_down, disk_bw
-    )
+    model_fetch_seconds, avoided_download_gb = _model_fetch_estimate(effective_model_gb, inet_down, disk_bw)
     model_fetch_hours = model_fetch_seconds / 3600.0
 
     # GPU rental cost during the model fetch: this is the time the GPU is
@@ -188,8 +184,7 @@ def cmd_volume_break_even(
     click.echo(f"[cost] dph=${dph:.4f}/h")
     click.echo(f"[cost] traffic cost: ${inet_down_cost:.4f}/GB")
     click.echo(
-        f"[cost] avoided model download: {avoided_download_gb:.2f} GB "
-        f"(main + draft/MTP; image pull is not saved)"
+        f"[cost] avoided model download: {avoided_download_gb:.2f} GB (main + draft/MTP; image pull is not saved)"
     )
     click.echo(
         f"[cost] avoided model fetch: {model_fetch_seconds:.0f}s "

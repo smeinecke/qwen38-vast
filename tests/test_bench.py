@@ -57,7 +57,9 @@ def test_bench_happy_path(config, project_dir):
     with mock.patch("hostai.commands.bench.State.load", return_value=state):
         with mock.patch("hostai.commands.bench.ssh.is_tunnel_healthy", return_value=True):
             with mock.patch("hostai.commands.bench.LlamaClient", return_value=FakeClient()):
-                with mock.patch("hostai.commands.bench.ssh.run_remote", return_value=mock.Mock(returncode=0, stdout="")):
+                with mock.patch(
+                    "hostai.commands.bench.ssh.run_remote", return_value=mock.Mock(returncode=0, stdout="")
+                ):
                     runner = CliRunner()
                     result = runner.invoke(cmd_bench, ["--max-tokens", "10"], obj=config)
 
@@ -110,7 +112,9 @@ def test_bench_streaming_error(config, project_dir):
     with mock.patch("hostai.commands.bench.State.load", return_value=state):
         with mock.patch("hostai.commands.bench.ssh.is_tunnel_healthy", return_value=True):
             with mock.patch("hostai.commands.bench.LlamaClient", return_value=FakeClient()):
-                with mock.patch("hostai.commands.bench.ssh.run_remote", return_value=mock.Mock(returncode=0, stdout="")):
+                with mock.patch(
+                    "hostai.commands.bench.ssh.run_remote", return_value=mock.Mock(returncode=0, stdout="")
+                ):
                     runner = CliRunner()
                     result = runner.invoke(cmd_bench, ["--max-tokens", "10"], obj=config)
 

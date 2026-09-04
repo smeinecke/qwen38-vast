@@ -21,6 +21,7 @@ from hostai.state import State, state_dir
 def _provider(config: Config):
     return get_provider(config)
 
+
 _refresh_ssh_state = _common.refresh_ssh_state
 
 

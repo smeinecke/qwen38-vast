@@ -9,9 +9,7 @@ from hostai.config import Config, image_for_profile, load_config
 
 def test_load_config_from_toml(project_dir):
     (project_dir / "hostai.toml").write_text(
-        "[hostai]\ndefault_profile = \"test\"\n"
-        "[market]\nmax_dph = 0.75\n"
-        "[model]\nmodel = \"my-model.gguf\"\n"
+        '[hostai]\ndefault_profile = "test"\n[market]\nmax_dph = 0.75\n[model]\nmodel = "my-model.gguf"\n'
     )
     cfg = load_config(project_dir)
     assert cfg.hostai.default_profile == "test"
@@ -20,7 +18,7 @@ def test_load_config_from_toml(project_dir):
 
 
 def test_load_config_from_env_override(project_dir, monkeypatch):
-    (project_dir / "hostai.toml").write_text("[hostai]\ndefault_profile = \"test\"\n")
+    (project_dir / "hostai.toml").write_text('[hostai]\ndefault_profile = "test"\n')
     (project_dir / ".env").write_text("VAST_API_KEY=secret\n")
     monkeypatch.setenv("MAX_DPH", "0.99")
     cfg = load_config(project_dir)

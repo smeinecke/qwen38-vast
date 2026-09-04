@@ -54,7 +54,11 @@ def _log(message: str, err: bool = False) -> None:
 @click.option("--expected-session", help="Expected session duration, e.g. 30m, 2h.")
 @click.option("--dry-run", is_flag=True, help="Search and print the chosen offer without renting.")
 @click.option("--scoring-mode", help="Override market scoring mode (dph, perf, session).")
-@click.option("--allow-unvalidated", is_flag=True, help="Skip the production-validation gate when [vast].require_production_validation is true.")
+@click.option(
+    "--allow-unvalidated",
+    is_flag=True,
+    help="Skip the production-validation gate when [vast].require_production_validation is true.",
+)
 @click.pass_obj
 def cmd_up(
     config: Config,
@@ -92,7 +96,9 @@ def cmd_up(
         config.market.scoring_mode = scoring_mode
 
     # Interruptible mode is enabled by CLI flag, config flag, or an explicit bid.
-    use_interruptible = interruptible or config.vast.interruptible or bid is not None or config.vast.bid_price is not None
+    use_interruptible = (
+        interruptible or config.vast.interruptible or bid is not None or config.vast.bid_price is not None
+    )
     if use_interruptible:
         bid_price = bid if bid is not None else config.vast.bid_price
         if bid_price is None:
@@ -249,8 +255,7 @@ def _shm_preflight(
         return 2
     if free < min_bytes:
         _log(
-            f"[cache] /dev/shm free={free / 1024 / 1024 / 1024:.2f}GB "
-            f"is below shm_min_gb={min_gb}GB",
+            f"[cache] /dev/shm free={free / 1024 / 1024 / 1024:.2f}GB is below shm_min_gb={min_gb}GB",
             err=True,
         )
         return 1
@@ -302,9 +307,7 @@ def _resolve_client_port(
         return desired
 
     if user_set:
-        raise click.ClickException(
-            f"client port {desired} is already in use; choose another with --local-port"
-        )
+        raise click.ClickException(f"client port {desired} is already in use; choose another with --local-port")
 
     _log(f"[up] client port {desired} is in use; searching for a free port", err=True)
     try:
@@ -552,7 +555,7 @@ def _capture_disk_telemetry(config: Config, state: State, known_hosts: Path) -> 
 
     # Always capture a final snapshot in case the start.sh log is missing
     # (older images) or the container's log path differs.
-    final_script = r'''python3 - <<'PY'
+    final_script = r"""python3 - <<'PY'
 import json, os, subprocess
 
 def du(path):
@@ -577,7 +580,7 @@ record = {
     "tmp_bytes": du("/dev/shm/qwen38/tmp"),
 }
 print(json.dumps(record))
-PY'''
+PY"""
     res2 = ssh.run_remote(state.ssh_url, final_script, known_hosts=known_hosts, config=config, state=state, timeout=60)
     if res2.returncode == 0 and res2.stdout:
         try:
@@ -815,8 +818,12 @@ def _do_fresh(
     disk_gb = market.resolved_disk_gb(profile, config)
     interruptible = bid_price is not None
 
-    query, max_dph = market.build_search_query(config, profiles, profile, max_price=max_price, unverified=unverified, offer=offer, bid_price=bid_price)
-    _log(f"[profile] {profile.name} | sm_{image.cuda_arch} | ctx={ctx_size} | image={selected_image} | disk={disk_gb}GB")
+    query, max_dph = market.build_search_query(
+        config, profiles, profile, max_price=max_price, unverified=unverified, offer=offer, bid_price=bid_price
+    )
+    _log(
+        f"[profile] {profile.name} | sm_{image.cuda_arch} | ctx={ctx_size} | image={selected_image} | disk={disk_gb}GB"
+    )
     _log(f"[search]  {query}")
 
     offer_type = "bid" if interruptible else "on-demand"
@@ -1176,7 +1183,9 @@ def _do_fresh_core(
     if run_dir and state.ssh_url:
         telemetry = _capture_disk_telemetry(config, state, known_hosts)
         if telemetry:
-            _log(f"[disk] telemetry: {len(telemetry['records'])} stages, free={telemetry['records'][-1]['free_bytes']/1e9:.2f}GB")
+            _log(
+                f"[disk] telemetry: {len(telemetry['records'])} stages, free={telemetry['records'][-1]['free_bytes'] / 1e9:.2f}GB"
+            )
 
     _log("\nREADY")
     _log(f"  Profile:   {state.profile} (sm_{image.cuda_arch})")

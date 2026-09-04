@@ -99,7 +99,8 @@ def _is_request_active(client: api.LlamaClient, previous: Dict[str, Any]) -> tup
     # (current < previous) is also treated as activity because we cannot
     # distinguish a server restart from genuine activity.
     counters_changed = any(
-        isinstance(current.get(k), (int, float)) and isinstance(previous.get(k), (int, float))
+        isinstance(current.get(k), (int, float))
+        and isinstance(previous.get(k), (int, float))
         and current[k] != previous[k]
         for k in ("llamacpp:prompt_tokens_total", "llamacpp:tokens_predicted_total")
     )
@@ -144,8 +145,7 @@ def _run_once(
 
     max_runtime_elapsed = max_runtime_deadline is not None and now >= max_runtime_deadline
     idle_elapsed = (
-        config.vast.idle_timeout_seconds is not None
-        and now - last_activity_epoch >= config.vast.idle_timeout_seconds
+        config.vast.idle_timeout_seconds is not None and now - last_activity_epoch >= config.vast.idle_timeout_seconds
     )
     idle_observations_ok = consecutive_inactive >= MIN_IDLE_OBSERVATIONS
 
@@ -153,9 +153,15 @@ def _run_once(
     if idle_elapsed:
         if activity_state == "inactive" and idle_observations_ok:
             reason = "idle-timeout"
-            _log(config, f"idle for {now - last_activity_epoch:.0f}s ({consecutive_inactive} consecutive inactive observations); destroying instance {state.instance_id}")
+            _log(
+                config,
+                f"idle for {now - last_activity_epoch:.0f}s ({consecutive_inactive} consecutive inactive observations); destroying instance {state.instance_id}",
+            )
         elif activity_state == "inactive":
-            _log(config, f"idle timeout reached but only {consecutive_inactive} inactive observation(s); waiting for {MIN_IDLE_OBSERVATIONS}")
+            _log(
+                config,
+                f"idle timeout reached but only {consecutive_inactive} inactive observation(s); waiting for {MIN_IDLE_OBSERVATIONS}",
+            )
         elif activity_state == "active":
             _log(config, "idle timeout reached but request still active; waiting")
         elif activity_state == "unknown":
@@ -163,7 +169,10 @@ def _run_once(
     elif max_runtime_elapsed:
         if activity_state == "inactive" and idle_observations_ok:
             reason = "max-runtime"
-            _log(config, f"max runtime reached and idle ({consecutive_inactive} observations); destroying instance {state.instance_id}")
+            _log(
+                config,
+                f"max runtime reached and idle ({consecutive_inactive} observations); destroying instance {state.instance_id}",
+            )
         elif activity_state == "inactive":
             _log(config, f"max runtime reached but only {consecutive_inactive} inactive observation(s); waiting")
         elif activity_state == "active":
@@ -173,7 +182,9 @@ def _run_once(
 
     if reason:
         try:
-            down_instance(config, state, pause=False, no_archive=False, no_cache=False, reason=reason, skip_confirm=True)
+            down_instance(
+                config, state, pause=False, no_archive=False, no_cache=False, reason=reason, skip_confirm=True
+            )
             _watchdog_pid_file(config).unlink(missing_ok=True)
         except Exception as exc:
             _log(config, f"down_instance failed: {exc}")

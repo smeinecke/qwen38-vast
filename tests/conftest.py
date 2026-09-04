@@ -11,7 +11,7 @@ from hostai.state import State
 @pytest.fixture
 def project_dir(tmp_path):
     """A temporary project root with empty hostai.toml and .env files."""
-    (tmp_path / "hostai.toml").write_text("[hostai]\ndefault_profile = \"test\"\n")
+    (tmp_path / "hostai.toml").write_text('[hostai]\ndefault_profile = "test"\n')
     (tmp_path / ".env").write_text("")
     return tmp_path
 

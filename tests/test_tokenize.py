@@ -17,6 +17,7 @@ def _fixture() -> dict:
 def _skip_if_no_transformers() -> bool:
     try:
         from transformers import AutoTokenizer  # noqa: F401
+
         return False
     except Exception:  # pragma: no cover
         return True
@@ -171,6 +172,4 @@ def test_tokenizer_rejects_audio_input(config, project_dir):
     )
     tokenizer = Tokenizer(config)
     with pytest.raises(TokenizerError, match="multimodal input not supported"):
-        tokenizer.apply_chat_template(
-            [{"role": "user", "content": [{"type": "audio", "audio_url": "x.mp3"}]}]
-        )
+        tokenizer.apply_chat_template([{"role": "user", "content": [{"type": "audio", "audio_url": "x.mp3"}]}])

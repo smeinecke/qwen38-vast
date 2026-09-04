@@ -301,19 +301,13 @@ def compare_validations(current: ValidationRecord, previous: ValidationRecord) -
     if current.image != previous.image:
         diffs.append(f"validation image changed: {previous.image} -> {current.image}")
     if current.git_commit != previous.git_commit:
-        diffs.append(
-            f"git commit changed: {previous.git_commit[:12]} -> {current.git_commit[:12]}"
-        )
+        diffs.append(f"git commit changed: {previous.git_commit[:12]} -> {current.git_commit[:12]}")
     if current.dirty != previous.dirty:
         diffs.append(f"working tree dirty state changed: {previous.dirty} -> {current.dirty}")
     if current.image_id != previous.image_id:
-        diffs.append(
-            f"integration image ID changed: {previous.image_id[:31]}... -> {current.image_id[:31]}..."
-        )
+        diffs.append(f"integration image ID changed: {previous.image_id[:31]}... -> {current.image_id[:31]}...")
     if current.image_digest != previous.image_digest:
-        diffs.append(
-            f"integration image digest changed: {previous.image_digest} -> {current.image_digest}"
-        )
+        diffs.append(f"integration image digest changed: {previous.image_digest} -> {current.image_digest}")
     if current.profile_hash != previous.profile_hash:
         diffs.append(f"profiles.json changed: {previous.profile_hash} -> {current.profile_hash}")
     if current.level != previous.level:

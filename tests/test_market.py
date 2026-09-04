@@ -1,6 +1,5 @@
 """Tests for hostai.market: query, filtering, scoring, and hardware rank."""
 
-
 import pytest
 
 from hostai import market, utils
@@ -297,7 +296,14 @@ def test_session_scoring_uses_cache_state(config):
     config.market.scoring_mode = "session"
     config.vast.volume_id = "vol-123"
     config.vast.volume_mount_path = "/models"
-    offer = {"id": 1, "gpu_name": "RTX 4090", "dph_total": 0.5, "inet_down": 1000, "disk_bw": 1000, "inet_down_cost": 0.0}
+    offer = {
+        "id": 1,
+        "gpu_name": "RTX 4090",
+        "dph_total": 0.5,
+        "inet_down": 1000,
+        "disk_bw": 1000,
+        "inet_down_cost": 0.0,
+    }
     scored_cached = market.score_offers([dict(offer)], config, {}, session_seconds=300)
 
     config.vast.volume_id = ""
@@ -311,7 +317,14 @@ def test_session_scoring_uses_cache_state(config):
 def test_session_scoring_total_cost_units(config):
     """Session scoring must return total cost, not cost per token."""
     config.market.scoring_mode = "session"
-    offer = {"id": 1, "gpu_name": "RTX 4090", "dph_total": 0.5, "inet_down": 1000, "disk_bw": 1000, "inet_down_cost": 0.0}
+    offer = {
+        "id": 1,
+        "gpu_name": "RTX 4090",
+        "dph_total": 0.5,
+        "inet_down": 1000,
+        "disk_bw": 1000,
+        "inet_down_cost": 0.0,
+    }
     stats = {"rtx4090": {"decode_tps": 1000, "decode_samples": 1}}
     scored = market.score_offers([offer], config, stats, session_seconds=3600)
     # Total cost for one hour at $0.5/h plus a small startup cost.

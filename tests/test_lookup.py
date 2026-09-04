@@ -110,8 +110,10 @@ def test_cmd_lookup_no_offers(config, project_dir):
 
 def test_cmd_lookup_with_offers(config, project_dir):
     provider = _mock_provider([make_offer()])
-    with mock.patch("hostai.commands.lookup.Profiles.from_file") as from_file, \
-         mock.patch("hostai.commands.lookup.get_provider", return_value=provider):
+    with (
+        mock.patch("hostai.commands.lookup.Profiles.from_file") as from_file,
+        mock.patch("hostai.commands.lookup.get_provider", return_value=provider),
+    ):
         profile = mock.Mock()
         profile.name = "test"
         profile.gpu_query = "gpu_name == RTX 4090"

@@ -69,10 +69,10 @@ def _slot_save(config: Config, state: State, slot_id: Optional[int] = None) -> O
 _RSYNC_SIZE_UNITS = {
     "B": 1,
     "K": 1024,
-    "M": 1024 ** 2,
-    "G": 1024 ** 3,
-    "T": 1024 ** 4,
-    "P": 1024 ** 5,
+    "M": 1024**2,
+    "G": 1024**3,
+    "T": 1024**4,
+    "P": 1024**5,
 }
 
 
@@ -538,7 +538,9 @@ def down_instance(
         "cache_save_ms": slot_details.get("save_ms", 0) if slot_details else 0,
         "cache_snapshot_bytes": snapshot_bytes,
         "cache_transfer_bytes": transferred if transferred is not None else 0,
-        "cache_transfer_duration_seconds": round(slot_details["upload_duration_s"], 3) if slot_details and "upload_duration_s" in slot_details else 0,
+        "cache_transfer_duration_seconds": round(slot_details["upload_duration_s"], 3)
+        if slot_details and "upload_duration_s" in slot_details
+        else 0,
         "cache_delta_seed_used": cache_delta_seed_used,
         "cache_upload_failed": cache_upload_failed,
         "telemetry_archive_duration_seconds": round(archive_duration, 3),
@@ -556,7 +558,9 @@ def down_instance(
     if pause:
         state.save()
 
-    _client_log(run_dir, f"{outcome} | tail={shutdown_tail_seconds}s cost=${shutdown_cost:.6f} reason={reason or 'manual'}")
+    _client_log(
+        run_dir, f"{outcome} | tail={shutdown_tail_seconds}s cost=${shutdown_cost:.6f} reason={reason or 'manual'}"
+    )
 
     click.echo(outcome)
     if run_dir and not no_archive:
@@ -594,5 +598,6 @@ def cmd_down(config: Config, yes: bool, no_archive: bool, no_cache: bool, pause:
         skip_confirm=yes,
     )
     from hostai.commands.watchdog import stop_watchdog
+
     stop_watchdog(config)
     stop_monitor(config)

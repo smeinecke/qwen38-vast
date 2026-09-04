@@ -19,7 +19,9 @@ def fake_completed(returncode=0, stdout="", stderr=""):
 
 def test_slot_save_parses_payload(config, running_state):
     payload = {"n_saved": 100, "n_written": 1024, "timings": {"save_ms": 50}}
-    with mock.patch("requests.post", return_value=mock.Mock(status_code=200, text=json.dumps(payload), json=lambda: payload)) as post:
+    with mock.patch(
+        "requests.post", return_value=mock.Mock(status_code=200, text=json.dumps(payload), json=lambda: payload)
+    ) as post:
         result = _slot_save(config, running_state)
     assert result["n_saved"] == 100
     assert result["n_written"] == 1024
@@ -29,7 +31,9 @@ def test_slot_save_parses_payload(config, running_state):
 
 def test_slot_save_empty_slot(config, running_state):
     payload = {"n_saved": 0}
-    with mock.patch("requests.post", return_value=mock.Mock(status_code=200, text=json.dumps(payload), json=lambda: payload)):
+    with mock.patch(
+        "requests.post", return_value=mock.Mock(status_code=200, text=json.dumps(payload), json=lambda: payload)
+    ):
         result = _slot_save(config, running_state)
     assert result is None
 
@@ -45,12 +49,16 @@ def test_save_and_upload_slot_cache_happy_path(config, running_state, tmp_path):
     run_dir = tmp_path / "run"
     run_dir.mkdir()
 
-    with mock.patch("requests.post", return_value=mock.Mock(status_code=200, text=json.dumps(payload), json=lambda: payload)):
+    with mock.patch(
+        "requests.post", return_value=mock.Mock(status_code=200, text=json.dumps(payload), json=lambda: payload)
+    ):
         with mock.patch("hostai.commands.down._install_cache_key_on_vast", return_value=True):
             with mock.patch("hostai.commands.down._fetch_llama_commit", return_value="abc123"):
                 with mock.patch("hostai.commands.down.ssh.run_remote", return_value=fake_completed()):
                     with mock.patch("hostai.commands.down.ssh.scp_to", return_value=fake_completed()):
-                        with mock.patch("hostai.commands.down._upload_slot_cache_from_vast", return_value=(True, 12345)):
+                        with mock.patch(
+                            "hostai.commands.down._upload_slot_cache_from_vast", return_value=(True, 12345)
+                        ):
                             result = _save_and_upload_slot_cache(
                                 config,
                                 running_state,

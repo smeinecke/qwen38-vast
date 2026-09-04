@@ -176,9 +176,7 @@ class UnixTLSConnector(aiohttp.UnixConnector):
         server_hostname = req.host if ssl_context else None
 
         try:
-            async with ceil_timeout(
-                timeout.sock_connect, ceil_threshold=timeout.ceil_threshold
-            ):
+            async with ceil_timeout(timeout.sock_connect, ceil_threshold=timeout.ceil_threshold):
                 _, proto = await self._loop.create_unix_connection(
                     self._factory,
                     self._path,
@@ -186,9 +184,7 @@ class UnixTLSConnector(aiohttp.UnixConnector):
                     server_hostname=server_hostname,
                 )
         except OSError as exc:
-            raise UnixClientConnectorError(
-                self.path, req.connection_key, exc
-            ) from exc
+            raise UnixClientConnectorError(self.path, req.connection_key, exc) from exc
 
         return proto
 
@@ -225,9 +221,7 @@ class TokenizedProxy:
 
     async def _on_startup(self, app: web.Application) -> None:
         if self.upstream_socket:
-            connector: aiohttp.BaseConnector = UnixTLSConnector(
-                path=self.upstream_socket, ssl=self.ssl_ctx, limit=20
-            )
+            connector: aiohttp.BaseConnector = UnixTLSConnector(path=self.upstream_socket, ssl=self.ssl_ctx, limit=20)
         else:
             connector = aiohttp.TCPConnector(ssl=self.ssl_ctx, limit=20)
         headers: Dict[str, str] = {"Content-Type": "application/json"}
@@ -281,9 +275,7 @@ class TokenizedProxy:
         except TokenizerError as exc:
             raise web.HTTPBadRequest(reason=f"tokenization failed: {exc}") from exc
 
-        payload = self.build_completion_payload(
-            token_ids, max_tokens, temperature, stream, body
-        )
+        payload = self.build_completion_payload(token_ids, max_tokens, temperature, stream, body)
 
         upstream_response = await self.session.post(
             f"{self.upstream}/completion",
@@ -292,9 +284,7 @@ class TokenizedProxy:
 
         if upstream_response.status != 200:
             text = await upstream_response.text()
-            raise web.HTTPInternalServerError(
-                reason=f"upstream returned {upstream_response.status}: {text[:200]}"
-            )
+            raise web.HTTPInternalServerError(reason=f"upstream returned {upstream_response.status}: {text[:200]}")
 
         if stream:
             return await self._stream_chat(request, upstream_response)
@@ -547,10 +537,7 @@ class TokenizedProxy:
                     break
                 except OSError as exc:
                     if exc.errno == errno.EADDRINUSE and attempt < 9:
-                        print(
-                            f"port {self.port} in use, retrying in 0.5s "
-                            f"(attempt {attempt + 1}/10)"
-                        )
+                        print(f"port {self.port} in use, retrying in 0.5s (attempt {attempt + 1}/10)")
                         await asyncio.sleep(0.5)
                         continue
                     raise

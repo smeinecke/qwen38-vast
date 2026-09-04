@@ -37,9 +37,7 @@ class VastProvider(Provider):
     def __init__(self, config: Config) -> None:
         super().__init__(config)
         if config.provider.backend != "vast":
-            raise ProviderError(
-                f"VastProvider construction blocked: provider.backend is '{config.provider.backend}'"
-            )
+            raise ProviderError(f"VastProvider construction blocked: provider.backend is '{config.provider.backend}'")
         self._vast_api_key = self._api_key_value()
 
     def _client(self, timeout: float = 120.0) -> VastClient:

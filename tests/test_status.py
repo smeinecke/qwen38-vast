@@ -42,10 +42,14 @@ def test_status_happy_path(config, project_dir):
     with (
         mock.patch(
             "hostai.commands.status._provider",
-            return_value=mock.Mock(get_instance=mock.Mock(return_value={
-                "actual_status": "running",
-                "gpu_name": "RTX 4090",
-            })),
+            return_value=mock.Mock(
+                get_instance=mock.Mock(
+                    return_value={
+                        "actual_status": "running",
+                        "gpu_name": "RTX 4090",
+                    }
+                )
+            ),
         ),
         mock.patch("hostai.commands.status.ssh.ensure_tunnel"),
         mock.patch("hostai.commands.status.ssh.is_tunnel_healthy", return_value=True),

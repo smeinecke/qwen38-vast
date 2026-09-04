@@ -495,9 +495,7 @@ def score_offers(
     if cache_state is None:
         cache_state = _resolve_cache_state(config)
     for offer in offers:
-        scoring = score_offer(
-            offer, config, stats, session_seconds=session_seconds, cache_state=cache_state
-        )
+        scoring = score_offer(offer, config, stats, session_seconds=session_seconds, cache_state=cache_state)
         offer["_hostai_score"] = scoring
     offers.sort(key=lambda o: o["_hostai_score"].score)
     return offers
@@ -625,19 +623,14 @@ def select_offer(
         cache_state = _resolve_cache_state(config)
 
     if config.market.scoring_mode in ("perf", "session"):
-        matches = score_offers(
-            matches, config, stats, session_seconds=session_seconds, cache_state=cache_state
-        )
+        matches = score_offers(matches, config, stats, session_seconds=session_seconds, cache_state=cache_state)
     else:
         matches.sort(key=_effective_dph)
 
     best = matches[0]
     scoring = best.get("_hostai_score")
     if verbose and scoring:
-        click.echo(
-            f"[market] selected {best.get('gpu_name')} with score {scoring.score:.6f} "
-            f"({scoring.reason})"
-        )
+        click.echo(f"[market] selected {best.get('gpu_name')} with score {scoring.score:.6f} ({scoring.reason})")
 
     return best
 

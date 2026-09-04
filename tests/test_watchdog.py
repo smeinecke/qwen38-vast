@@ -104,11 +104,13 @@ def test_run_once_idle_timeout_triggers_down(config):
         Client.return_value = make_client({"llamacpp:prompt_tokens_total": 10}, [])
         with mock.patch("hostai.commands.watchdog.down_instance") as down:
             with mock.patch("hostai.commands.watchdog.time.time", return_value=100):
-                _, _, _, _, inact1 = _run_once(
-                    config, state, {"llamacpp:prompt_tokens_total": 10}, 0, None
-                )
+                _, _, _, _, inact1 = _run_once(config, state, {"llamacpp:prompt_tokens_total": 10}, 0, None)
                 _run_once(
-                    config, state, {"llamacpp:prompt_tokens_total": 10}, 0, None,
+                    config,
+                    state,
+                    {"llamacpp:prompt_tokens_total": 10},
+                    0,
+                    None,
                     consecutive_inactive=inact1,
                 )
 
@@ -147,11 +149,13 @@ def test_run_once_max_runtime_triggers_down_when_idle(config):
         Client.return_value = make_client({"llamacpp:prompt_tokens_total": 10}, [])
         with mock.patch("hostai.commands.watchdog.down_instance") as down:
             with mock.patch("hostai.commands.watchdog.time.time", return_value=100):
-                _, _, _, _, inact1 = _run_once(
-                    config, state, {"llamacpp:prompt_tokens_total": 10}, 0, 60
-                )
+                _, _, _, _, inact1 = _run_once(config, state, {"llamacpp:prompt_tokens_total": 10}, 0, 60)
                 _run_once(
-                    config, state, {"llamacpp:prompt_tokens_total": 10}, 0, 60,
+                    config,
+                    state,
+                    {"llamacpp:prompt_tokens_total": 10},
+                    0,
+                    60,
                     consecutive_inactive=inact1,
                 )
 
@@ -250,9 +254,7 @@ def test_run_once_temporary_api_failure_recovers(config):
         with mock.patch("hostai.commands.watchdog.down_instance") as down:
             with mock.patch("hostai.commands.watchdog.time.time", return_value=100):
                 _, _, done1, failures1, _ = _run_once(config, state, {}, 0, None)
-                _, _, done2, failures2, _ = _run_once(
-                    config, state, {}, 0, None, consecutive_failures=failures1
-                )
+                _, _, done2, failures2, _ = _run_once(config, state, {}, 0, None, consecutive_failures=failures1)
 
     assert done1 is False
     assert done2 is False
@@ -355,7 +357,11 @@ def test_run_once_active_request_prevents_idle_destroy(config):
             with mock.patch("hostai.commands.watchdog.time.time", return_value=100):
                 for inact in (0, 1, 2):
                     _, _, done, _, _ = _run_once(
-                        config, state, {"llamacpp:prompt_tokens_total": 10}, 0, None,
+                        config,
+                        state,
+                        {"llamacpp:prompt_tokens_total": 10},
+                        0,
+                        None,
                         consecutive_inactive=inact,
                     )
                     assert done is False
@@ -421,9 +427,7 @@ def test_run_once_repeated_observability_failure_remains_fail_safe(config):
             with mock.patch("hostai.commands.watchdog.time.time", return_value=100):
                 failures = 0
                 for _ in range(10):
-                    _, _, done, failures, _ = _run_once(
-                        config, state, {}, 0, None, consecutive_failures=failures
-                    )
+                    _, _, done, failures, _ = _run_once(config, state, {}, 0, None, consecutive_failures=failures)
                     assert done is False
 
     down.assert_not_called()
@@ -449,15 +453,11 @@ def test_run_once_activity_resuming_resets_idle_state(config):
 
                 active_client = make_client({"llamacpp:prompt_tokens_total": 15}, [])
                 Client.return_value = active_client
-                _, _, _, _, inact2 = _run_once(
-                    config, state, base, 0, None, consecutive_inactive=inact1
-                )
+                _, _, _, _, inact2 = _run_once(config, state, base, 0, None, consecutive_inactive=inact1)
                 assert inact2 == 0
 
                 Client.return_value = make_client({"llamacpp:prompt_tokens_total": 15}, [])
-                _, _, done, _, inact3 = _run_once(
-                    config, state, {"llamacpp:prompt_tokens_total": 15}, 0, None
-                )
+                _, _, done, _, inact3 = _run_once(config, state, {"llamacpp:prompt_tokens_total": 15}, 0, None)
                 assert done is False
                 assert inact3 == 1
 

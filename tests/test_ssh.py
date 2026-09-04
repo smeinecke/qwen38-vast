@@ -142,6 +142,7 @@ def test_run_remote_success():
     class FakeSSH:
         async def __aenter__(self):
             return FakeConn()
+
         async def __aexit__(self, *args):
             return False
 

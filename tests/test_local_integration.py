@@ -57,12 +57,8 @@ def _container_count() -> int:
 def project_dir(tmp_path):
     """A temporary project root with a copy of the repo profiles and empty env."""
     repo_root = Path(__file__).parent.parent
-    (tmp_path / "hostai.toml").write_text(
-        "[hostai]\ndefault_profile = \"v100-128k\"\n"
-    )
-    (tmp_path / ".env").write_text(
-        "GHCR_IMAGE_BASE=ghcr.io/smeinecke/qwen38-vast\n"
-    )
+    (tmp_path / "hostai.toml").write_text('[hostai]\ndefault_profile = "v100-128k"\n')
+    (tmp_path / ".env").write_text("GHCR_IMAGE_BASE=ghcr.io/smeinecke/qwen38-vast\n")
     # Use the repository's built-in profiles for real profile resolution.
     (tmp_path / "profiles.json").write_text((repo_root / "profiles.json").read_text())
     return tmp_path
@@ -79,7 +75,9 @@ def local_env():
 
 
 @pytest.mark.skipif(not _has_docker(), reason="docker not available")
-@pytest.mark.skipif(not _image_exists(_integration_image()), reason=f"integration image {_integration_image()} not built")
+@pytest.mark.skipif(
+    not _image_exists(_integration_image()), reason=f"integration image {_integration_image()} not built"
+)
 def test_local_up_down_lifecycle(project_dir, local_env, monkeypatch):
     """Run `hostai up` and `hostai down` against the local Docker backend."""
     runner = CliRunner(env=local_env)
@@ -131,7 +129,9 @@ def test_local_up_down_lifecycle(project_dir, local_env, monkeypatch):
 
 
 @pytest.mark.skipif(not _has_docker(), reason="docker not available")
-@pytest.mark.skipif(not _image_exists(_integration_image()), reason=f"integration image {_integration_image()} not built")
+@pytest.mark.skipif(
+    not _image_exists(_integration_image()), reason=f"integration image {_integration_image()} not built"
+)
 def test_local_up_shm_size_configurable(project_dir):
     """HOSTAI_LOCAL_SHM_SIZE_GB is reflected in the container's --shm-size."""
     from hostai.config import Config
@@ -153,7 +153,9 @@ def test_local_up_shm_size_configurable(project_dir):
 
 
 @pytest.mark.skipif(not _has_docker(), reason="docker not available")
-@pytest.mark.skipif(not _image_exists(_integration_image()), reason=f"integration image {_integration_image()} not built")
+@pytest.mark.skipif(
+    not _image_exists(_integration_image()), reason=f"integration image {_integration_image()} not built"
+)
 def test_local_up_with_small_shm(project_dir, local_env, monkeypatch):
     """A /dev/shm smaller than the cache minimum falls back to disk slot cache."""
     runner = CliRunner(env=local_env)
@@ -189,7 +191,9 @@ def test_local_up_with_small_shm(project_dir, local_env, monkeypatch):
 
 
 @pytest.mark.skipif(not _has_docker(), reason="docker not available")
-@pytest.mark.skipif(not _image_exists(_integration_image()), reason=f"integration image {_integration_image()} not built")
+@pytest.mark.skipif(
+    not _image_exists(_integration_image()), reason=f"integration image {_integration_image()} not built"
+)
 def test_local_up_socket_delay_regression(project_dir, local_env, monkeypatch):
     """A 15-second socket delay is covered by a 60-second global boot deadline."""
     env = dict(local_env)
@@ -215,7 +219,9 @@ def test_local_up_socket_delay_regression(project_dir, local_env, monkeypatch):
 
 
 @pytest.mark.skipif(not _has_docker(), reason="docker not available")
-@pytest.mark.skipif(not _image_exists(_integration_image()), reason=f"integration image {_integration_image()} not built")
+@pytest.mark.skipif(
+    not _image_exists(_integration_image()), reason=f"integration image {_integration_image()} not built"
+)
 def test_local_up_socket_timeout_regression(project_dir, local_env, monkeypatch):
     """A socket delay that exceeds the global deadline fails with a precise stage error and cleans up."""
     env = dict(local_env)
@@ -233,8 +239,7 @@ def test_local_up_socket_timeout_regression(project_dir, local_env, monkeypatch)
     )
     # The CLI catches provisioning errors and exits non-zero.
     assert result.exit_code != 0
-    assert ("[boot:end-to-end] timeout" in result.output
-            or "timeout" in result.output.lower())
+    assert "[boot:end-to-end] timeout" in result.output or "timeout" in result.output.lower()
 
     # Cleanup should remove the container.
     assert _container_count() == before

@@ -49,7 +49,9 @@ def test_search_instance_offers(config):
 
 def test_get_instance(config):
     config = config_with_key(config)
-    with mock.patch("hostai.providers.vast.show_instance", return_value={"id": 123, "actual_status": "running"}) as show:
+    with mock.patch(
+        "hostai.providers.vast.show_instance", return_value={"id": 123, "actual_status": "running"}
+    ) as show:
         inst = vast.get_instance(config, 123)
     assert inst == {"id": 123, "actual_status": "running"}
     show.assert_called_once()

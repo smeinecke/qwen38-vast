@@ -189,9 +189,7 @@ def default_reasoning_kwargs(config: Config) -> Dict[str, Any]:
     effort = (config.model.reasoning_effort or "xhigh").strip().lower()
     valid = {"low", "medium", "xhigh"}
     if effort not in valid:
-        raise TokenizerError(
-            f"invalid reasoning_effort {effort!r}; must be one of {sorted(valid)}"
-        )
+        raise TokenizerError(f"invalid reasoning_effort {effort!r}; must be one of {sorted(valid)}")
     return {
         "enable_thinking": True,
         "preserve_thinking": True,

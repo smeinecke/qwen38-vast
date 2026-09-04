@@ -18,9 +18,7 @@ from aiohttp import web
 _logger = logging.getLogger(__name__)
 
 PUBLIC_SOCKET = os.environ.get("HOSTAI_GUARD_LISTEN", "/dev/shm/qwen38/llama.sock")
-BACKEND_SOCKET = os.environ.get(
-    "HOSTAI_GUARD_BACKEND", "/dev/shm/qwen38/llama-internal.sock"
-)
+BACKEND_SOCKET = os.environ.get("HOSTAI_GUARD_BACKEND", "/dev/shm/qwen38/llama-internal.sock")
 CERT_FILE = os.environ.get("HOSTAI_GUARD_CERT", "/dev/shm/qwen38/certs/server.crt")
 KEY_FILE = os.environ.get("HOSTAI_GUARD_KEY", "/dev/shm/qwen38/certs/server.key")
 
@@ -76,9 +74,7 @@ class TokenOnlyGuard:
         method = request.method
 
         if path in BLOCKED_PATHS:
-            raise web.HTTPForbidden(
-                reason="endpoint disabled in tokenized-only mode"
-            )
+            raise web.HTTPForbidden(reason="endpoint disabled in tokenized-only mode")
 
         headers = {
             k: v
@@ -103,9 +99,7 @@ class TokenOnlyGuard:
 
             prompt = data.get("prompt")
             if not _is_prompt_tokenized(prompt):
-                raise web.HTTPBadRequest(
-                    reason="tokenized-only: prompt must be an array of token IDs"
-                )
+                raise web.HTTPBadRequest(reason="tokenized-only: prompt must be an array of token IDs")
 
         try:
             async with self.session.request(
@@ -114,7 +108,6 @@ class TokenOnlyGuard:
                 headers=headers,
                 data=body or None,
             ) as response:
-
                 resp_headers = {
                     k: v
                     for k, v in response.headers.items()

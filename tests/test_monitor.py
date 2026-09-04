@@ -17,7 +17,9 @@ from hostai.profiles import HardwareRank, MonitorHardware, Profile, Profiles
 from hostai.state import State
 
 
-def make_profile(name="test", group="", disk_gb=None, query="gpu_name == RTX_4090", ctx_size=32768, monitor_search=True):
+def make_profile(
+    name="test", group="", disk_gb=None, query="gpu_name == RTX_4090", ctx_size=32768, monitor_search=True
+):
     return Profile(
         name=name,
         image="a",

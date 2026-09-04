@@ -474,9 +474,7 @@ def _tunnel_thread_runner(
 ) -> None:
     asyncio.set_event_loop(loop)
     loop.run_until_complete(
-        _start_tunnel_worker(
-            user, host, port, local_port, remote_dest, identity, connect_timeout, ready, stop, outcome
-        )
+        _start_tunnel_worker(user, host, port, local_port, remote_dest, identity, connect_timeout, ready, stop, outcome)
     )
     loop.close()
 
@@ -508,7 +506,9 @@ def _wait_for_remote_socket(
         return False
     start = time.monotonic()
     while time.monotonic() - start < timeout:
-        if is_remote_socket_present(ssh_url, socket_path, known_hosts=known_hosts, identity=identity, config=config, state=state, timeout=5):
+        if is_remote_socket_present(
+            ssh_url, socket_path, known_hosts=known_hosts, identity=identity, config=config, state=state, timeout=5
+        ):
             return True
         time.sleep(1)
     return False

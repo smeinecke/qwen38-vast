@@ -96,7 +96,9 @@ def test_cache_copy_happy_path(config, running_state, project_dir):
             with mock.patch("hostai.commands.cache_cmd.LlamaClient", return_value=FakeClient()):
                 with mock.patch("hostai.commands.cache_cmd.down._save_and_upload_slot_cache", side_effect=fake_save):
                     with mock.patch("hostai.commands.cache_cmd.ensure_cache_key", return_value=key_path):
-                        with mock.patch("hostai.commands.cache_cmd.utils.run", return_value=mock.Mock(returncode=0, stdout="1024")):
+                        with mock.patch(
+                            "hostai.commands.cache_cmd.utils.run", return_value=mock.Mock(returncode=0, stdout="1024")
+                        ):
                             runner = CliRunner()
                             result = runner.invoke(cmd_cache_copy, ["--slot", "1"], obj=config)
 

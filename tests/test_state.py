@@ -1,6 +1,5 @@
 """Tests for hostai.state persistence."""
 
-
 from hostai.state import State, init_run_dir, runs_dir, state_dir
 
 

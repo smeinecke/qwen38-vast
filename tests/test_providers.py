@@ -92,7 +92,7 @@ def test_local_provider_offers_match_query(project_dir):
         pytest.skip("docker not available")
     config = _config(project_dir)
     provider = LocalProvider(config)
-    v100_offers = provider.search_offers("gpu_name in [\"Tesla V100\"]")
+    v100_offers = provider.search_offers('gpu_name in ["Tesla V100"]')
     assert len(v100_offers) == 1
     assert v100_offers[0]["gpu_name"] == "Tesla V100"
 

@@ -75,10 +75,7 @@ def _resolve_monitor_targets(
             ctx = current.ctx_size or active.ctx_size
             active = dataclasses.replace(active, ctx_size=ctx)
             if active.monitor_group:
-                targets = [
-                    p for p in profiles.all_monitor_profiles(ctx)
-                    if p.monitor_group == active.monitor_group
-                ]
+                targets = [p for p in profiles.all_monitor_profiles(ctx) if p.monitor_group == active.monitor_group]
                 # The exact active profile is always a candidate even when it
                 # has monitor_search=false, because we need to compare against
                 # the same hardware class.
@@ -127,7 +124,11 @@ def _search_profiles(
     be rented at the same economics.
     """
     bid_price = current.bid_price if (current.exists and current.bid_price is not None) else None
-    max_price = current.dph if (current.exists and current.instance_id and current.dph is not None and current.dph > 0) else None
+    max_price = (
+        current.dph
+        if (current.exists and current.instance_id and current.dph is not None and current.dph > 0)
+        else None
+    )
     offer_type = "bid" if bid_price is not None else "on-demand"
 
     all_offers: List[Dict[str, Any]] = []
