@@ -8,6 +8,7 @@ remote TCP port.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import shlex
 import socket
 import threading
@@ -176,6 +177,23 @@ async def _run_remote(
         )
 
 
+def _run_coro(coro: Any) -> Any:
+    """Run a coroutine, handling both sync and async (running loop) callers.
+
+    If there is already a running event loop (e.g. we are inside `hostai proxy`),
+    run the coroutine in a separate thread with its own event loop to avoid
+    ``RuntimeError: asyncio.run() cannot be called from a running event loop``.
+    """
+    try:
+        # get_running_loop raises RuntimeError if no loop is running.
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        return executor.submit(asyncio.run, coro).result()
+
+
 def run_remote(
     ssh_url: Optional[str],
     command: Any,
@@ -195,7 +213,7 @@ def run_remote(
         identity = _default_identity(config, state)
     user, host, port = _parse_url(ssh_url)
     try:
-        return asyncio.run(_run_remote(host, port, user, command, input_data, timeout, known_hosts, identity))
+        return _run_coro(_run_remote(host, port, user, command, input_data, timeout, known_hosts, identity))
     except Exception as exc:
         return CompletedProcess(
             args=command,
@@ -231,7 +249,7 @@ def is_ssh_reachable(
     if identity is None and (config or state):
         identity = _default_identity(config, state)
     user, host, port = _parse_url(ssh_url)
-    return asyncio.run(_is_ssh_reachable(host, port, user, known_hosts, identity))
+    return _run_coro(_is_ssh_reachable(host, port, user, known_hosts, identity))
 
 
 def wait_for_ssh(
@@ -252,7 +270,7 @@ def wait_for_ssh(
     user, host, port = _parse_url(ssh_url)
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if asyncio.run(_is_ssh_reachable(host, port, user, known_hosts, identity)):
+        if _run_coro(_is_ssh_reachable(host, port, user, known_hosts, identity)):
             return True
         if not quiet:
             print(f"[ssh] waiting for {ssh_url} ...")
@@ -307,7 +325,7 @@ def scp_to(
     if identity is None and (config or state):
         identity = _default_identity(config, state)
     user, host, port = _parse_url(ssh_url)
-    return asyncio.run(_scp(local_path, host, port, user, remote_path, known_hosts, identity, timeout))
+    return _run_coro(_scp(local_path, host, port, user, remote_path, known_hosts, identity, timeout))
 
 
 async def _scp_from(
@@ -355,7 +373,7 @@ def scp_from(
     if identity is None and (config or state):
         identity = _default_identity(config, state)
     user, host, port = _parse_url(ssh_url)
-    return asyncio.run(_scp_from(remote_path, local_path, host, port, user, known_hosts, identity, timeout))
+    return _run_coro(_scp_from(remote_path, local_path, host, port, user, known_hosts, identity, timeout))
 
 
 def _default_remote_dest(state: State) -> str:
@@ -471,7 +489,8 @@ def _tunnel_is_running(state: State) -> bool:
 
 def _boot_log(stage: str, elapsed: float, message: str) -> None:
     """Emit a structured boot-stage diagnostic line."""
-    print(f"[boot:{stage}] {message} after {elapsed:.1f}s", flush=True)
+    ts = time.strftime("%H:%M:%S", time.localtime())
+    print(f"[{ts}] [boot:{stage}] {message} after {elapsed:.1f}s", flush=True)
 
 
 def _wait_for_remote_socket(

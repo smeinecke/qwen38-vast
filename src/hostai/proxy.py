@@ -117,12 +117,11 @@ def _ssl_context(state: State) -> ssl.SSLContext:
 
 
 class UnixTLSConnector(aiohttp.UnixConnector):
-    """Unix domain socket connector that can also wrap the socket in TLS.
+    """Unix domain socket connector that supports TLS over the socket.
 
-    The standard :class:`aiohttp.UnixConnector` does not support ``ssl``, which
-    makes it impossible to speak HTTPS over a Unix socket. This subclass adds
-    TLS wrapping by duplicating the connected socket and re-creating the
-    transport with :meth:`BaseConnector._wrap_existing_connection`.
+    ``aiohttp.UnixConnector`` ignores the ``ssl`` argument. This subclass
+    creates the Unix connection with ``ssl=`` so ``https`` requests can be
+    forwarded to a TLS-speaking backend over a local Unix socket.
     """
 
     def __init__(
@@ -135,6 +134,34 @@ class UnixTLSConnector(aiohttp.UnixConnector):
         super().__init__(path=path, **kwargs)
         self._ssl = ssl
 
+    def _get_ssl_context(self, req: Any) -> Optional[ssl.SSLContext]:
+        """Return the SSL context to use for a request, mirroring TCPConnector."""
+        if not req.is_ssl():
+            return None
+
+        # Request-level SSL override takes precedence.
+        ctx = req.ssl
+        if isinstance(ctx, ssl.SSLContext):
+            return ctx
+        if ctx is False:
+            unverified = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            unverified.check_hostname = False
+            unverified.verify_mode = ssl.CERT_NONE
+            return unverified
+
+        # Connector-level SSL context.
+        ctx = self._ssl
+        if isinstance(ctx, ssl.SSLContext):
+            return ctx
+        if ctx is False or ctx is None:
+            unverified = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            unverified.check_hostname = False
+            unverified.verify_mode = ssl.CERT_NONE
+            return unverified
+
+        # Default: verified, system CA store.
+        return ssl.create_default_context()
+
     async def _create_connection(
         self,
         req: Any,
@@ -144,45 +171,25 @@ class UnixTLSConnector(aiohttp.UnixConnector):
         from aiohttp.client_exceptions import UnixClientConnectorError
         from aiohttp.helpers import ceil_timeout
 
+        ssl_context = self._get_ssl_context(req)
+        server_hostname = req.host if ssl_context else None
+
         try:
             async with ceil_timeout(
                 timeout.sock_connect, ceil_threshold=timeout.ceil_threshold
             ):
-                transport, proto = await self._loop.create_unix_connection(
-                    self._factory, self._path
+                _, proto = await self._loop.create_unix_connection(
+                    self._factory,
+                    self._path,
+                    ssl=ssl_context,
+                    server_hostname=server_hostname,
                 )
         except OSError as exc:
             raise UnixClientConnectorError(
                 self.path, req.connection_key, exc
             ) from exc
 
-        if not req.is_ssl():
-            return proto
-
-        rawsock = transport.get_extra_info("socket")
-        if rawsock is None:
-            transport.close()
-            raise RuntimeError("Unix transport does not expose socket instance")
-
-        # Duplicate the file descriptor so we can close the plaintext transport
-        # and re-open it as a TLS connection over the same Unix socket.
-        rawsock = rawsock.dup()
-        transport.close()
-
-        ssl_context = self._get_ssl_context(req)  # type: ignore[attr-defined]
-        if ssl_context is None:
-            rawsock.close()
-            raise RuntimeError("could not build SSL context for Unix socket")
-
-        wrapped_transport, wrapped_proto = await self._wrap_existing_connection(  # type: ignore[attr-defined]
-            self._factory,
-            req=req,
-            timeout=timeout,
-            sock=rawsock,
-            ssl=ssl_context,
-            server_hostname=req.host,
-        )
-        return wrapped_proto
+        return proto
 
 
 class TokenizedProxy:

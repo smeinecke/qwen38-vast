@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+import time
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -58,6 +60,10 @@ def generate_cert(tls_dir: Path, common_name: str = "localhost") -> Tuple[Path, 
     return cert_path, key_path
 
 
+def _ts() -> str:
+    return time.strftime("%H:%M:%S", time.localtime())
+
+
 def deliver_cert(
     ssh_url: Optional[str],
     tls_dir: Path,
@@ -74,6 +80,7 @@ def deliver_cert(
     (~/.ssh/known_hosts) is used.
     """
     if not ssh_url:
+        print(f"[{_ts()}] [tls] no ssh_url", file=sys.stderr, flush=True)
         return False
     tls_dir = Path(tls_dir)
     known_hosts = Path(known_hosts) if known_hosts else Path.home() / ".ssh" / "known_hosts"
@@ -81,6 +88,7 @@ def deliver_cert(
     cert_path = tls_dir / "server.crt"
     key_path = tls_dir / "server.key"
     if not cert_path.exists() or not key_path.exists():
+        print(f"[{_ts()}] [tls] local cert/key missing", file=sys.stderr, flush=True)
         return False
 
     cert_text = cert_path.read_text()
@@ -98,6 +106,7 @@ def deliver_cert(
         timeout=timeout,
     )
     if result.returncode != 0:
+        print(f"[{_ts()}] [tls] install remote certs dir failed: rc={result.returncode} stderr={result.stderr!r}", file=sys.stderr, flush=True)
         return False
 
     # Stream the certificate and key to tmpfs.
@@ -114,6 +123,7 @@ def deliver_cert(
             timeout=timeout,
         )
         if result.returncode != 0:
+            print(f"[{_ts()}] [tls] writing {remote_name} failed: rc={result.returncode} stderr={result.stderr!r}", file=sys.stderr, flush=True)
             return False
 
     # Restrict the private key.
@@ -127,6 +137,8 @@ def deliver_cert(
         capture=True,
         timeout=timeout,
     )
+    if result.returncode != 0:
+        print(f"[{_ts()}] [tls] chmod server.key failed: rc={result.returncode} stderr={result.stderr!r}", file=sys.stderr, flush=True)
     return result.returncode == 0
 
 

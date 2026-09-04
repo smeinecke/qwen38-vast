@@ -31,6 +31,12 @@ def _provider(config: Config):
     return get_provider(config)
 
 
+def _log(message: str, err: bool = False) -> None:
+    """Emit a console line with a wall-clock timestamp."""
+    ts = time.strftime("%H:%M:%S", time.localtime())
+    click.echo(f"[{ts}] {message}", err=err)
+
+
 @click.command("up", help="Start a Vast instance for a profile.")
 @click.argument("profile", required=False)
 @click.option("-p", "--profile", "profile_opt", help="Profile to run.")
@@ -141,7 +147,7 @@ def _check_production_validation(config: Config, allow_unvalidated: bool) -> Opt
     if not config.vast.require_production_validation:
         return
     if allow_unvalidated:
-        click.echo("[validation] --allow-unvalidated set; skipping production validation gate", err=True)
+        _log("[validation] --allow-unvalidated set; skipping production validation gate", err=True)
         return
 
     previous = load_last_validation(config.root_dir, success=True)
@@ -175,13 +181,13 @@ def _check_production_validation(config: Config, allow_unvalidated: bool) -> Opt
     diffs = compare_validations(current_record, previous)
     if diffs:
         for d in diffs:
-            click.echo(f"[validation] DRIFT: {d}", err=True)
+            _log(f"[validation] DRIFT: {d}", err=True)
         raise click.ClickException(
             "[validation] current state does not match the last successful production validation. "
             "Run 'hostai validate --production' again, or pass --allow-unvalidated."
         )
 
-    click.echo("[validation] production validation gate passed")
+    _log("[validation] production validation gate passed")
     return previous
 
 
@@ -198,17 +204,17 @@ def _cleanup_instance(config: Config, state: State, reason: str) -> None:
     if not state.instance_id:
         return
     if config.vast.keep_on_failure:
-        click.echo(f"[cleanup] {reason}; keep_on_failure is set, not destroying {state.instance_id}", err=True)
+        _log(f"[cleanup] {reason}; keep_on_failure is set, not destroying {state.instance_id}", err=True)
         state.status = "failed"
         state.set("failure_reason", reason)
         state.save()
         return
-    click.echo(f"[cleanup] {reason}; destroying instance {state.instance_id}...", err=True)
+    _log(f"[cleanup] {reason}; destroying instance {state.instance_id}...", err=True)
     try:
         _provider(config).destroy_instance(state.instance_id)
-        click.echo(f"[cleanup] instance {state.instance_id} destroyed", err=True)
+        _log(f"[cleanup] instance {state.instance_id} destroyed", err=True)
     except Exception as exc:
-        click.echo(f"[cleanup] destroy failed: {exc}; please remove it manually", err=True)
+        _log(f"[cleanup] destroy failed: {exc}; please remove it manually", err=True)
     state.status = "failed"
     state.set("failure_reason", reason)
     state.save()
@@ -368,7 +374,7 @@ def _emit_instance_logs(config: Config, instance_id: int, seen: Dict[str, Set[st
             if not line or line in seen[kind]:
                 continue
             seen[kind].add(line)
-            click.echo(f"[logs:{kind}] {line}")
+            _log(f"[logs:{kind}] {line}")
 
 
 def _wait_for_ssh_endpoint(config: Config, state: State, timeout: int) -> None:
@@ -383,7 +389,7 @@ def _wait_for_ssh_endpoint(config: Config, state: State, timeout: int) -> None:
             raise click.ClickException(f"[boot:ssh-endpoint] timeout after {elapsed:.1f}s")
         inst = _provider(config).get_instance(state.instance_id)
         if not inst:
-            click.echo("[boot] waiting for instance to appear...")
+            _log("[boot] waiting for instance to appear...")
             time.sleep(5)
             continue
         status = inst.get("actual_status") or inst.get("status") or "loading"
@@ -394,7 +400,7 @@ def _wait_for_ssh_endpoint(config: Config, state: State, timeout: int) -> None:
             state.ssh_url = endpoint["ssh_url"]
             state.status = "ssh-ready"
             state.save()
-            click.echo(f"[boot:ssh-endpoint] {state.ssh_url} ready after {elapsed:.1f}s")
+            _log(f"[boot:ssh-endpoint] {state.ssh_url} ready after {elapsed:.1f}s")
             return
         if elapsed - last_status >= 15:
             last_status = elapsed
@@ -402,7 +408,7 @@ def _wait_for_ssh_endpoint(config: Config, state: State, timeout: int) -> None:
             ports = inst.get("ports") or {}
             tcp = ports.get("22/tcp") or []
             port = tcp[0].get("HostPort") if tcp and isinstance(tcp[0], dict) else "?"
-            click.echo(f"[boot] status={status} | ssh={host}:{port} | waiting...")
+            _log(f"[boot] status={status} | ssh={host}:{port} | waiting...")
             _emit_instance_logs(config, state.instance_id, seen_log_lines)
         time.sleep(5)
 
@@ -420,7 +426,7 @@ def _wait_for_api(config: Config, state: State, timeout: int, client: LlamaClien
             return
         if now - last_log >= 15:
             last_log = now
-            click.echo(f"[api] waiting for llama-server ({now - start}s / {timeout}s)")
+            _log(f"[api] waiting for llama-server ({now - start}s / {timeout}s)")
             # best-effort log tail
             try:
                 result = ssh.run_remote(
@@ -432,7 +438,7 @@ def _wait_for_api(config: Config, state: State, timeout: int, client: LlamaClien
                     timeout=10,
                 )
                 if result.stdout:
-                    click.echo(result.stdout)
+                    _log(result.stdout)
             except Exception:
                 pass
         time.sleep(interval)
@@ -607,28 +613,29 @@ def _start_proxy(config: Config, state: State, client_api_scheme: str = "http") 
 
     port = config.proxy.port or config.ssh.local_port or 0
     if port and not utils.port_is_free(port, host="127.0.0.1"):
-        click.echo(f"[proxy] WARNING: configured port {port} is in use; skipping", err=True)
+        _log(f"[proxy] WARNING: configured port {port} is in use; skipping", err=True)
         return None
     if not port:
         try:
             port = utils.find_free_port(start=18083, host="127.0.0.1")
         except RuntimeError as exc:
-            click.echo(f"[proxy] WARNING: no free TCP port: {exc}; skipping", err=True)
+            _log(f"[proxy] WARNING: no free TCP port: {exc}; skipping", err=True)
             return None
     config.proxy.port = port
 
     env = os.environ.copy()
     env["HOSTAI_PROXY_PORT"] = str(port)
+    env["PYTHONUNBUFFERED"] = "1"
     log_path = state.state_file.parent / "proxy.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
         proxy_bin = _hostai_binary()
     except RuntimeError as exc:
-        click.echo(f"[proxy] WARNING: {exc}; skipping", err=True)
+        _log(f"[proxy] WARNING: {exc}; skipping", err=True)
         return None
 
-    click.echo(f"[proxy] auto-starting on {client_api_scheme}://127.0.0.1:{port}")
+    _log(f"[proxy] auto-starting on {client_api_scheme}://127.0.0.1:{port}")
     try:
         with open(log_path, "a", encoding="utf-8") as log_file:
             proc = subprocess.Popen(
@@ -640,7 +647,7 @@ def _start_proxy(config: Config, state: State, client_api_scheme: str = "http") 
                 stdin=subprocess.DEVNULL,
             )
     except OSError as exc:
-        click.echo(f"[proxy] WARNING: failed to start: {exc}; skipping", err=True)
+        _log(f"[proxy] WARNING: failed to start: {exc}; skipping", err=True)
         return None
 
     deadline = time.monotonic() + 120
@@ -649,7 +656,13 @@ def _start_proxy(config: Config, state: State, client_api_scheme: str = "http") 
             break
         time.sleep(0.2)
     else:
-        click.echo(f"[proxy] WARNING: did not see proxy on port {port}; check {log_path}", err=True)
+        _log(f"[proxy] WARNING: did not see proxy on port {port}; check {log_path}", err=True)
+        try:
+            tail = log_path.read_text(encoding="utf-8").splitlines()[-50:]
+            for line in tail:
+                _log(f"[proxy] log: {line}", err=True)
+        except Exception:
+            pass
         return None
 
     # Reload state; the proxy has updated local_port and saved pid.
@@ -661,7 +674,7 @@ def _start_proxy(config: Config, state: State, client_api_scheme: str = "http") 
     api_url = f"{client_api_scheme}://127.0.0.1:{port}"
     base_url = f"{api_url}/v1"
     _write_env_file(config, state, api_url, base_url)
-    click.echo(f"[proxy] ready (pid {proc.pid}); OPENAI_BASE_URL={base_url}")
+    _log(f"[proxy] ready (pid {proc.pid}); OPENAI_BASE_URL={base_url}")
     return port
 
 
@@ -727,28 +740,28 @@ def _do_fresh(
     interruptible = bid_price is not None
 
     query, max_dph = market.build_search_query(config, profiles, profile, max_price=max_price, unverified=unverified, offer=offer, bid_price=bid_price)
-    click.echo(f"[profile] {profile.name} | sm_{image.cuda_arch} | ctx={ctx_size} | image={selected_image} | disk={disk_gb}GB")
-    click.echo(f"[search]  {query}")
+    _log(f"[profile] {profile.name} | sm_{image.cuda_arch} | ctx={ctx_size} | image={selected_image} | disk={disk_gb}GB")
+    _log(f"[search]  {query}")
 
     offer_type = "bid" if interruptible else "on-demand"
     configured_max_dph = max_price if max_price is not None else config.market.max_dph
     if interruptible and bid_price is not None:
         effective_cap = min(configured_max_dph, bid_price)
-        click.echo(
+        _log(
             f"[search]  mode={offer_type} configured_max_dph=${configured_max_dph:.4f}/h "
             f"bid=${bid_price:.4f}/h effective_cap=${effective_cap:.4f}/h"
         )
     else:
-        click.echo(f"[search]  mode={offer_type} max_dph=${configured_max_dph:.4f}/h")
+        _log(f"[search]  mode={offer_type} max_dph=${configured_max_dph:.4f}/h")
     provider = _provider(config)
-    click.echo(f"[provider] {provider.name}")
+    _log(f"[provider] {provider.name}")
     previous = _check_production_validation(config, allow_unvalidated)
     if config.vast.require_production_validation and previous is not None and not allow_unvalidated:
         # Use the immutable SHA-tagged image that the CI published for the
         # validated Git commit instead of the mutable profile tag.
         commit = previous.git_commit[:7]
         selected_image = image_for_profile(config, f"{image.image_tag}-sha-{commit}")
-        click.echo(f"[image] gated to validated image: {selected_image}")
+        _log(f"[image] gated to validated image: {selected_image}")
 
     offer_data = market.select_offer(
         config,
@@ -768,10 +781,10 @@ def _do_fresh(
     offer_id = int(offer_id_raw)
     gpu_name = offer_data.get("gpu_name", "unknown")
     dph = offer_data.get("dph_total", 0.0)
-    click.echo(f"[rent] {market.offer_summary(offer_data)}")
+    _log(f"[rent] {market.offer_summary(offer_data)}")
 
     if dry_run:
-        click.echo("\nDRY RUN: not creating an instance")
+        _log("\nDRY RUN: not creating an instance")
         return
 
     run_id = utils.make_run_id(profile.name)
@@ -923,14 +936,14 @@ def _do_fresh_core(
     abort_if_shm_too_small: bool,
 ) -> None:
     """Provision a freshly created instance (SSH, cache, tunnel, TLS, API)."""
-    click.echo(f"[boot] instance {state.instance_id} created; waiting for SSH...")
+    _log(f"[boot] instance {state.instance_id} created; waiting for SSH...")
     _wait_for_ssh_endpoint(config, state, config.ssh.start_timeout)
 
     known_hosts = state.state_file.parent / "known_hosts"
     ssh_start = time.monotonic()
     if not ssh.wait_for_ssh(state.ssh_url, known_hosts=known_hosts, config=config, state=state, timeout=300):
         raise click.ClickException("[boot:ssh-command] timeout")
-    click.echo(f"[boot:ssh-command] ready after {time.monotonic() - ssh_start:.1f}s")
+    _log(f"[boot:ssh-command] ready after {time.monotonic() - ssh_start:.1f}s")
 
     # runtime preflight
     result = ssh.run_remote(
@@ -949,7 +962,7 @@ def _do_fresh_core(
     if not state.unsecure:
         tls_dir = tls.ensure_local_tls_dir(config.root_dir)
         tls.generate_cert(tls_dir)
-        click.echo("[tls] delivering certificates to container")
+        _log("[tls] delivering certificates to container")
         tls_deadline = time.monotonic() + min(120.0, float(config.ssh.start_timeout or 1200))
         tls_delivered = False
         while not tls_delivered:
@@ -965,11 +978,11 @@ def _do_fresh_core(
                 break
             if time.monotonic() >= tls_deadline:
                 raise click.ClickException("TLS certificate delivery failed")
-            click.echo("[tls] delivery attempt failed; retrying in 5s", err=True)
+            _log("[tls] delivery attempt failed; retrying in 5s", err=True)
             time.sleep(5)
         state.tls_ca = tls_dir / "ca.crt"
         state.save()
-        click.echo("[tls] certificates delivered")
+        _log("[tls] certificates delivered")
         api_scheme = "https"
     else:
         api_scheme = "http"
@@ -977,12 +990,12 @@ def _do_fresh_core(
     # cache setup
     cache_enabled = state.slot_cache_enabled
     if cache_enabled and not cache.validate_cache_config(config):
-        click.echo("[cache] WARNING: cache config invalid; continuing cold", err=True)
+        _log("[cache] WARNING: cache config invalid; continuing cold", err=True)
         cache_enabled = False
         state.slot_cache_enabled = False
 
     if cache_enabled and not config.cache.rclone and not cache.install_cache_key_on_vast(state, config):
-        click.echo("[cache] WARNING: could not install cache private key; continuing cold", err=True)
+        _log("[cache] WARNING: could not install cache private key; continuing cold", err=True)
         cache_enabled = False
         state.slot_cache_enabled = False
 
@@ -1004,7 +1017,7 @@ def _do_fresh_core(
             if shm_rc == 1:
                 if abort_if_shm_too_small or config.cache.shm_require:
                     raise click.ClickException("[cache] /dev/shm is too small and abort-if-shm-too-small is set")
-                click.echo("[cache] /dev/shm is too small; disabling slot cache for this host", err=True)
+                _log("[cache] /dev/shm is too small; disabling slot cache for this host", err=True)
                 cache_enabled = False
                 state.slot_cache_enabled = False
             elif shm_rc == 2:
@@ -1021,10 +1034,10 @@ def _do_fresh_core(
         state.save()
 
         if _prefetch_slot_cache_to_vast(state.ssh_url, config, remote_local_dir, cache_remote, known_hosts):
-            click.echo("[cache] prefetched slot from cache server")
+            _log("[cache] prefetched slot from cache server")
             state.data["slot_cache_prefetch"] = "ok"
         else:
-            click.echo("[cache] no slot cache on server; will start cold", err=True)
+            _log("[cache] no slot cache on server; will start cold", err=True)
             state.data["slot_cache_prefetch"] = "empty"
         state.save()
 
@@ -1035,10 +1048,10 @@ def _do_fresh_core(
         proxy_port = _start_proxy(config, state, client_api_scheme="http")
         if not proxy_port:
             raise click.ClickException("[proxy] failed to start")
-        click.echo(f"[tunnel] proxy on localhost:{proxy_port}")
+        _log(f"[tunnel] proxy on localhost:{proxy_port}")
     else:
         proxy_port = ssh.ensure_tunnel(config, state)
-        click.echo(f"[tunnel] localhost:{proxy_port}")
+        _log(f"[tunnel] localhost:{proxy_port}")
 
     # Build client API URL. When the proxy is active it is local HTTP; in the
     # non-tokenized legacy path we still speak directly to the remote TLS port.
@@ -1065,10 +1078,10 @@ def _do_fresh_core(
     # restore slot cache
     if cache_enabled:
         if client.slot_restore(config.cache.slot_id):
-            click.echo("[cache] slot restore requested")
+            _log("[cache] slot restore requested")
             state.data["slot_cache_restore"] = "restored"
         else:
-            click.echo("[cache] WARNING: slot restore failed; continuing cold", err=True)
+            _log("[cache] WARNING: slot restore failed; continuing cold", err=True)
             state.data["slot_cache_restore"] = "failed"
         state.save()
 
@@ -1086,21 +1099,21 @@ def _do_fresh_core(
     if run_dir and state.ssh_url:
         telemetry = _capture_disk_telemetry(config, state, known_hosts)
         if telemetry:
-            click.echo(f"[disk] telemetry: {len(telemetry['records'])} stages, free={telemetry['records'][-1]['free_bytes']/1e9:.2f}GB")
+            _log(f"[disk] telemetry: {len(telemetry['records'])} stages, free={telemetry['records'][-1]['free_bytes']/1e9:.2f}GB")
 
-    click.echo("\nREADY")
-    click.echo(f"  Profile:   {state.profile} (sm_{image.cuda_arch})")
-    click.echo(f"  Image:     {state.image}")
-    click.echo(f"  GPU:       {state.gpu}")
-    click.echo(f"  Cost:      ${float(state.dph):.4f}/h")
-    click.echo(f"  Context:   {state.ctx_size}")
-    click.echo(f"  API:       {client_base_url}")
-    click.echo(f"  Instance:  {state.instance_id}")
-    click.echo(f"  Run log:   {run_dir}")
+    _log("\nREADY")
+    _log(f"  Profile:   {state.profile} (sm_{image.cuda_arch})")
+    _log(f"  Image:     {state.image}")
+    _log(f"  GPU:       {state.gpu}")
+    _log(f"  Cost:      ${float(state.dph):.4f}/h")
+    _log(f"  Context:   {state.ctx_size}")
+    _log(f"  API:       {client_base_url}")
+    _log(f"  Instance:  {state.instance_id}")
+    _log(f"  Run log:   {run_dir}")
     if cache_enabled:
-        click.echo(f"  Slot cache: session={session} remote={cache_remote}")
-    click.echo("\nRun: source .hostai-vast/env")
-    click.echo("Stop: hostai down")
+        _log(f"  Slot cache: session={session} remote={cache_remote}")
+    _log("\nRun: source .hostai-vast/env")
+    _log("Stop: hostai down")
 
     maybe_start_watchdog(config, state)
     maybe_start_monitor(config, state)
@@ -1130,7 +1143,7 @@ def _do_restart(
     if status != "running":
         try:
             _provider(config).start_instance(state.instance_id)
-            click.echo(f"[restart] started instance {state.instance_id}")
+            _log(f"[restart] started instance {state.instance_id}")
         except Exception as exc:
             raise click.ClickException(f"failed to start instance: {exc}")
 
@@ -1144,7 +1157,7 @@ def _do_restart(
         tls_dir = tls.ensure_local_tls_dir(config.root_dir)
         if not (tls_dir / "server.crt").exists():
             tls.generate_cert(tls_dir)
-        click.echo("[tls] delivering certificates to container")
+        _log("[tls] delivering certificates to container")
         tls_deadline = time.monotonic() + min(120.0, float(config.ssh.start_timeout or 1200))
         tls_delivered = False
         while not tls_delivered:
@@ -1160,11 +1173,11 @@ def _do_restart(
                 break
             if time.monotonic() >= tls_deadline:
                 raise click.ClickException("TLS certificate delivery failed")
-            click.echo("[tls] delivery attempt failed; retrying in 5s", err=True)
+            _log("[tls] delivery attempt failed; retrying in 5s", err=True)
             time.sleep(5)
         state.tls_ca = tls_dir / "ca.crt"
         state.save()
-        click.echo("[tls] certificates delivered")
+        _log("[tls] certificates delivered")
         api_scheme = "https"
     else:
         api_scheme = "http"
@@ -1172,13 +1185,13 @@ def _do_restart(
     # cache setup for restart
     cache_enabled = state.slot_cache_enabled and not no_cache
     if cache_enabled and not cache.validate_cache_config(config):
-        click.echo("[cache] WARNING: cache config invalid; continuing cold", err=True)
+        _log("[cache] WARNING: cache config invalid; continuing cold", err=True)
         cache_enabled = False
         state.slot_cache_enabled = False
 
     if cache_enabled:
         if not config.cache.rclone and not cache.install_cache_key_on_vast(state, config):
-            click.echo("[cache] WARNING: could not install cache key; continuing cold", err=True)
+            _log("[cache] WARNING: could not install cache key; continuing cold", err=True)
             cache_enabled = False
             state.slot_cache_enabled = False
         else:
@@ -1191,10 +1204,10 @@ def _do_restart(
             state.data["slot_cache_remote_dir"] = cache_remote
             state.data["slot_cache_restore"] = "pending"
             if _prefetch_slot_cache_to_vast(state.ssh_url, config, remote_local_dir, cache_remote, known_hosts):
-                click.echo("[cache] prefetched slot from cache server")
+                _log("[cache] prefetched slot from cache server")
                 state.data["slot_cache_prefetch"] = "ok"
             else:
-                click.echo("[cache] no slot cache on server; will start cold", err=True)
+                _log("[cache] no slot cache on server; will start cold", err=True)
                 state.data["slot_cache_prefetch"] = "empty"
             state.save()
 
@@ -1204,10 +1217,10 @@ def _do_restart(
         proxy_port = _start_proxy(config, state, client_api_scheme="http")
         if not proxy_port:
             raise click.ClickException("[proxy] failed to start")
-        click.echo(f"[tunnel] proxy on localhost:{proxy_port}")
+        _log(f"[tunnel] proxy on localhost:{proxy_port}")
     else:
         proxy_port = ssh.ensure_tunnel(config, state)
-        click.echo(f"[tunnel] localhost:{proxy_port}")
+        _log(f"[tunnel] localhost:{proxy_port}")
 
     state.save()
     client_scheme = "http" if config.proxy.tokenized_only else api_scheme
@@ -1230,10 +1243,10 @@ def _do_restart(
     # restore slot cache on restart
     if cache_enabled:
         if client.slot_restore(config.cache.slot_id):
-            click.echo("[cache] slot restored")
+            _log("[cache] slot restored")
             state.data["slot_cache_restore"] = "restored"
         else:
-            click.echo("[cache] WARNING: slot restore failed; continuing cold", err=True)
+            _log("[cache] WARNING: slot restore failed; continuing cold", err=True)
             state.data["slot_cache_restore"] = "failed"
         state.save()
 
@@ -1244,10 +1257,10 @@ def _do_restart(
     if state.run_dir:
         state.save_metadata(state.run_dir, status="restarted")
 
-    click.echo("\nREADY")
-    click.echo(f"  Profile:   {state.profile}")
-    click.echo(f"  API:       {client_base_url}")
-    click.echo(f"  Instance:  {state.instance_id}")
+    _log("\nREADY")
+    _log(f"  Profile:   {state.profile}")
+    _log(f"  API:       {client_base_url}")
+    _log(f"  Instance:  {state.instance_id}")
 
     maybe_start_watchdog(config, state)
     maybe_start_monitor(config, state)
