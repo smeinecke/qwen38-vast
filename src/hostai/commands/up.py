@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import json
 import os
-import secrets
 import shutil
 import subprocess
 import sys
@@ -881,7 +880,7 @@ def _do_fresh(
     run_started = _now_rfc()
     run_epoch = _now_epoch()
 
-    api_key = "sk-local-" + secrets.token_hex(24)
+    api_key = config.secrets.get("MODEL_API_KEY") or utils.make_api_key()
     session = cache_session or config.cache.session
 
     # metadata

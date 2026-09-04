@@ -337,7 +337,7 @@ ENV_MAP: Dict[str, tuple[str, str, Optional[Type[Any]]]] = {
     "HOSTAI_PROXY_CACHE_DIR": ("proxy", "cache_dir", str),
 }
 
-SECRETS = {"VAST_API_KEY", "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "SSH_PUBLIC_KEY"}
+SECRETS = {"VAST_API_KEY", "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "SSH_PUBLIC_KEY", "MODEL_API_KEY"}
 
 
 CTX_SIZE_OVERRIDE = "CTX_SIZE_OVERRIDE"
