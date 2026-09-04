@@ -155,7 +155,7 @@ def test_local_up_shm_size_configurable(project_dir):
 @pytest.mark.skipif(not _has_docker(), reason="docker not available")
 @pytest.mark.skipif(not _image_exists(_integration_image()), reason=f"integration image {_integration_image()} not built")
 def test_local_up_with_small_shm(project_dir, local_env, monkeypatch):
-    """A /dev/shm smaller than the cache minimum disables slot cache gracefully."""
+    """A /dev/shm smaller than the cache minimum falls back to disk slot cache."""
     runner = CliRunner(env=local_env)
     monkeypatch.chdir(project_dir)
 
@@ -181,7 +181,7 @@ def test_local_up_with_small_shm(project_dir, local_env, monkeypatch):
         obj=None,
     )
     assert result.exit_code == 0, result.output
-    assert "[cache] /dev/shm is too small; disabling slot cache for this host" in result.output
+    assert "[cache] /dev/shm is too small; falling back to disk slot cache" in result.output
 
     down_result = runner.invoke(cli, ["down", "--yes"], catch_exceptions=False, obj=None)
     assert down_result.exit_code == 0, down_result.output

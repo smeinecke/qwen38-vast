@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import sys
 import time
 from pathlib import Path
@@ -94,52 +95,41 @@ def deliver_cert(
     cert_text = cert_path.read_text()
     key_text = key_path.read_text()
 
-    # Ensure the remote certs directory exists.
+    # Deliver everything in a single SSH round-trip to avoid repeated
+    # connection/shell startup overhead, which can be several seconds on slow
+    # Vast hosts.
+    cert_b64 = base64.b64encode(cert_text.encode()).decode()
+    key_b64 = base64.b64encode(key_text.encode()).decode()
+    script = f"""\
+set -e
+install -d -m 700 /dev/shm/qwen38/certs
+base64 -d > /dev/shm/qwen38/certs/server.crt <<'EOF'
+{cert_b64}
+EOF
+base64 -d > /dev/shm/qwen38/certs/server.key <<'EOF'
+{key_b64}
+EOF
+chmod 600 /dev/shm/qwen38/certs/server.key
+"""
     result = ssh.run_remote(
         ssh_url,
-        "install -d -m 700 /dev/shm/qwen38/certs",
+        "bash -s",
         known_hosts=known_hosts,
         identity=identity,
         config=config,
         state=state,
+        input_data=script,
         capture=True,
         timeout=timeout,
     )
     if result.returncode != 0:
-        print(f"[{_ts()}] [tls] install remote certs dir failed: rc={result.returncode} stderr={result.stderr!r}", file=sys.stderr, flush=True)
-        return False
-
-    # Stream the certificate and key to tmpfs.
-    for local_text, remote_name in [(cert_text, "server.crt"), (key_text, "server.key")]:
-        result = ssh.run_remote(
-            ssh_url,
-            f"cat > /dev/shm/qwen38/certs/{remote_name}",
-            known_hosts=known_hosts,
-            identity=identity,
-            config=config,
-            state=state,
-            input_data=local_text,
-            capture=True,
-            timeout=timeout,
+        print(
+            f"[{_ts()}] [tls] remote cert delivery failed: rc={result.returncode} stderr={result.stderr!r}",
+            file=sys.stderr,
+            flush=True,
         )
-        if result.returncode != 0:
-            print(f"[{_ts()}] [tls] writing {remote_name} failed: rc={result.returncode} stderr={result.stderr!r}", file=sys.stderr, flush=True)
-            return False
-
-    # Restrict the private key.
-    result = ssh.run_remote(
-        ssh_url,
-        "chmod 600 /dev/shm/qwen38/certs/server.key",
-        known_hosts=known_hosts,
-        identity=identity,
-        config=config,
-        state=state,
-        capture=True,
-        timeout=timeout,
-    )
-    if result.returncode != 0:
-        print(f"[{_ts()}] [tls] chmod server.key failed: rc={result.returncode} stderr={result.stderr!r}", file=sys.stderr, flush=True)
-    return result.returncode == 0
+        return False
+    return True
 
 
 def load_cert_pair(tls_dir: Path) -> Tuple[str, str]:

@@ -248,7 +248,13 @@ def _shm_preflight(
     except (TypeError, ValueError):
         return 2
     if free < min_bytes:
+        _log(
+            f"[cache] /dev/shm free={free / 1024 / 1024 / 1024:.2f}GB "
+            f"is below shm_min_gb={min_gb}GB",
+            err=True,
+        )
         return 1
+    _log(f"[cache] /dev/shm free={free / 1024 / 1024 / 1024:.2f}GB OK")
     return 0
 
 
@@ -1087,9 +1093,12 @@ def _do_fresh_core(
             if shm_rc == 1:
                 if abort_if_shm_too_small or config.cache.shm_require:
                     raise click.ClickException("[cache] /dev/shm is too small and abort-if-shm-too-small is set")
-                _log("[cache] /dev/shm is too small; disabling slot cache for this host", err=True)
-                cache_enabled = False
-                state.slot_cache_enabled = False
+                _log(
+                    "[cache] /dev/shm is too small; falling back to disk slot cache",
+                    err=True,
+                )
+                state.slot_cache_use_shm = False
+                state.slot_cache_local_dir = "/var/lib/qwen38/slots"
             elif shm_rc == 2:
                 raise click.ClickException("[cache] slot cache /dev/shm preflight failed")
 
@@ -1265,6 +1274,25 @@ def _do_restart(
             cache_enabled = False
             state.slot_cache_enabled = False
         else:
+            if config.cache.use_shm:
+                shm_rc = _shm_preflight(
+                    state.ssh_url,
+                    config,
+                    known_hosts,
+                    config.cache.shm_min_gb,
+                )
+                if shm_rc == 1:
+                    if config.cache.shm_require:
+                        raise click.ClickException("[cache] /dev/shm is too small and [cache].shm_require is set")
+                    _log(
+                        "[cache] /dev/shm is too small; falling back to disk slot cache",
+                        err=True,
+                    )
+                    state.slot_cache_use_shm = False
+                    state.slot_cache_local_dir = "/var/lib/qwen38/slots"
+                elif shm_rc == 2:
+                    raise click.ClickException("[cache] slot cache /dev/shm preflight failed")
+
             llama_commit = state.data.get("llama_cpp_commit") or _common.fetch_llama_commit(state.ssh_url, known_hosts)
             state.data["llama_cpp_commit"] = llama_commit
             signature = cache._signature_for_state(config, state, llama_commit)
