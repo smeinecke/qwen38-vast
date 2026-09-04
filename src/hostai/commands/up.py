@@ -6,6 +6,9 @@ import base64
 import json
 import os
 import secrets
+import shutil
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -577,6 +580,92 @@ def _default_proxy_socket(config: Config) -> Path:
     return state_dir(config.root_dir) / "proxy.sock"
 
 
+def _hostai_binary() -> Path:
+    """Return the path to the hostai executable for spawning child processes."""
+    candidate = Path(sys.executable).parent / "hostai"
+    if candidate.is_file() and os.access(candidate, os.X_OK):
+        return candidate
+    path = shutil.which("hostai")
+    if path:
+        return Path(path)
+    raise RuntimeError("could not find hostai executable")
+
+
+def _start_proxy(config: Config, state: State, api_scheme: str) -> None:
+    """Auto-start the local tokenized proxy after `up` is ready.
+
+    When tokenized-only mode is enabled, the proxy is the OpenAI-compatible
+    endpoint. It runs as a detached child process so it survives after the
+    `up` command exits.
+    """
+    if not config.proxy.tokenized_only:
+        return
+
+    port = config.proxy.port
+    if port:
+        if not utils.port_is_free(port, host="127.0.0.1"):
+            click.echo(f"[proxy] WARNING: configured port {port} is in use; skipping", err=True)
+            return
+    else:
+        # Auto-pick a free localhost TCP port. The proxy will also listen on
+        # the Unix socket, but a TCP port is needed for typical OpenAI clients.
+        start = max((state.local_port or 18081) + 2, 18083)
+        try:
+            port = utils.find_free_port(start=start, host="127.0.0.1")
+        except RuntimeError as exc:
+            click.echo(f"[proxy] WARNING: no free TCP port: {exc}; skipping", err=True)
+            return
+    config.proxy.port = port
+
+    env = os.environ.copy()
+    env["HOSTAI_PROXY_PORT"] = str(port)
+    log_path = state.state_file.parent / "proxy.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        proxy_bin = _hostai_binary()
+    except RuntimeError as exc:
+        click.echo(f"[proxy] WARNING: {exc}; skipping", err=True)
+        return
+
+    click.echo(f"[proxy] auto-starting on http://127.0.0.1:{port}")
+    try:
+        with open(log_path, "a", encoding="utf-8") as log_file:
+            proc = subprocess.Popen(
+                [str(proxy_bin), "proxy"],
+                env=env,
+                start_new_session=True,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+            )
+    except OSError as exc:
+        click.echo(f"[proxy] WARNING: failed to start: {exc}; skipping", err=True)
+        return
+
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        if not utils.port_is_free(port, host="127.0.0.1"):
+            break
+        time.sleep(0.2)
+    else:
+        click.echo(f"[proxy] WARNING: did not see proxy on port {port}; check {log_path}", err=True)
+        return
+
+    # Reload state; the proxy has updated local_port/tunnel info and saved pid.
+    state = State.load(state.state_file)
+    state.data["proxy_pid"] = proc.pid
+    state.save()
+
+    if state.local_port:
+        api_url = f"{api_scheme}://127.0.0.1:{state.local_port}"
+        base_url = f"{api_url}/v1"
+    else:
+        api_url = base_url = ""
+    _write_env_file(config, state, api_url, base_url)
+    click.echo(f"[proxy] ready (pid {proc.pid}); OPENAI_BASE_URL=http://127.0.0.1:{port}/v1")
+
+
 def _prefetch_slot_cache_to_vast(
     ssh_url: Optional[str],
     config: Config,
@@ -993,6 +1082,7 @@ def _do_fresh_core(
     click.echo("\nRun: source .hostai-vast/env")
     click.echo("Stop: hostai down")
 
+    _start_proxy(config, state, api_scheme)
     maybe_start_watchdog(config, state)
     maybe_start_monitor(config, state)
 
@@ -1123,5 +1213,6 @@ def _do_restart(
     click.echo(f"  API:       {base_url}")
     click.echo(f"  Instance:  {state.instance_id}")
 
+    _start_proxy(config, state, api_scheme)
     maybe_start_watchdog(config, state)
     maybe_start_monitor(config, state)

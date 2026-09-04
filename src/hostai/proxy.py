@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional
 import aiohttp
 from aiohttp import web
 
+from hostai import ssh
 from hostai.config import Config
 from hostai.state import State
 from hostai.tokenize import Tokenizer, TokenizerError, default_reasoning_kwargs
@@ -432,9 +433,17 @@ async def _fetch_props_once(config: Config, state: State) -> Optional[Dict[str, 
 
 
 async def run_proxy(config: Config, state: State) -> None:
-    """Start the local tokenized proxy for the active state."""
-    if not state.local_port:
-        raise ProxyError("no active SSH tunnel; run 'hostai up' first")
+    """Start the local tokenized proxy for the active state.
+
+    The proxy owns its own SSH tunnel, so it keeps the connection alive as long
+    as it is running.
+    """
+    local_port = ssh.ensure_tunnel(config, state)
+    _logger.info("proxy SSH tunnel on localhost:%d", local_port)
+
+    # Record the proxy pid so hostai down can stop it.
+    state.data["proxy_pid"] = os.getpid()
+    state.save()
 
     socket_path = Path(config.proxy.socket_path) if config.proxy.socket_path else _default_socket_path(state)
     port = config.proxy.port or 0

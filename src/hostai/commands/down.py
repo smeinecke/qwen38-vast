@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import signal
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -356,6 +358,31 @@ def _client_log(run_dir: Path, message: str) -> None:
         f.write(f"{utils.now_rfc3339()} {message}\n")
 
 
+def _stop_proxy(state: State) -> None:
+    """Stop a proxy that was auto-started by `hostai up`."""
+    pid = state.data.get("proxy_pid")
+    if not pid:
+        return
+    try:
+        os.kill(pid, 0)
+    except (OSError, ProcessLookupError):
+        return
+    click.echo(f"[down] stopping proxy (pid {pid})")
+    os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except (OSError, ProcessLookupError):
+            return
+        time.sleep(0.2)
+    click.echo(f"[down] proxy did not stop; killing (pid {pid})", err=True)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        pass
+
+
 def _pause_or_destroy(config: Config, state: State, pause: bool, run_dir: Path) -> str:
     """Pause or destroy the instance and update metadata."""
     if not state.instance_id:
@@ -466,6 +493,8 @@ def down_instance(
     state.set("down_started_at", utils.now_rfc3339())
     state.save()
     _client_log(run_dir, f"{action} initiated for instance {state.instance_id}: reason={reason or 'manual'}")
+
+    _stop_proxy(state)
 
     known_hosts = state.state_file.parent / "known_hosts"
 
