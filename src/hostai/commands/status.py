@@ -117,7 +117,15 @@ def _fetch_gpu_snapshot(ssh_url: str, known_hosts: Path) -> Optional[str]:
     return None
 
 
-def _print_status(config: Config, state: State, instance: Optional[Dict[str, Any]], metrics: Dict[str, float]) -> None:
+def _print_status(
+    config: Config,
+    state: State,
+    instance: Optional[Dict[str, Any]],
+    metrics: Dict[str, float],
+    *,
+    tunnel_healthy: bool = False,
+    api_healthy: bool = False,
+) -> None:
     console = Console()
     table = Table(title="hostai status", show_header=True, header_style="bold")
     table.add_column("Key")
@@ -140,10 +148,8 @@ def _print_status(config: Config, state: State, instance: Optional[Dict[str, Any
     table.add_row("SSH", state.ssh_url or "not published")
     table.add_row("Local port", str(state.local_port))
     table.add_row("API URL", api_url)
-    table.add_row("Tunnel healthy", str(ssh.is_tunnel_healthy(config, state, timeout=3)))
-
-    client = api.LlamaClient(config, state)
-    table.add_row("API healthy", str(client.health()))
+    table.add_row("Tunnel healthy", str(tunnel_healthy))
+    table.add_row("API healthy", str(api_healthy))
 
     if state.slot_cache_enabled:
         cache_session = state.slot_cache_session
@@ -213,13 +219,16 @@ def cmd_status(config: Config, logs: bool, lines: int, follow: bool, no_save: bo
     if _refresh_ssh_state(config, state):
         state.save()
 
-    if instance.get("actual_status") == "running":
-        try:
-            ssh.ensure_tunnel(config, state)
-        except Exception as exc:
-            click.echo(f"[status] WARNING: could not ensure tunnel: {exc}", err=True)
+    # status is a read-only report: do not open a new SSH tunnel/port-forward.
+    # If a tunnel from a previous up is still healthy, use it for API health/
+    # metrics; otherwise leave those fields empty/false.
+    metrics: Dict[str, float] = {}
+    tunnel_healthy = ssh.is_tunnel_healthy(config, state, timeout=3)
+    api_healthy = False
+    if tunnel_healthy:
+        client = api.LlamaClient(config, state)
+        api_healthy = client.health()
+        if api_healthy:
+            metrics = client.get_metrics()
 
-    client = api.LlamaClient(config, state)
-    metrics = client.get_metrics() if client.health() else {}
-
-    _print_status(config, state, instance, metrics)
+    _print_status(config, state, instance, metrics, tunnel_healthy=tunnel_healthy, api_healthy=api_healthy)
