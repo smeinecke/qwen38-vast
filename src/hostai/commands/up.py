@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import click
 
 from hostai import cache, market, ssh, tls, utils
-from hostai.api import LlamaClient, wait_for_api
+from hostai.api import LlamaClient
 from hostai.commands import _common
 from hostai.commands.monitor import maybe_start_monitor
 from hostai.commands.watchdog import maybe_start_watchdog
@@ -413,32 +413,48 @@ def _wait_for_ssh_endpoint(config: Config, state: State, timeout: int) -> None:
         time.sleep(5)
 
 
-def _wait_for_api(config: Config, state: State, timeout: int, client: LlamaClient) -> None:
+def _wait_for_api(
+    config: Config,
+    state: State,
+    timeout: int,
+    client: LlamaClient,
+    *,
+    stage_label: str = "end-to-end",
+) -> None:
     start = _now_epoch()
     interval = 1.0
     last_log = start
     known_hosts = state.state_file.parent / "known_hosts"
+    seen_logs: Dict[str, Set[str]] = {"container": set(), "daemon": set(), "server": set()}
     while True:
         now = _now_epoch()
         if now - start > timeout:
-            raise click.ClickException("timeout waiting for llama-server /health")
+            raise click.ClickException(f"timeout waiting for llama-server /health ({stage_label})")
         if client.health():
+            _log(f"[boot:{stage_label}] /health OK after {now - start:.1f}s")
             return
         if now - last_log >= 15:
             last_log = now
             _log(f"[api] waiting for llama-server ({now - start}s / {timeout}s)")
-            # best-effort log tail
+            if state.instance_id:
+                _emit_instance_logs(config, state.instance_id, seen_logs)
+            # best-effort server log tail from inside the container
             try:
                 result = ssh.run_remote(
                     state.ssh_url,
-                    "tail -n 20 /var/log/qwen38/server.log 2>/dev/null || true",
+                    "tail -n 50 /var/log/qwen38/server.log 2>/dev/null || true",
                     known_hosts=known_hosts,
                     config=config,
                     state=state,
                     timeout=10,
                 )
                 if result.stdout:
-                    _log(result.stdout)
+                    for line in result.stdout.splitlines():
+                        line = line.rstrip()
+                        if not line or line in seen_logs["server"]:
+                            continue
+                        seen_logs["server"].add(line)
+                        _log(f"[logs:server] {line}")
             except Exception:
                 pass
         time.sleep(interval)
@@ -1068,12 +1084,10 @@ def _do_fresh_core(
         client_state.local_port = proxy_port
         client_state.unsecure = True
         client = LlamaClient(config, client_state)
-        if not wait_for_api(config, client_state, config.ssh.start_timeout):
-            raise click.ClickException("[boot:end-to-end] timeout waiting for /health via proxy")
+        _wait_for_api(config, client_state, config.ssh.start_timeout, client, stage_label="end-to-end via proxy")
     else:
         client = LlamaClient(config, state)
-        if not wait_for_api(config, state, config.ssh.start_timeout):
-            raise click.ClickException("[boot:end-to-end] timeout waiting for /health")
+        _wait_for_api(config, state, config.ssh.start_timeout, client, stage_label="end-to-end")
 
     # restore slot cache
     if cache_enabled:
@@ -1233,12 +1247,10 @@ def _do_restart(
         client_state.local_port = proxy_port
         client_state.unsecure = True
         client = LlamaClient(config, client_state)
-        if not wait_for_api(config, client_state, config.ssh.start_timeout):
-            raise click.ClickException("[boot:end-to-end] timeout waiting for /health via proxy")
+        _wait_for_api(config, client_state, config.ssh.start_timeout, client, stage_label="end-to-end via proxy")
     else:
         client = LlamaClient(config, state)
-        if not wait_for_api(config, state, config.ssh.start_timeout):
-            raise click.ClickException("[boot:end-to-end] timeout waiting for /health")
+        _wait_for_api(config, state, config.ssh.start_timeout, client, stage_label="end-to-end")
 
     # restore slot cache on restart
     if cache_enabled:
