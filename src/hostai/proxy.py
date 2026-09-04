@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import logging
 import os
@@ -531,13 +532,30 @@ class TokenizedProxy:
         await unix_site.start()
         sites.append(unix_site)
         os.chmod(self.socket_path, 0o600)
-        _logger.info("proxy listening on unix socket %s", self.socket_path)
+        print(f"proxy listening on unix socket {self.socket_path}")
 
         if self.port:
-            tcp_site = web.TCPSite(runner, "127.0.0.1", self.port)
-            await tcp_site.start()
+            tcp_site = web.TCPSite(
+                runner,
+                "127.0.0.1",
+                self.port,
+                reuse_address=True,
+            )
+            for attempt in range(10):
+                try:
+                    await tcp_site.start()
+                    break
+                except OSError as exc:
+                    if exc.errno == errno.EADDRINUSE and attempt < 9:
+                        print(
+                            f"port {self.port} in use, retrying in 0.5s "
+                            f"(attempt {attempt + 1}/10)"
+                        )
+                        await asyncio.sleep(0.5)
+                        continue
+                    raise
             sites.append(tcp_site)
-            _logger.info("proxy listening on tcp 127.0.0.1:%d", self.port)
+            print(f"proxy listening on tcp 127.0.0.1:{self.port}")
             self.state.local_port = self.port
             self.state.save()
 
@@ -578,11 +596,15 @@ async def _fetch_props_once(config: Config, state: State) -> Optional[Dict[str, 
     return None
 
 
-async def _wait_for_upstream_health(proxy: TokenizedProxy, interval: float = 2.0) -> bool:
+async def _wait_for_upstream_health(
+    proxy: TokenizedProxy,
+    server_task: asyncio.Task,
+    interval: float = 2.0,
+) -> bool:
     """Poll upstream /health until the model is ready to serve requests."""
     if proxy.session is None:
         return False
-    while True:
+    while not server_task.done():
         try:
             async with proxy.session.get(f"{proxy.upstream}/health") as response:
                 if response.status == 200:
@@ -590,19 +612,29 @@ async def _wait_for_upstream_health(proxy: TokenizedProxy, interval: float = 2.0
         except aiohttp.ClientError:
             pass
         await asyncio.sleep(interval)
+    # The server task died (likely a startup failure); re-raise its exception.
+    await server_task
+    return False
 
 
-async def _bootstrap_proxy(proxy: TokenizedProxy, config: Config, state: State) -> None:
+async def _bootstrap_proxy(
+    proxy: TokenizedProxy,
+    config: Config,
+    state: State,
+    server_task: asyncio.Task,
+) -> None:
     """Wait for the upstream, fetch /props, and configure the tokenizer."""
     # Wait for the web server to finish startup (which creates self.session).
     for _ in range(200):
         if proxy.session is not None:
             break
+        if server_task.done():
+            await server_task  # re-raise the server failure
         await asyncio.sleep(0.05)
     else:
         raise RuntimeError("proxy server did not start")
 
-    if not await _wait_for_upstream_health(proxy):
+    if not await _wait_for_upstream_health(proxy, server_task):
         raise RuntimeError("upstream /health did not become ready")
 
     props = await _fetch_props_once(config, state)
@@ -646,10 +678,11 @@ async def run_proxy(config: Config, state: State) -> None:
     server_task = asyncio.create_task(proxy.run())
 
     try:
-        await _bootstrap_proxy(proxy, config, state)
+        await _bootstrap_proxy(proxy, config, state, server_task)
     except Exception as exc:
         _logger.error("proxy bootstrap failed: %s", exc)
-        server_task.cancel()
+        if not server_task.done():
+            server_task.cancel()
         try:
             await server_task
         except asyncio.CancelledError:

@@ -263,6 +263,54 @@ def _resolve_profile(config: Config, name: str) -> Tuple[Profiles, Any, Any]:
     return profiles, p, image
 
 
+def _resolve_client_port(
+    config: Config,
+    *,
+    user_port: Optional[int] = None,
+    state_port: Optional[int] = None,
+) -> int:
+    """Return a local client port that is free on 127.0.0.1.
+
+    Honors the user-specified port (``--local-port`` or ``[proxy].port``) and
+    fails early if that exact port is in use.  For the default port the helper
+    searches for the next free port instead of starting a rental that will
+    later fail to bind.
+    """
+    user_set = False
+    if user_port is not None:
+        desired = user_port
+        user_set = True
+    elif config.proxy.port:
+        desired = config.proxy.port
+        user_set = True
+    elif state_port is not None:
+        desired = state_port
+    else:
+        desired = config.ssh.local_port or 18081
+
+    if not (1 <= desired <= 65535):
+        raise click.ClickException("client port must be between 1 and 65535")
+
+    if utils.port_is_free(desired, host="127.0.0.1"):
+        config.ssh.local_port = desired
+        return desired
+
+    if user_set:
+        raise click.ClickException(
+            f"client port {desired} is already in use; choose another with --local-port"
+        )
+
+    _log(f"[up] client port {desired} is in use; searching for a free port", err=True)
+    try:
+        free_port = utils.find_free_port(start=desired)
+    except RuntimeError:
+        raise click.ClickException("no free localhost port found")
+
+    _log(f"[up] using client port {free_port}", err=True)
+    config.ssh.local_port = free_port
+    return free_port
+
+
 def _env_dict(
     config: Config,
     profile: Any,
@@ -681,8 +729,9 @@ def _start_proxy(config: Config, state: State, client_api_scheme: str = "http") 
             pass
         return None
 
-    # Reload state; the proxy has updated local_port and saved pid.
-    state = State.load(state.state_file)
+    # Record the proxy pid/port in the same state object the caller will keep
+    # writing.  Reloading would create a fresh copy that the next state.save()
+    # in the caller would overwrite.
     state.data["proxy_pid"] = proc.pid
     state.local_port = port
     state.save()
@@ -747,6 +796,11 @@ def _do_fresh(
                 raise click.ClickException(
                     f"state file already references instance {old.instance_id}; run hostai down first"
                 )
+
+    # Resolve the client-side port before spending money on a rental.  Fail early
+    # when the user explicitly asked for a port that is already in use; otherwise
+    # search for a free port near the configured default.
+    local_port = _resolve_client_port(config, user_port=local_port)
 
     profiles, profile, image = _resolve_profile(config, profile_name)
     ctx_size = config.hostai.ctx_size_override if config.hostai.ctx_size_override else profile.ctx_size
@@ -1149,8 +1203,10 @@ def _do_restart(
         raise click.ClickException("no state to restart; run hostai up first")
 
     state.unsecure = unsecure
-    if local_port is not None:
-        state.local_port = local_port
+    resolved = _resolve_client_port(config, user_port=local_port, state_port=state.local_port)
+    if resolved != state.local_port:
+        state.local_port = resolved
+        state.save()
 
     inst = _provider(config).get_instance(state.instance_id)
     status = inst.get("actual_status") or inst.get("status") if inst else None
