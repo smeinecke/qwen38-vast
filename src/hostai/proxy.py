@@ -212,6 +212,7 @@ class TokenizedProxy:
         self.api_key = state.api_key or ""
         self.ssl_ctx = _ssl_context(state)
         self.session: Optional[aiohttp.ClientSession] = None
+        self.ready = False
         self.app = web.Application(client_max_size=64 * 1024 * 1024)
         self.app.router.add_post("/v1/chat/completions", self._chat)
         self.app.router.add_get("/v1/models", self._models)
@@ -242,8 +243,8 @@ class TokenizedProxy:
             await self.session.close()
 
     async def _chat(self, request: web.Request) -> web.StreamResponse:
-        if self.session is None:
-            raise web.HTTPServiceUnavailable(reason="proxy client not initialized")
+        if not self.ready or self.session is None:
+            raise web.HTTPServiceUnavailable(reason="proxy not ready")
 
         try:
             body = await request.json()
@@ -459,8 +460,8 @@ class TokenizedProxy:
         upstream_path: str,
     ) -> web.StreamResponse:
         """Pass an arbitrary request through to the upstream server."""
-        if self.session is None:
-            raise web.HTTPServiceUnavailable(reason="proxy client not initialized")
+        if not self.ready or self.session is None:
+            raise web.HTTPServiceUnavailable(reason="proxy not ready")
 
         headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
         body = await request.read()
@@ -492,6 +493,8 @@ class TokenizedProxy:
         return await self._forward_to_upstream(request, request.path)
 
     async def _models(self, request: web.Request) -> web.Response:
+        if not self.ready:
+            raise web.HTTPServiceUnavailable(reason="proxy not ready")
         model_id = self.config.model.model or "local"
         return web.json_response(
             {
@@ -508,8 +511,8 @@ class TokenizedProxy:
         )
 
     async def _health(self, request: web.Request) -> web.Response:
-        if self.session is None:
-            raise web.HTTPServiceUnavailable(reason="proxy client not initialized")
+        if not self.ready or self.session is None:
+            raise web.HTTPServiceUnavailable(reason="proxy not ready")
         try:
             async with self.session.get(f"{self.upstream}/health") as response:
                 text = await response.text()
@@ -575,6 +578,44 @@ async def _fetch_props_once(config: Config, state: State) -> Optional[Dict[str, 
     return None
 
 
+async def _wait_for_upstream_health(proxy: TokenizedProxy, interval: float = 2.0) -> bool:
+    """Poll upstream /health until the model is ready to serve requests."""
+    if proxy.session is None:
+        return False
+    while True:
+        try:
+            async with proxy.session.get(f"{proxy.upstream}/health") as response:
+                if response.status == 200:
+                    return True
+        except aiohttp.ClientError:
+            pass
+        await asyncio.sleep(interval)
+
+
+async def _bootstrap_proxy(proxy: TokenizedProxy, config: Config, state: State) -> None:
+    """Wait for the upstream, fetch /props, and configure the tokenizer."""
+    # Wait for the web server to finish startup (which creates self.session).
+    for _ in range(200):
+        if proxy.session is not None:
+            break
+        await asyncio.sleep(0.05)
+    else:
+        raise RuntimeError("proxy server did not start")
+
+    if not await _wait_for_upstream_health(proxy):
+        raise RuntimeError("upstream /health did not become ready")
+
+    props = await _fetch_props_once(config, state)
+    chat_template: Optional[str] = None
+    if props and props.get("chat_template"):
+        chat_template = props["chat_template"]
+        _logger.info("using chat template from remote /props")
+
+    proxy.tokenizer = Tokenizer(config, chat_template=chat_template)
+    proxy.ready = True
+    _logger.info("proxy ready")
+
+
 async def run_proxy(config: Config, state: State) -> None:
     """Start the local proxy for the active state.
 
@@ -596,12 +637,23 @@ async def run_proxy(config: Config, state: State) -> None:
     socket_path = Path(config.proxy.socket_path) if config.proxy.socket_path else _default_socket_path(state)
     port = config.proxy.port or config.ssh.local_port or 0
 
-    chat_template: Optional[str] = None
-    props = await _fetch_props_once(config, state)
-    if props and props.get("chat_template"):
-        chat_template = props["chat_template"]
-        _logger.info("using chat template from remote /props")
-
-    tokenizer = Tokenizer(config, chat_template=chat_template)
+    tokenizer = Tokenizer(config)
     proxy = TokenizedProxy(config, state, tokenizer, socket_path, port)
-    await proxy.run()
+
+    # Start the client-facing web server immediately so `hostai up` can see the
+    # port and move on to its own long `wait_for_api`. The upstream model load
+    # happens in the background and the proxy returns 503 until it is ready.
+    server_task = asyncio.create_task(proxy.run())
+
+    try:
+        await _bootstrap_proxy(proxy, config, state)
+    except Exception as exc:
+        _logger.error("proxy bootstrap failed: %s", exc)
+        server_task.cancel()
+        try:
+            await server_task
+        except asyncio.CancelledError:
+            pass
+        raise
+
+    await server_task
