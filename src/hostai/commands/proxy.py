@@ -14,7 +14,7 @@ from hostai.state import State, state_dir
 @click.command("proxy", help="Run a local OpenAI-compatible proxy that tokenizes prompts client-side.")
 @click.pass_obj
 def cmd_proxy(config):
-    state = State(state_dir(config.root_dir) / "state.json")
+    state = State.load(state_dir(config.root_dir) / "state.json")
     if not state.exists:
         raise click.ClickException("no active state; run 'hostai up' first")
 
