@@ -1,0 +1,115 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index fdc8f2b..f30282d 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -4156,7 +4156,7 @@ void server_context::set_state_callback(server_state_callback_t callback) {
+ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+             const server_http_req & req,
+             server_task_type type,
+-            const json & data,
++            json data,
+             const std::vector<raw_buffer> & files,
+             task_response_type res_type) {
+     GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
+@@ -4173,6 +4173,35 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+     try {
+         std::vector<server_task> tasks;
+ 
++        // For /completion with a tokenized prompt, the request body does not
++        // carry the chat parser that oaicompat_chat_params_parse would inject.
++        // Build it from the model template so reasoning can be parsed out.
++        if (type == SERVER_TASK_TYPE_COMPLETION && json_is_array_and_contains_numbers(data.at("prompt")) && !data.contains("chat_format")) {
++            common_chat_templates_inputs chat_inputs;
++            common_chat_msg msg;
++            msg.role = "user";
++            msg.content = "";
++            chat_inputs.messages = { msg };
++            chat_inputs.add_generation_prompt = true;
++            chat_inputs.use_jinja = meta->chat_params.use_jinja;
++            chat_inputs.enable_thinking = meta->chat_params.enable_thinking;
++            chat_inputs.reasoning_format = meta->chat_params.reasoning_format;
++            chat_inputs.chat_template_kwargs = meta->chat_params.chat_template_kwargs;
++            if (data.contains("reasoning_format")) {
++                chat_inputs.reasoning_format = common_reasoning_format_from_name(data.at("reasoning_format").get<std::string>());
++            }
++            const auto chat_params = common_chat_templates_apply(meta->chat_params.tmpls.get(), chat_inputs);
++            if (chat_params.format != COMMON_CHAT_FORMAT_CONTENT_ONLY) {
++                data["chat_format"] = static_cast<int>(chat_params.format);
++                if (!chat_params.parser.empty()) {
++                    data["chat_parser"] = chat_params.parser;
++                }
++                if (!chat_params.generation_prompt.empty()) {
++                    data["generation_prompt"] = chat_params.generation_prompt;
++                }
++            }
++        }
++
+         const auto & prompt = data.at("prompt");
+         // TODO: this log can become very long, put it behind a flag or think about a more compact format
+         //SRV_DBG("Prompt: %s\n", prompt.is_string() ? prompt.get<std::string>().c_str() : prompt.dump(2).c_str());
+diff --git a/tools/server/server-context.h b/tools/server/server-context.h
+index f9ab113..1ee704b 100644
+--- a/tools/server/server-context.h
++++ b/tools/server/server-context.h
+@@ -161,7 +161,7 @@ private:
+     std::unique_ptr<server_res_generator> handle_completions_impl(
+             const server_http_req & req,
+             server_task_type type,
+-            const json & data,
++            json data,
+             const std::vector<raw_buffer> & files,
+             task_response_type res_type);
+     std::unique_ptr<server_res_generator> handle_slots_save(const server_http_req & req, int id_slot);
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 64afbc5..1128f59 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -340,9 +340,10 @@ json server_task_result_cmpl_final::to_json() {
+ }
+ 
+ json server_task_result_cmpl_final::to_json_non_oaicompat() {
++    const std::string & out_content = oaicompat_msg.empty() ? content : oaicompat_msg.content;
+     json res = json {
+         {"index",               index},
+-        {"content",             content},
++        {"content",             out_content},
+         {"tokens",              tokens},
+         {"id_slot",             id_slot},
+         {"stop",                true},
+@@ -358,6 +359,9 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
+         {"tokens_cached",       n_tokens_cached},
+         {"timings",             stats.to_json()},
+     };
++    if (!oaicompat_msg.reasoning_content.empty()) {
++        res["reasoning_content"] = oaicompat_msg.reasoning_content;
++    }
+     if (!stream && !probs_output.empty()) {
+         res["completion_probabilities"] = completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs);
+     }
+@@ -1049,16 +1053,25 @@ json server_task_result_cmpl_partial::to_json() {
+ }
+ 
+ json server_task_result_cmpl_partial::to_json_non_oaicompat() {
++    std::string out_content;
++    std::string out_reasoning;
++    for (const auto & diff : oaicompat_msg_diffs) {
++        out_content += diff.content_delta;
++        out_reasoning += diff.reasoning_content_delta;
++    }
+     // non-OAI-compat JSON
+     json res = json {
+         {"index",            index},
+-        {"content",          content},
++        {"content",          out_content},
+         {"tokens",           tokens},
+         {"stop",             false},
+         {"id_slot",          id_slot},
+         {"tokens_predicted", n_decoded},
+         {"tokens_evaluated", n_prompt_tokens},
+     };
++    if (!out_reasoning.empty()) {
++        res["reasoning_content"] = out_reasoning;
++    }
+     // populate the timings object when needed (usually for the last response or with timings_per_token enabled)
+     if (stats.is_set()) {
+         res.push_back({"timings", stats.to_json()});

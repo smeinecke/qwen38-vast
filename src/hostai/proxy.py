@@ -31,6 +31,26 @@ _TOOL_CALL_RE = re.compile(
     re.DOTALL,
 )
 
+# The Qwen chat template puts the opening thinking marker into the prompt, so
+# generated output normally contains only the closing marker. Split on it.
+_THINK_START = "▶"
+_THINK_END = "◀"
+
+
+def _split_reasoning(content: str) -> Tuple[str, str]:
+    """Split raw completion output into (reasoning, answer).
+
+    The opening thinking marker lives in the prompt, so the model output
+    typically contains only the closing tag. If the model also emitted the
+    opening tag, it is stripped from the reasoning text.
+    """
+    if _THINK_END not in content:
+        return "", content
+    reasoning, answer = content.split(_THINK_END, 1)
+    if _THINK_START in reasoning:
+        reasoning = reasoning.split(_THINK_START, 1)[1]
+    return reasoning.strip(), answer.lstrip()
+
 
 def _parse_tool_calls(content: str) -> List[Dict[str, Any]]:
     """Parse Qwen-style <tool_call>...</tool_call> output into OpenAI tool_calls.
@@ -345,6 +365,9 @@ class TokenizedProxy:
             raise web.HTTPInternalServerError(reason=f"invalid upstream JSON: {exc}") from exc
 
         content = data.get("content", "")
+        reasoning = data.get("reasoning_content") or ""
+        if not reasoning:
+            reasoning, content = _split_reasoning(content)
         finish_reason = self._map_finish_reason(data)
         completion_tokens = data.get("tokens_predicted", 0) or 0
 
@@ -355,6 +378,8 @@ class TokenizedProxy:
                 finish_reason = "tool_calls"
         else:
             message = {"role": "assistant", "content": content}
+        if reasoning:
+            message["reasoning_content"] = reasoning
 
         output = {
             "id": f"chatcmpl-{os.urandom(12).hex()}",
@@ -395,6 +420,7 @@ class TokenizedProxy:
         completion_id = f"chatcmpl-{os.urandom(12).hex()}"
         model = self.config.model.model or "local"
         created = int(time.time())
+        sent_reasoning = False
 
         async for raw in response.content:
             for line in raw.decode("utf-8", errors="replace").splitlines():
@@ -409,8 +435,24 @@ class TokenizedProxy:
                 except json.JSONDecodeError:
                     continue
 
-                delta = obj.get("content", "")
+                # The final chunk carries the full content/reasoning_content,
+                # not deltas. Its content was already streamed, so only the
+                # reasoning blob is forwarded, and only when no deltas were sent.
                 stop = obj.get("stop", False)
+                if stop:
+                    delta_payload = {}
+                    reasoning = (obj.get("reasoning_content") or "") if not sent_reasoning else ""
+                    if reasoning:
+                        delta_payload["reasoning_content"] = reasoning
+                else:
+                    delta_payload = {}
+                    delta = obj.get("content", "")
+                    if delta:
+                        delta_payload["content"] = delta
+                    reasoning_delta = obj.get("reasoning_content", "")
+                    if reasoning_delta:
+                        delta_payload["reasoning_content"] = reasoning_delta
+                        sent_reasoning = True
 
                 chunk: Dict[str, Any] = {
                     "id": completion_id,
@@ -420,14 +462,13 @@ class TokenizedProxy:
                     "choices": [
                         {
                             "index": 0,
-                            "delta": {"content": delta},
+                            "delta": delta_payload,
                             "finish_reason": None,
                         }
                     ],
                 }
                 if stop:
                     chunk["choices"][0]["finish_reason"] = self._map_finish_reason(obj)
-                    chunk["choices"][0]["delta"] = {}
 
                 await stream.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
                 if stop:

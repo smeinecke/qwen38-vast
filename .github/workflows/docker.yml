@@ -31,6 +31,7 @@ jobs:
           filters: |
             docker:
               - 'Dockerfile'
+              - 'patches/**'
               - 'start.sh'
               - 'entrypoint.sh'
               - 'hostai-init-ssh.sh'

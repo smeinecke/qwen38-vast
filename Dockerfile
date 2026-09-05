@@ -47,11 +47,14 @@ RUN git init llama.cpp \
     && git checkout --detach FETCH_HEAD
 
 WORKDIR /src/llama.cpp
+COPY patches/llama-completion-reasoning.patch /tmp/llama-completion-reasoning.patch
 RUN curl -fL --retry 5 --retry-all-errors --connect-timeout 15 \
       "${FASTMTP_PATCH_URL}" -o /tmp/fastmtp.patch \
     && echo "${FASTMTP_PATCH_SHA256}  /tmp/fastmtp.patch" | sha256sum -c - \
     && git apply --check /tmp/fastmtp.patch \
-    && git apply /tmp/fastmtp.patch
+    && git apply /tmp/fastmtp.patch \
+    && git apply --check /tmp/llama-completion-reasoning.patch \
+    && git apply /tmp/llama-completion-reasoning.patch
 
 # GGML_NATIVE=OFF is important: GitHub-hosted builders have no NVIDIA GPU.
 # CUDA 12.8 lets llama.cpp include Ampere/Ada/Blackwell CUDA targets.

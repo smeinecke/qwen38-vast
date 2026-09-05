@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from hostai.proxy import TokenizedProxy, _parse_tool_calls
+from hostai.proxy import TokenizedProxy, _parse_tool_calls, _split_reasoning
 from hostai.tokenize import default_reasoning_kwargs
 
 
@@ -85,3 +85,22 @@ def test_parse_tool_calls_ignores_invalid_json():
     calls = _parse_tool_calls(content)
     assert len(calls) == 1
     assert calls[0]["function"]["name"] == "x"
+
+
+def test_split_reasoning_strips_orphan_closing_tag():
+    reasoning, answer = _split_reasoning("We need answer simple arithmetic.\u25c0\n\n4")
+    assert reasoning == "We need answer simple arithmetic."
+    assert answer == "4"
+
+
+def test_split_reasoning_strips_both_markers():
+    reasoning, answer = _split_reasoning("\u25b6thinking\u25c0\n\nanswer")
+    assert reasoning == "thinking"
+    assert answer == "answer"
+
+
+def test_split_reasoning_no_marker_returns_content():
+    reasoning, answer = _split_reasoning("plain answer")
+    assert reasoning == ""
+    assert answer == "plain answer"
+
