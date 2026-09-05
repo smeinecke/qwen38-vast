@@ -147,7 +147,7 @@ def _rclone_env_script(config: Config) -> str:
         lines.extend(
             [
                 f"pass_plain={pass_quoted}",
-                f'export RCLONE_CONFIG_{name}_PASS="$(printf \'%s\\n\' "$pass_plain" | rclone obscure)"',
+                f'export RCLONE_CONFIG_{name}_PASS="$(printf \'%s\\n\' "$pass_plain" | rclone obscure -)"',
                 "unset pass_plain",
             ]
         )

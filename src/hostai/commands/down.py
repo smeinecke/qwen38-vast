@@ -103,6 +103,21 @@ def _parse_rsync_transferred_bytes(stdout: str) -> Optional[int]:
     return None
 
 
+def _format_upload_log(res: Any) -> str:
+    """Combine stdout and stderr from the upload remote command into one log.
+
+    Capturing both is essential for diagnosing rclone/rsync failures because
+    the scripts intentionally write little or no stdout and report errors on
+    stderr.
+    """
+    parts = []
+    if res.stdout:
+        parts.append("=== STDOUT ===\n" + res.stdout)
+    if res.stderr:
+        parts.append("=== STDERR ===\n" + res.stderr)
+    return "".join(parts)
+
+
 def _upload_slot_cache_from_vast(
     ssh_url: str,
     config: Config,
@@ -128,7 +143,7 @@ def _upload_slot_cache_from_vast(
         res = ssh.run_remote(ssh_url, "bash -s", input_data=script, known_hosts=known_hosts, timeout=1800)
         if upload_log is not None:
             upload_log.parent.mkdir(parents=True, exist_ok=True)
-            upload_log.write_text(res.stdout or "")
+            upload_log.write_text(_format_upload_log(res))
         ok = res.returncode == 0 and "ok" in (res.stdout or "")
         return ok, None
 
@@ -171,7 +186,7 @@ echo "ok"
     res = ssh.run_remote(ssh_url, f"bash -s {arg_str}", input_data=script, known_hosts=known_hosts, timeout=1800)
     if upload_log is not None:
         upload_log.parent.mkdir(parents=True, exist_ok=True)
-        upload_log.write_text(res.stdout or "")
+        upload_log.write_text(_format_upload_log(res))
     ok = res.returncode == 0 and "ok" in (res.stdout or "")
     transferred = _parse_rsync_transferred_bytes(res.stdout or "") if ok else None
     return ok, transferred
@@ -288,6 +303,11 @@ def _save_and_upload_slot_cache(
         state.set("slot_cache_bytes_saved", n_written)
     else:
         click.echo("[slot-cache] WARNING: upload to cache server failed", err=True)
+        if upload_log.exists():
+            tail = "\n".join(upload_log.read_text().splitlines()[-30:])
+            if tail:
+                click.echo("[slot-cache] upload log tail:", err=True)
+                click.echo(tail, err=True)
         state.set("slot_cache_save", "upload-failed")
         if config.cache.require_save:
             state.save()
