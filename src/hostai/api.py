@@ -57,10 +57,13 @@ class LlamaClient:
         self.state = state
         self._api_key = state.api_key or ""
 
-        scheme = "http" if state.unsecure else "https"
+        # In tokenized-only mode the local hostai proxy (not the remote
+        # llama-server) is the client-facing endpoint and it speaks plain HTTP.
+        is_proxy = bool(config.proxy.tokenized_only)
+        scheme = "http" if (state.unsecure or is_proxy) else "https"
         self.base_url = f"{scheme}://127.0.0.1:{state.local_port}"
 
-        if state.unsecure or not state.tls_ca or not state.tls_ca.exists():
+        if state.unsecure or is_proxy or not state.tls_ca or not state.tls_ca.exists():
             self._verify: Union[bool, str] = False
         else:
             self._verify = str(state.tls_ca)

@@ -136,7 +136,8 @@ def _print_status(
     if instance:
         instance_status = instance.get("actual_status") or instance.get("status") or "unknown"
 
-    scheme = "http" if state.unsecure else "https"
+    # The local hostai proxy in tokenized-only mode is plain HTTP.
+    scheme = "http" if (state.unsecure or config.proxy.tokenized_only) else "https"
     api_url = f"{scheme}://127.0.0.1:{state.local_port}"
 
     table.add_row("Instance ID", str(state.instance_id))

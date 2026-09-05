@@ -103,7 +103,7 @@ def cmd_cache_copy(config: Config, slot: Optional[int]):
     run_dir.mkdir(parents=True, exist_ok=True)
     run_dir.chmod(0o700)
 
-    ok = down._save_and_upload_slot_cache(
+    details = down._save_and_upload_slot_cache(
         config,
         state,
         run_dir,
@@ -111,7 +111,7 @@ def cmd_cache_copy(config: Config, slot: Optional[int]):
         known_hosts=known_hosts,
         slot_id=slot,
     )
-    if not ok:
+    if not details or not details.get("uploaded"):
         raise click.ClickException("slot cache copy/upload failed")
 
     # Load save details for verification.

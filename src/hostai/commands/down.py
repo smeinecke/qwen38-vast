@@ -251,7 +251,9 @@ def _save_and_upload_slot_cache(
         f"({save_ms} ms); uploading to {config.cache.host}..."
     )
 
-    slot_dir = cache._default_local_dir(config)
+    # Use the actual slot dir recorded by up.py (it may have fallen back to
+    # disk after a /dev/shm preflight), falling back to the configured default.
+    slot_dir = state.slot_cache_local_dir or cache._default_local_dir(config)
     use_fastmtp = 1 if state.data.get("use_fastmtp", config.model.use_fastmtp) else 0
     metadata = {
         "schema_version": 1,
