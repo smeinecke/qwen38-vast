@@ -81,7 +81,7 @@ RUN --mount=type=cache,id=qwen38-ccache,target=/root/.cache/ccache,sharing=locke
 
 FROM ${RUNTIME_BASE} AS runtime
 
-ARG HF_HUB_VERSION=1.28.0
+ARG HF_HUB_VERSION=1.30.0
 ARG LLAMA_CPP_COMMIT=4df29be4f4c3673f428170fda944a5b19f743bb8
 ARG CUDA_ARCHITECTURES=86
 ARG HOSTAI_BUILD_PROFILE=custom
