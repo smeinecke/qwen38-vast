@@ -1,0 +1,120 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index f30282d..f918baa 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -667,8 +667,14 @@ struct server_slot {
+             };
+ 
+             if (!only_metrics) {
+-                res["prompt"] = ptask->tokens.detokenize(ctx_tgt, true);
+-                res["generated"] = generated_text.empty() ? debug_generated_text : generated_text;
++                if (ptask->params.token_only) {
++                    // token_only slots never produce text; expose ids instead
++                    res["prompt"] = ptask->tokens.get_tokens();
++                    res["generated"] = generated_tokens;
++                } else {
++                    res["prompt"] = ptask->tokens.detokenize(ctx_tgt, true);
++                    res["generated"] = generated_text.empty() ? debug_generated_text : generated_text;
++                }
+             }
+         }
+ 
+@@ -1769,7 +1775,7 @@ private:
+         slot.sampled = result.tok;
+ 
+         slot.generated_text += token_str;
+-        if (slot.task->params.return_tokens) {
++        if (slot.task->params.return_tokens || slot.task->params.token_only) {
+             slot.generated_tokens.push_back(result.tok);
+         }
+         slot.has_next_token = true;
+@@ -2007,7 +2013,7 @@ private:
+         res->oaicompat_cmpl_id = slot.task->params.oaicompat_cmpl_id;
+ 
+         // populate res.probs_output
+-        if (slot.task->params.sampling.n_probs > 0) {
++        if (slot.task->params.sampling.n_probs > 0 && !slot.task->params.token_only) {
+             res->prob_output = tkn; // copy the token probs
+         }
+ 
+@@ -2041,7 +2047,7 @@ private:
+             res->tokens      = std::move(slot.generated_tokens);
+         }
+         res->stats           = slot.stats;
+-        res->prompt          = slot.task->tokens.detokenize(ctx_tgt, true);
++        res->prompt          = slot.task->params.token_only ? "" : slot.task->tokens.detokenize(ctx_tgt, true);
+         res->response_fields = std::move(slot.task->params.response_fields);
+ 
+         res->truncated             = slot.truncated;
+@@ -2062,7 +2068,7 @@ private:
+         res->oaicompat_cmpl_id = slot.task->params.oaicompat_cmpl_id;
+ 
+         // populate res.probs_output
+-        if (slot.task->params.sampling.n_probs > 0) {
++        if (slot.task->params.sampling.n_probs > 0 && !slot.task->params.token_only) {
+             if (!slot.task->params.stream && slot.stop == STOP_TYPE_WORD) {
+                 const llama_tokens stop_word_toks = common_tokenize(ctx_tgt, slot.stopping_word, false);
+ 
+@@ -3780,10 +3786,12 @@ private:
+ 
+             completion_token_output result;
+             result.tok          = id;
+-            result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
++            result.text_to_send = slot.task->params.token_only
++                ? ""
++                : common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
+             result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
+ 
+-            if (slot.task->params.sampling.n_probs > 0) {
++            if (slot.task->params.sampling.n_probs > 0 && !slot.task->params.token_only) {
+                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
+             }
+ 
+@@ -3901,7 +3909,9 @@ private:
+                 completion_token_output result;
+ 
+                 result.tok          = ids[i];
+-                result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
++                result.text_to_send = slot.task->params.token_only
++                    ? ""
++                    : common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
+                 result.prob         = 1.0f; // set later
+ 
+                 // TODO: set result.probs
+@@ -4176,7 +4186,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+         // For /completion with a tokenized prompt, the request body does not
+         // carry the chat parser that oaicompat_chat_params_parse would inject.
+         // Build it from the model template so reasoning can be parsed out.
+-        if (type == SERVER_TASK_TYPE_COMPLETION && json_is_array_and_contains_numbers(data.at("prompt")) && !data.contains("chat_format")) {
++        // Skipped for token_only requests: no text is produced, so there is
++        // nothing to parse.
++        if (type == SERVER_TASK_TYPE_COMPLETION && json_is_array_and_contains_numbers(data.at("prompt")) && !data.contains("chat_format") && !data.value("token_only", false)) {
+             common_chat_templates_inputs chat_inputs;
+             common_chat_msg msg;
+             msg.role = "user";
+diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
+index 5d7fa6a..4655589 100644
+--- a/tools/server/server-schema.cpp
++++ b/tools/server/server-schema.cpp
+@@ -34,6 +34,9 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
+     add((new field_bool("return_tokens", params.return_tokens))
+         ->set_desc("Return the raw generated token ids in the `tokens` field"));
+ 
++    add((new field_bool("token_only", params.token_only))
++        ->set_desc("Suppress generated text entirely: skip detokenization, emit only token ids (implies `return_tokens`)"));
++
+     add((new field_bool("return_progress", params.return_progress))
+         ->set_desc("Include prompt processing progress events in stream mode"));
+ 
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index b6da4d4..6484bea 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -53,6 +53,7 @@ struct task_params {
+     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
+     bool return_tokens   = false;
+     bool return_progress = false;
++    bool token_only      = false; // suppress all generated text; output is token ids only
+ 
+     int32_t sse_ping_interval = 30; // seconds between SSE comment pings while the stream stays silent, -1 disables
+ 

@@ -4,7 +4,13 @@ import json
 
 import pytest
 
-from hostai.proxy import TokenizedProxy, _parse_tool_calls, _split_reasoning
+from hostai.proxy import (
+    TokenizedProxy,
+    _find_stop,
+    _parse_tool_calls,
+    _split_reasoning,
+    _TokenDetokenizer,
+)
 from hostai.tokenize import default_reasoning_kwargs
 
 
@@ -43,6 +49,8 @@ def test_build_completion_payload():
     assert payload["n_predict"] == 64
     assert payload["temperature"] == 0.7
     assert payload["stream"] is False
+    assert payload["return_tokens"] is True
+    assert payload["token_only"] is True
     assert payload["top_p"] == 0.9
     assert payload["frequency_penalty"] == 0.2
     assert payload["seed"] == 42
@@ -103,4 +111,84 @@ def test_split_reasoning_no_marker_returns_content():
     reasoning, answer = _split_reasoning("plain answer")
     assert reasoning == ""
     assert answer == "plain answer"
+
+
+class _FakeTokenizer:
+    """Decode stub mapping each token id to a fixed piece."""
+
+    def __init__(self, pieces):
+        self._pieces = pieces
+
+    def decode(self, token_ids, skip_special_tokens=True):
+        return "".join(self._pieces.get(i, "") for i in token_ids)
+
+
+def test_find_stop_returns_earliest_match():
+    assert _find_stop("hello STOP world END", ["END", "STOP"]) == 6
+    assert _find_stop("nothing here", ["x"]) == -1
+    assert _find_stop("abc", []) == -1
+
+
+def test_detokenizer_emits_content_incrementally():
+    tok = _FakeTokenizer({1: "Hello", 2: " ", 3: "world"})
+    detok = _TokenDetokenizer(tok, expect_reasoning=False)
+    assert detok.add([1]) == {"content": "Hello"}
+    assert detok.add([2, 3]) == {"content": " world"}
+    assert detok.finish() == {}
+
+
+def test_detokenizer_splits_reasoning_marker():
+    tok = _FakeTokenizer({1: "think ", 2: "hard", 3: "◀", 4: "answer"})
+    detok = _TokenDetokenizer(tok, expect_reasoning=True)
+    assert detok.add([1, 2]) == {"reasoning_content": "think hard"}
+    assert detok.add([3, 4]) == {"content": "answer"}
+
+
+def test_detokenizer_straddling_delta_splits_both_keys():
+    tok = _FakeTokenizer({1: "think", 2: "◀ans", 3: "wer"})
+    detok = _TokenDetokenizer(tok, expect_reasoning=True)
+    assert detok.add([1, 2, 3]) == {"reasoning_content": "think", "content": "answer"}
+
+
+def test_detokenizer_no_marker_all_reasoning_when_expected():
+    tok = _FakeTokenizer({1: "think", 2: "ing"})
+    detok = _TokenDetokenizer(tok, expect_reasoning=True)
+    assert detok.add([1, 2]) == {"reasoning_content": "thinking"}
+
+
+def test_detokenizer_stop_string_truncates():
+    tok = _FakeTokenizer({1: "alpha ", 2: "STOP", 3: " beta"})
+    detok = _TokenDetokenizer(tok, stop_strings=["STOP"], expect_reasoning=False)
+    delta = detok.add([1, 2, 3])
+    assert delta == {"content": "alpha "}
+    assert detok.stopped is True
+    # further tokens emit nothing
+    assert detok.add([4]) == {}
+
+
+def test_detokenizer_stop_holds_back_boundary_prefix():
+    # "STOP" split across decode boundary: "ST" then "OP more" - with a
+    # 4-char stop the last 3 decoded chars are held back until the match
+    # resolves.
+    tok = _FakeTokenizer({1: "say ST", 2: "OP more", 3: " tail"})
+    detok = _TokenDetokenizer(tok, stop_strings=["STOP"], expect_reasoning=False)
+    # len("say ST")=6, holdback=3 -> emits "say"; " ST" is held back.
+    assert detok.add([1]) == {"content": "say"}
+    # Decoded "say STOP more": stop matches at 4, text truncates to "say ".
+    delta = detok.add([2])
+    assert delta == {"content": " "}
+    assert detok.stopped is True
+
+
+def test_detokenizer_finish_flushes_holdback():
+    tok = _FakeTokenizer({1: "abc", 2: "def"})
+    detok = _TokenDetokenizer(tok, stop_strings=["ZZZZ"], expect_reasoning=False)
+    assert detok.add([1, 2]) == {"content": "abc"}
+    assert detok.finish() == {"content": "def"}
+
+
+def test_detokenizer_strips_leading_open_marker():
+    tok = _FakeTokenizer({1: "▶think", 2: "◀", 3: "ok"})
+    detok = _TokenDetokenizer(tok, expect_reasoning=True)
+    assert detok.add([1, 2, 3]) == {"reasoning_content": "think", "content": "ok"}
 
