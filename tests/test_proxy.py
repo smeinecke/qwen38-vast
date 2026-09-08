@@ -96,12 +96,18 @@ def test_parse_tool_calls_ignores_invalid_json():
 
 
 def test_split_reasoning_strips_orphan_closing_tag():
-    reasoning, answer = _split_reasoning("We need answer simple arithmetic.\u25c0\n\n4")
+    reasoning, answer = _split_reasoning("We need answer simple arithmetic.</think>\n\n4")
     assert reasoning == "We need answer simple arithmetic."
     assert answer == "4"
 
 
 def test_split_reasoning_strips_both_markers():
+    reasoning, answer = _split_reasoning("<think>thinking</think>\n\nanswer")
+    assert reasoning == "thinking"
+    assert answer == "answer"
+
+
+def test_split_reasoning_accepts_legacy_arrow_marker():
     reasoning, answer = _split_reasoning("\u25b6thinking\u25c0\n\nanswer")
     assert reasoning == "thinking"
     assert answer == "answer"
@@ -138,22 +144,37 @@ def test_detokenizer_emits_content_incrementally():
 
 
 def test_detokenizer_splits_reasoning_marker():
-    tok = _FakeTokenizer({1: "think ", 2: "hard", 3: "◀", 4: "answer"})
+    tok = _FakeTokenizer({1: "think ", 2: "hard", 3: "</think>", 4: "answer"})
     detok = _TokenDetokenizer(tok, expect_reasoning=True)
-    assert detok.add([1, 2]) == {"reasoning_content": "think hard"}
-    assert detok.add([3, 4]) == {"content": "answer"}
+    # The marker holdback keeps the last len("</think>")-1 chars pending.
+    assert detok.add([1, 2]) == {"reasoning_content": "thi"}
+    assert detok.add([3, 4]) == {"reasoning_content": "nk hard"}
+    assert detok.finish() == {"content": "answer"}
 
 
 def test_detokenizer_straddling_delta_splits_both_keys():
-    tok = _FakeTokenizer({1: "think", 2: "◀ans", 3: "wer"})
+    tok = _FakeTokenizer({1: "think", 2: "</think>ans", 3: "wer"})
     detok = _TokenDetokenizer(tok, expect_reasoning=True)
-    assert detok.add([1, 2, 3]) == {"reasoning_content": "think", "content": "answer"}
+    assert detok.add([1, 2, 3]) == {"reasoning_content": "think"}
+    assert detok.finish() == {"content": "answer"}
+
+
+def test_detokenizer_marker_straddling_decode_boundary():
+    # "…</thi" then "nk>ans" - the 7-char marker holdback keeps the partial
+    # marker from being emitted as reasoning.
+    tok = _FakeTokenizer({1: "wor", 2: "ds</thi", 3: "nk>", 4: "ans"})
+    detok = _TokenDetokenizer(tok, expect_reasoning=True)
+    assert detok.add([1, 2]) == {"reasoning_content": "wor"}
+    assert detok.add([3, 4]) == {"reasoning_content": "ds"}
+    assert detok.finish() == {"content": "ans"}
 
 
 def test_detokenizer_no_marker_all_reasoning_when_expected():
     tok = _FakeTokenizer({1: "think", 2: "ing"})
     detok = _TokenDetokenizer(tok, expect_reasoning=True)
-    assert detok.add([1, 2]) == {"reasoning_content": "thinking"}
+    # "thinking" is 7 chars; the marker holdback keeps it pending until finish.
+    assert detok.add([1, 2]) == {"reasoning_content": "t"}
+    assert detok.finish() == {"reasoning_content": "hinking"}
 
 
 def test_detokenizer_stop_string_truncates():
@@ -188,7 +209,8 @@ def test_detokenizer_finish_flushes_holdback():
 
 
 def test_detokenizer_strips_leading_open_marker():
-    tok = _FakeTokenizer({1: "▶think", 2: "◀", 3: "ok"})
+    tok = _FakeTokenizer({1: "<think>think", 2: "</think>", 3: "ok"})
     detok = _TokenDetokenizer(tok, expect_reasoning=True)
-    assert detok.add([1, 2, 3]) == {"reasoning_content": "think", "content": "ok"}
+    assert detok.add([1, 2, 3]) == {"reasoning_content": "think"}
+    assert detok.finish() == {"content": "ok"}
 

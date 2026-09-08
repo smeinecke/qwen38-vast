@@ -32,9 +32,20 @@ _TOOL_CALL_RE = re.compile(
 )
 
 # The Qwen chat template puts the opening thinking marker into the prompt, so
-# generated output normally contains only the closing marker. Split on it.
-_THINK_START = "▶"
-_THINK_END = "◀"
+# generated output normally contains only the closing tag. Split on it. Both
+# the canonical ``</think>`` and the ``◀`` variant are accepted.
+_THINK_START_MARKERS = ("<think>", "▶")
+_THINK_END_MARKERS = ("</think>", "◀")
+
+
+def _find_marker(text: str, markers: Tuple[str, ...]) -> int:
+    """Return the index of the earliest marker occurrence, or -1."""
+    pos = -1
+    for marker in markers:
+        i = text.find(marker)
+        if i >= 0 and (pos < 0 or i < pos):
+            pos = i
+    return pos
 
 
 def _split_reasoning(content: str) -> Tuple[str, str]:
@@ -44,11 +55,19 @@ def _split_reasoning(content: str) -> Tuple[str, str]:
     typically contains only the closing tag. If the model also emitted the
     opening tag, it is stripped from the reasoning text.
     """
-    if _THINK_END not in content:
+    end = _find_marker(content, _THINK_END_MARKERS)
+    if end < 0:
         return "", content
-    reasoning, answer = content.split(_THINK_END, 1)
-    if _THINK_START in reasoning:
-        reasoning = reasoning.split(_THINK_START, 1)[1]
+    reasoning = content[:end]
+    answer = content[end:]
+    for marker in _THINK_END_MARKERS:
+        if answer.startswith(marker):
+            answer = answer[len(marker) :]
+            break
+    start = _find_marker(reasoning, _THINK_START_MARKERS)
+    if start >= 0:
+        marker = next(m for m in _THINK_START_MARKERS if reasoning.startswith(m, start))
+        reasoning = reasoning[start + len(marker) :]
     return reasoning.strip(), answer.lstrip()
 
 
@@ -111,23 +130,29 @@ def _find_stop(text: str, stops: List[str]) -> int:
 def _split_delta(text: str, start: int, end: int, expect_reasoning: bool) -> Dict[str, str]:
     """Split the new range ``text[start:end]`` into reasoning/content delta keys.
 
-    ``◀`` (when ``expect_reasoning`` is set) separates reasoning from the final
-    answer: everything before it is reasoning, everything after is content.
-    Without an expected marker, or before it appears, text is attributed to the
-    current phase.
+    The closing thinking marker (when ``expect_reasoning`` is set) separates
+    reasoning from the final answer: everything before it is reasoning,
+    everything after is content. Without an expected marker, or before it
+    appears, text is attributed to the current phase.
     """
     if start >= end:
         return {}
-    marker = text.find(_THINK_END) if expect_reasoning else -1
+    marker = _find_marker(text, _THINK_END_MARKERS) if expect_reasoning else -1
+    marker_len = 0
+    if marker >= 0:
+        marker_len = len(next(m for m in _THINK_END_MARKERS if text.startswith(m, marker)))
     delta: Dict[str, str] = {}
     if marker < 0:
         delta["reasoning_content" if expect_reasoning else "content"] = text[start:end]
         return delta
     reasoning = text[start : min(end, marker)]
-    content = text[max(start, marker + 1) : end]
+    content = text[max(start, marker + marker_len) : end]
     if reasoning:
-        if start == 0 and reasoning.startswith(_THINK_START):
-            reasoning = reasoning[len(_THINK_START) :]
+        if start == 0:
+            for m in _THINK_START_MARKERS:
+                if reasoning.startswith(m):
+                    reasoning = reasoning[len(m) :]
+                    break
         if reasoning:
             delta["reasoning_content"] = reasoning
     if content:
@@ -157,9 +182,13 @@ class _TokenDetokenizer:
         self._emitted = 0
         self._cut = -1
         self.stopped = False
-        # Hold back trailing chars so a stop string that straddles a chunk
-        # boundary can still be detected before its prefix is emitted.
-        self._holdback = max(0, max((len(s) for s in self._stops), default=0) - 1)
+        # Hold back trailing chars so a stop string or reasoning marker that
+        # straddles a decode boundary can still be detected before its prefix
+        # is emitted.
+        boundary_lengths = [len(s) for s in self._stops]
+        if expect_reasoning:
+            boundary_lengths += [len(m) for m in _THINK_END_MARKERS]
+        self._holdback = max(0, max(boundary_lengths, default=0) - 1)
 
     def add(self, token_ids: List[int]) -> Dict[str, str]:
         """Append generated token ids and return the new delta text."""
