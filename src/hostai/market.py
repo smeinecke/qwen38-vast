@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import click
+import pycountry
 
 from hostai.config import Config
 from hostai.profiles import Profile, Profiles, re_normalize_gpu
@@ -638,6 +639,20 @@ def _format_transfer_cost(cost: float) -> str:
     return f"${cost:.4f}/GB"
 
 
+def _format_country(geolocation: Optional[str]) -> str:
+    """Convert a country code to "Name Flag" or return the raw value."""
+    if not geolocation:
+        return "?"
+    raw = geolocation.strip()
+    code = raw.upper()
+    if len(code) == 2:
+        country = pycountry.countries.get(alpha_2=code)
+        if country is not None:
+            name = getattr(country, "common_name", None) or country.name
+            return f"{name} {country.flag}"
+    return raw
+
+
 def offer_summary(offer: Dict[str, Any]) -> str:
     """Human-readable one-line summary of an offer."""
     dph = _effective_dph(offer)
@@ -653,10 +668,12 @@ def offer_summary(offer: Dict[str, Any]) -> str:
         extras.append(f"score={scoring.score:.6f}")
     if offer.get("is_bid") or offer.get("type") == "bid":
         extras.append("bid")
+    loc = _format_country(offer.get("geolocation") or offer.get("location"))
     summary = (
         f"{gpu} | ${dph:.4f}/h | "
         f"down={down} ({_format_transfer_cost(down_cost)}) | "
-        f"up={up} ({_format_transfer_cost(up_cost)}) | offer={offer_id}"
+        f"up={up} ({_format_transfer_cost(up_cost)}) | "
+        f"{loc} | offer={offer_id}"
     )
     if extras:
         summary += f" | {' '.join(extras)}"

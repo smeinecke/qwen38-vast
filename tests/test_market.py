@@ -338,3 +338,33 @@ def test_parse_duration_to_seconds():
     assert utils.parse_duration_to_seconds("") is None
     with pytest.raises(ValueError):
         utils.parse_duration_to_seconds("abc")
+
+
+def test_offer_summary_includes_country_name_and_flag():
+    offer = {
+        "id": 1,
+        "gpu_name": "RTX 4090",
+        "dph_total": 0.5,
+        "inet_down": 800,
+        "inet_up": 100,
+        "inet_down_cost": 0.0001,
+        "inet_up_cost": 0.0001,
+        "geolocation": "DE",
+    }
+    summary = market.offer_summary(offer)
+    assert "Germany 🇩🇪" in summary
+
+
+def test_offer_summary_country_falls_back_to_raw_value():
+    offer = {
+        "id": 2,
+        "gpu_name": "RTX 4090",
+        "dph_total": 0.5,
+        "inet_down": 800,
+        "inet_up": 100,
+        "inet_down_cost": 0.0001,
+        "inet_up_cost": 0.0001,
+        "geolocation": "local",
+    }
+    summary = market.offer_summary(offer)
+    assert "local" in summary
