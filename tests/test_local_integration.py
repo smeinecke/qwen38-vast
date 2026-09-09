@@ -9,6 +9,7 @@ The image can be built with:
 """
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -43,14 +44,9 @@ def _integration_image() -> str:
     return os.environ.get("HOSTAI_LOCAL_IMAGE", "hostai-test:latest")
 
 
-def _container_count() -> int:
-    result = subprocess.run(
-        ["docker", "ps", "-a", "-q", "--filter", "label=hostai.provider=local"],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    return len([line for line in result.stdout.splitlines() if line.strip()])
+def _sanitize_test_label(name: str) -> str:
+    """Sanitize a directory name the same way LocalProvider._test_label does."""
+    return re.sub(r"[^a-z0-9_.-]", "-", name.lower()).strip("-.") or "hostai-test"
 
 
 @pytest.fixture
@@ -65,20 +61,41 @@ def project_dir(tmp_path):
 
 
 @pytest.fixture
-def local_env():
+def local_test_label(project_dir) -> str:
+    """A unique Docker label for this test's containers."""
+    return _sanitize_test_label(project_dir.name)
+
+
+@pytest.fixture
+def local_env(local_test_label):
     env = dict(os.environ)
     env["HOSTAI_PROVIDER"] = "local"
     env["HOSTAI_LOCAL_IMAGE"] = os.environ.get("HOSTAI_LOCAL_IMAGE", "hostai-test:latest")
     env["HOSTAI_PROFILES_FILE"] = "profiles.json"
     env["GHCR_IMAGE_BASE"] = "ghcr.io/smeinecke/qwen38-vast"
+    env["HOSTAI_LOCAL_TEST_LABEL"] = local_test_label
     return env
+
+
+@pytest.fixture
+def container_count(local_test_label):
+    """Return a callable that counts only containers tagged for this test."""
+    def _count() -> int:
+        result = subprocess.run(
+            ["docker", "ps", "-a", "-q", "--filter", f"label=hostai.test={local_test_label}"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return len([line for line in result.stdout.splitlines() if line.strip()])
+    return _count
 
 
 @pytest.mark.skipif(not _has_docker(), reason="docker not available")
 @pytest.mark.skipif(
     not _image_exists(_integration_image()), reason=f"integration image {_integration_image()} not built"
 )
-def test_local_up_down_lifecycle(project_dir, local_env, monkeypatch):
+def test_local_up_down_lifecycle(project_dir, local_env, monkeypatch, container_count):
     """Run `hostai up` and `hostai down` against the local Docker backend."""
     runner = CliRunner(env=local_env)
     monkeypatch.chdir(project_dir)
@@ -91,7 +108,7 @@ def test_local_up_down_lifecycle(project_dir, local_env, monkeypatch):
     if runs_dir.exists():
         shutil.rmtree(runs_dir)
 
-    before = _container_count()
+    before = container_count()
     result = runner.invoke(
         cli,
         ["up", "--unsecure", "--no-cache", "v100-128k"],
@@ -104,7 +121,7 @@ def test_local_up_down_lifecycle(project_dir, local_env, monkeypatch):
     assert "http://127.0.0.1:" in result.output
 
     # The container should exist.
-    assert _container_count() == before + 1
+    assert container_count() == before + 1
 
     # API should be healthy through the tunnel.
     api_base = [line for line in result.output.splitlines() if "API:" in line][0].split()[-1]
@@ -125,7 +142,7 @@ def test_local_up_down_lifecycle(project_dir, local_env, monkeypatch):
     assert "destroyed" in down_result.output
 
     # Container should be gone.
-    assert _container_count() == before
+    assert container_count() == before
 
 
 @pytest.mark.skipif(not _has_docker(), reason="docker not available")
@@ -156,7 +173,7 @@ def test_local_up_shm_size_configurable(project_dir):
 @pytest.mark.skipif(
     not _image_exists(_integration_image()), reason=f"integration image {_integration_image()} not built"
 )
-def test_local_up_with_small_shm(project_dir, local_env, monkeypatch):
+def test_local_up_with_small_shm(project_dir, local_env, monkeypatch, container_count):
     """A /dev/shm smaller than the cache minimum falls back to disk slot cache."""
     runner = CliRunner(env=local_env)
     monkeypatch.chdir(project_dir)
@@ -175,7 +192,7 @@ def test_local_up_with_small_shm(project_dir, local_env, monkeypatch):
     env["HOSTAI_SLOT_CACHE_USER"] = "root"
     runner = CliRunner(env=env)
 
-    before = _container_count()
+    before = container_count()
     result = runner.invoke(
         cli,
         ["up", "--unsecure", "v100-128k"],
@@ -187,14 +204,14 @@ def test_local_up_with_small_shm(project_dir, local_env, monkeypatch):
 
     down_result = runner.invoke(cli, ["down", "--yes"], catch_exceptions=False, obj=None)
     assert down_result.exit_code == 0, down_result.output
-    assert _container_count() == before
+    assert container_count() == before
 
 
 @pytest.mark.skipif(not _has_docker(), reason="docker not available")
 @pytest.mark.skipif(
     not _image_exists(_integration_image()), reason=f"integration image {_integration_image()} not built"
 )
-def test_local_up_socket_delay_regression(project_dir, local_env, monkeypatch):
+def test_local_up_socket_delay_regression(project_dir, local_env, monkeypatch, container_count):
     """A 15-second socket delay is covered by a 60-second global boot deadline."""
     env = dict(local_env)
     env["START_TIMEOUT"] = "60"
@@ -202,7 +219,7 @@ def test_local_up_socket_delay_regression(project_dir, local_env, monkeypatch):
     runner = CliRunner(env=env)
     monkeypatch.chdir(project_dir)
 
-    before = _container_count()
+    before = container_count()
     result = runner.invoke(
         cli,
         ["up", "--unsecure", "--no-cache", "v100-128k"],
@@ -211,18 +228,18 @@ def test_local_up_socket_delay_regression(project_dir, local_env, monkeypatch):
     )
     assert result.exit_code == 0, result.output
     assert "[boot:end-to-end] /health OK" in result.output
-    assert _container_count() == before + 1
+    assert container_count() == before + 1
 
     down_result = runner.invoke(cli, ["down", "--yes"], catch_exceptions=False, obj=None)
     assert down_result.exit_code == 0, down_result.output
-    assert _container_count() == before
+    assert container_count() == before
 
 
 @pytest.mark.skipif(not _has_docker(), reason="docker not available")
 @pytest.mark.skipif(
     not _image_exists(_integration_image()), reason=f"integration image {_integration_image()} not built"
 )
-def test_local_up_socket_timeout_regression(project_dir, local_env, monkeypatch):
+def test_local_up_socket_timeout_regression(project_dir, local_env, monkeypatch, container_count):
     """A socket delay that exceeds the global deadline fails with a precise stage error and cleans up."""
     env = dict(local_env)
     env["START_TIMEOUT"] = "30"
@@ -230,7 +247,7 @@ def test_local_up_socket_timeout_regression(project_dir, local_env, monkeypatch)
     runner = CliRunner(env=env)
     monkeypatch.chdir(project_dir)
 
-    before = _container_count()
+    before = container_count()
     result = runner.invoke(
         cli,
         ["up", "--unsecure", "--no-cache", "v100-128k"],
@@ -242,4 +259,4 @@ def test_local_up_socket_timeout_regression(project_dir, local_env, monkeypatch)
     assert "[boot:end-to-end] timeout" in result.output or "timeout" in result.output.lower()
 
     # Cleanup should remove the container.
-    assert _container_count() == before
+    assert container_count() == before
