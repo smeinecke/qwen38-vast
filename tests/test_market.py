@@ -1,5 +1,9 @@
 """Tests for hostai.market: query, filtering, scoring, and hardware rank."""
 
+import json
+from unittest import mock
+
+import click
 import pytest
 
 from hostai import market, utils
@@ -353,6 +357,58 @@ def test_offer_summary_includes_country_name_and_flag():
     }
     summary = market.offer_summary(offer)
     assert "Germany 🇩🇪" in summary
+
+
+def test_historical_per_gpu_stats(tmp_path):
+    runs = tmp_path / "runs"
+    run_dir = runs / "r1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "metadata.json").write_text(json.dumps({
+        "started_epoch": 9999999999,
+        "gpu": "RTX_4090",
+        "startup_seconds": 45.0,
+    }))
+    bench_dir = run_dir / "benchmarks" / "b1"
+    bench_dir.mkdir(parents=True)
+    (bench_dir / "metrics.json").write_text(json.dumps({
+        "performance": {"prompt_tps": 100.0, "decode_tps": 200.0},
+        "session": {"gpu": "RTX_4090"},
+    }))
+    stats = market.historical_per_gpu_stats(runs, min_samples=1, max_age_days=9999)
+    assert "rtx4090" in stats
+    assert stats["rtx4090"]["prompt_tps"] == 100.0
+    assert stats["rtx4090"]["startup_seconds"] == 45.0
+
+
+def test_historical_per_gpu_stats_missing_runs_dir(tmp_path):
+    runs = tmp_path / "nope"
+    assert market.historical_per_gpu_stats(runs) == {}
+
+
+def test_select_offer_no_matches(config):
+    profiles = Profiles(
+        schema_version=1,
+        images=[],
+        profiles=[make_profile()],
+        monitor_hardware=MonitorHardware(),
+        market_policy=MarketPolicy(),
+    )
+    with mock.patch("hostai.market.search_offers", return_value=[]):
+        with pytest.raises(click.ClickException, match="no matching offer"):
+            market.select_offer(config, profiles, "query", max_dph=0.5, unverified=False, offer=None, storage=35)
+
+
+def test_select_offer_specific_id_not_found(config):
+    profiles = Profiles(
+        schema_version=1,
+        images=[],
+        profiles=[make_profile()],
+        monitor_hardware=MonitorHardware(),
+        market_policy=MarketPolicy(),
+    )
+    with mock.patch("hostai.market.search_offers", return_value=[{"id": 2, "dph_total": 0.3}]):
+        with pytest.raises(click.ClickException, match="no matching offer for id 1"):
+            market.select_offer(config, profiles, "query", max_dph=0.5, unverified=False, offer=1, storage=35)
 
 
 def test_offer_summary_country_falls_back_to_raw_value():

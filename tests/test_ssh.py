@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from unittest import mock
+from unittest.mock import AsyncMock
 
 from hostai import ssh
 from hostai.state import State
@@ -125,3 +126,67 @@ def test_wait_for_ssh_returns_false_without_url(tmp_path):
 
 def test_local_port_is_open_not_open():
     assert ssh._local_port_is_open(0, timeout=1) is False
+
+
+class _FakeConn:
+    def __init__(self, result=None, fail=False):
+        self.result = result
+        self.fail = fail
+    async def __aenter__(self):
+        if self.fail:
+            raise Exception("conn fail")
+        return self
+    async def __aexit__(self, *args):
+        return None
+    async def run(self, *args, **kwargs):
+        return self.result
+
+
+def _make_connect(result=None, fail=False):
+    return mock.Mock(return_value=_FakeConn(result=result, fail=fail))
+
+
+def test_run_remote_success(tmp_path):
+    result = mock.Mock(returncode=0, stdout=b"ok", stderr=b"")
+    with mock.patch("asyncssh.connect", _make_connect(result)):
+        cp = ssh.run_remote("ssh://root@host:22", "echo ok", known_hosts=tmp_path / "kh")
+    assert cp.returncode == 0
+    assert cp.stdout == "ok"
+
+
+def test_run_remote_no_url():
+    cp = ssh.run_remote(None, "ls", known_hosts=Path("/tmp/kh"))
+    assert cp.returncode == 1
+
+
+def test_run_remote_exception():
+    with mock.patch("asyncssh.connect", _make_connect(fail=True)):
+        cp = ssh.run_remote("ssh://root@host:22", "ls", known_hosts=Path("/tmp/kh"))
+    assert cp.returncode == 1
+
+
+def test_is_ssh_reachable_true():
+    result = mock.Mock(returncode=0, stdout="ok", stderr="")
+    with mock.patch("asyncssh.connect", _make_connect(result)):
+        assert ssh.is_ssh_reachable("ssh://root@host:22", known_hosts=Path("/tmp/kh")) is True
+
+
+def test_wait_for_ssh_returns_true(tmp_path):
+    result = mock.Mock(returncode=0, stdout="ok", stderr="")
+    with mock.patch("asyncssh.connect", _make_connect(result)):
+        assert ssh.wait_for_ssh("ssh://root@host:22", known_hosts=tmp_path / "kh", timeout=3) is True
+
+
+def test_scp_to_success(tmp_path):
+    local = tmp_path / "local.txt"
+    local.write_text("x")
+    with mock.patch("asyncssh.scp", new_callable=AsyncMock):
+        cp = ssh.scp_to("ssh://root@host:22", local, "/remote", known_hosts=tmp_path / "kh")
+    assert cp.returncode == 0
+
+
+def test_scp_from_success(tmp_path):
+    local = tmp_path / "down.txt"
+    with mock.patch("asyncssh.scp", new_callable=AsyncMock):
+        cp = ssh.scp_from("ssh://root@host:22", "/remote", local, known_hosts=tmp_path / "kh")
+    assert cp.returncode == 0

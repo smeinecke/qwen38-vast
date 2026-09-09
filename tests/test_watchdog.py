@@ -168,3 +168,27 @@ def test_run_once_max_runtime_active_waits(config, running_state):
                 config, running_state, {}, 0, 10, 0, 0
             )
     assert shutdown is False
+
+
+def test_run_watchdog_no_state_file(config, project_dir, capsys):
+    config.root_dir = project_dir
+    watchdog.run_watchdog(config)
+
+
+def test_run_watchdog_no_instance(config, project_dir, running_state):
+    config.root_dir = project_dir
+    running_state.instance_id = None
+    running_state.save()
+    watchdog.run_watchdog(config)
+
+
+def test_run_watchdog_loop_exits(config, project_dir, running_state):
+    config.root_dir = project_dir
+    config.vast.idle_timeout_seconds = 60
+    running_state.instance_id = 12345
+    running_state.started_epoch = 1
+    running_state.save()
+    with mock.patch("hostai.commands.watchdog._run_once", return_value=({}, 0, True, 0, 0)):
+        with mock.patch("time.sleep"):
+            with mock.patch("time.time", return_value=0):
+                watchdog.run_watchdog(config)

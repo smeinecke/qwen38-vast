@@ -1,6 +1,7 @@
 """Tests for hostai.commands.up helpers."""
 
 import base64
+import contextlib
 from pathlib import Path
 from unittest import mock
 
@@ -10,6 +11,7 @@ from click.testing import CliRunner
 
 from hostai.commands import up
 from hostai.state import State
+from hostai.validate import ValidationRecord
 
 
 def test_now_helpers():
@@ -216,6 +218,57 @@ def _make_image_mock():
     return image
 
 
+def test_cmd_up_validation_errors(config, project_dir):
+    config.hostai.default_profile = "test"
+    runner = CliRunner()
+    for args, expected in [
+        (["--local-port", "0"], "must be between"),
+        (["--max-price", "-1"], "non-negative"),
+        (["--bid", "0"], "positive"),
+        (["--scoring-mode", "invalid"], "dph, perf, or session"),
+    ]:
+        result = runner.invoke(up.cmd_up, args, obj=config)
+        assert result.exit_code != 0
+        assert expected in result.output
+
+
+def test_cmd_up_no_profile(config, project_dir):
+    config.hostai.default_profile = ""
+    runner = CliRunner()
+    result = runner.invoke(up.cmd_up, [], obj=config)
+    assert result.exit_code != 0
+    assert "no profile" in result.output
+
+
+def test_cmd_up_scoring_and_keep_flags(config, project_dir):
+    config.hostai.default_profile = "test"
+    runner = CliRunner()
+    with mock.patch("hostai.commands.up._resolve_client_port", return_value=18080):
+        with mock.patch("hostai.commands.up._resolve_profile", return_value=(mock.Mock(), _make_profile_mock(), _make_image_mock())):
+            with mock.patch("hostai.commands.up.image_for_profile", return_value="ghcr.io/test"):
+                with mock.patch("hostai.commands.up.market.resolved_disk_gb", return_value=35):
+                    with mock.patch("hostai.commands.up.market.build_search_query", return_value=("query", 1.0)):
+                        with mock.patch("hostai.commands.up.market.select_offer", return_value={"id": 1, "dph_total": 0.5, "gpu_name": "A100"}):
+                            with mock.patch("hostai.commands.up.market.offer_summary", return_value="summary"):
+                                provider = mock.Mock()
+                                provider.name = "vast"
+                                with mock.patch("hostai.commands.up._provider", return_value=provider):
+                                    with mock.patch("hostai.commands.up._do_fresh_core"):
+                                        result = runner.invoke(up.cmd_up, ["--scoring-mode", "perf", "--keep-on-failure", "--dry-run"], obj=config)
+    assert result.exit_code == 0
+    assert config.market.scoring_mode == "perf"
+    assert config.vast.keep_on_failure is True
+
+
+def test_cmd_up_restart(config, project_dir):
+    config.hostai.default_profile = "test"
+    runner = CliRunner()
+    with mock.patch("hostai.commands.up._do_restart") as restart:
+        result = runner.invoke(up.cmd_up, ["--restart"], obj=config)
+    assert result.exit_code == 0
+    restart.assert_called_once()
+
+
 def test_cmd_up_dry_run(config, project_dir):
     config.hostai.default_profile = "test"
     runner = CliRunner()
@@ -234,6 +287,39 @@ def test_cmd_up_dry_run(config, project_dir):
     assert result.exit_code == 0
     provider.create_instance.assert_not_called()
     core.assert_not_called()
+
+
+def test_do_fresh_core_tokenized(config, project_dir):
+    state = _make_state(project_dir)
+    config.proxy.tokenized_only = True
+    config.cache.enabled = False
+    client = mock.Mock()
+    with mock.patch("hostai.commands.up._wait_for_ssh_endpoint"):
+        with mock.patch("hostai.commands.up.ssh.wait_for_ssh", return_value=True):
+            with mock.patch("hostai.commands.up.ssh.run_remote", return_value=mock.Mock(returncode=0)):
+                with mock.patch("hostai.commands.up._start_proxy", return_value=18083):
+                    with mock.patch("hostai.commands.up.State.load", return_value=state):
+                        with mock.patch("hostai.commands.up._write_env_file") as write_env:
+                            with mock.patch("hostai.commands.up.LlamaClient", return_value=client):
+                                with mock.patch("hostai.commands.up._wait_for_api"):
+                                    with mock.patch("hostai.commands.up._capture_disk_telemetry", return_value=None):
+                                        with mock.patch("hostai.commands.up.maybe_start_watchdog"):
+                                            with mock.patch("hostai.commands.up.maybe_start_monitor"):
+                                                up._do_fresh_core(config, state, _make_image_mock(), no_cache=True, abort_if_shm_too_small=False)
+    assert state.status == "running"
+    write_env.assert_called_once()
+
+
+def test_do_fresh_core_tokenized_proxy_fails(config, project_dir):
+    state = _make_state(project_dir)
+    config.proxy.tokenized_only = True
+    config.cache.enabled = False
+    with mock.patch("hostai.commands.up._wait_for_ssh_endpoint"):
+        with mock.patch("hostai.commands.up.ssh.wait_for_ssh", return_value=True):
+            with mock.patch("hostai.commands.up.ssh.run_remote", return_value=mock.Mock(returncode=0)):
+                with mock.patch("hostai.commands.up._start_proxy", return_value=0):
+                    with pytest.raises(click.ClickException, match="proxy.*failed"):
+                        up._do_fresh_core(config, state, _make_image_mock(), no_cache=True, abort_if_shm_too_small=False)
 
 
 def test_cmd_up_fresh(config, project_dir):
@@ -260,7 +346,7 @@ def test_cmd_up_fresh(config, project_dir):
     assert core.called
 
 
-def test_do_fresh_core_no_cache_unsecure(config, project_dir):
+def _make_state(project_dir, **overrides):
     state = State(project_dir / ".hostai-vast" / "state.json")
     state.instance_id = 12345
     state.ssh_url = "ssh://root@203.0.113.1:2222"
@@ -273,24 +359,189 @@ def test_do_fresh_core_no_cache_unsecure(config, project_dir):
     state.image = "ghcr.io/test"
     state.gpu = "A100"
     state.ctx_size = 32768
+    state.local_port = 18080
     state.run_dir = project_dir / "run-123"
     state.run_dir.mkdir()
+    for k, v in overrides.items():
+        setattr(state, k, v)
     state.save()
+    return state
+
+
+def _fresh_core_mocks(config, state):
+    client = mock.Mock()
+    patches = [
+        mock.patch("hostai.commands.up._wait_for_ssh_endpoint"),
+        mock.patch("hostai.commands.up.ssh.wait_for_ssh", return_value=True),
+        mock.patch("hostai.commands.up.ssh.run_remote", return_value=mock.Mock(returncode=0)),
+        mock.patch("hostai.commands.up.ssh.ensure_tunnel", return_value=18080),
+        mock.patch("hostai.commands.up.State.load", return_value=state),
+        mock.patch("hostai.commands.up.LlamaClient", return_value=client),
+        mock.patch("hostai.commands.up._wait_for_api"),
+        mock.patch("hostai.commands.up._capture_disk_telemetry", return_value=None),
+        mock.patch("hostai.commands.up.maybe_start_watchdog"),
+        mock.patch("hostai.commands.up.maybe_start_monitor"),
+    ]
+    stack = contextlib.ExitStack()
+    for p in patches:
+        stack.enter_context(p)
+    write_env = stack.enter_context(mock.patch("hostai.commands.up._write_env_file"))
+    return stack, write_env
+
+
+def test_do_fresh_core_no_cache_unsecure(config, project_dir):
+    state = _make_state(project_dir)
+    config.proxy.tokenized_only = False
+    config.cache.enabled = False
+    stack, _ = _fresh_core_mocks(config, state)
+    with stack:
+        up._do_fresh_core(config, state, _make_image_mock(), no_cache=True, abort_if_shm_too_small=False)
+    assert state.status == "running"
+
+
+def test_do_fresh_core_with_cache_and_tls(config, project_dir):
+    state = _make_state(project_dir, slot_cache_enabled=True, unsecure=False)
+    config.proxy.tokenized_only = False
+    config.cache.enabled = True
+    config.cache.use_shm = False
+    config.cache.rclone = False
+    config.cache.local_dir = "/var/lib/qwen38/slots"
+    stack, _ = _fresh_core_mocks(config, state)
+    with stack:
+        with mock.patch("hostai.commands.up.tls.ensure_local_tls_dir", return_value=Path("/tmp/tls")):
+            with mock.patch("hostai.commands.up.tls.generate_cert"):
+                with mock.patch("hostai.commands.up.tls.deliver_cert", return_value=True):
+                    with mock.patch("hostai.commands.up.cache.validate_cache_config", return_value=True):
+                        with mock.patch("hostai.commands.up.cache.install_cache_key_on_vast", return_value=True):
+                            with mock.patch("hostai.commands.up._common.fetch_llama_commit", return_value="commit"):
+                                with mock.patch("hostai.commands.up._shm_preflight", return_value=0):
+                                    with mock.patch("hostai.commands.up.cache._signature_for_state", return_value="sig"):
+                                        with mock.patch("hostai.commands.up.cache.remote_cache_dir", return_value="remote"):
+                                            with mock.patch("hostai.commands.up._prefetch_slot_cache_to_vast", return_value=False):
+                                                with mock.patch("hostai.commands.up.cache._default_local_dir", return_value="/var/lib/qwen38/slots"):
+                                                    up._do_fresh_core(config, state, _make_image_mock(), no_cache=False, abort_if_shm_too_small=False)
+    assert state.status == "running"
+
+
+def test_check_production_validation_non_vast(config):
+    config.provider.backend = "local"
+    up._check_production_validation(config, allow_unvalidated=False)
+
+
+def test_check_production_validation_disabled(config):
+    config.provider.backend = "vast"
+    config.vast.require_production_validation = False
+    up._check_production_validation(config, allow_unvalidated=False)
+
+
+def test_check_production_validation_passes(config, project_dir):
+    config.provider.backend = "vast"
+    config.vast.require_production_validation = True
+    previous = ValidationRecord(
+        timestamp="",
+        result="ok",
+        duration_seconds=0.0,
+        git_commit="abc",
+        dirty=False,
+        image="img",
+        image_id="id",
+        image_digest="dig",
+        profile_hash="h",
+        errors=[],
+        level="production",
+        checks_run=["integration-tests"],
+    )
+    with mock.patch("hostai.commands.up.load_last_validation", return_value=previous):
+        with mock.patch("hostai.commands.up.utils.git_commit", return_value="abc"):
+            with mock.patch("hostai.commands.up.utils.is_dirty_tree", return_value=False):
+                with mock.patch("hostai.commands.up.utils.file_hash", return_value="h"):
+                    with mock.patch("hostai.commands.up._image_info", return_value=("id", "dig")):
+                        with mock.patch("hostai.commands.up.compare_validations", return_value=[]):
+                            record = up._check_production_validation(config, allow_unvalidated=False)
+    assert record is not None
+
+
+def test_check_production_validation_drift_raises(config):
+    config.provider.backend = "vast"
+    config.vast.require_production_validation = True
+    previous = ValidationRecord(
+        timestamp="",
+        result="ok",
+        duration_seconds=0.0,
+        git_commit="abc",
+        dirty=False,
+        image="img",
+        image_id="id",
+        image_digest="dig",
+        profile_hash="h",
+        errors=[],
+        level="production",
+        checks_run=["integration-tests"],
+    )
+    with mock.patch("hostai.commands.up.load_last_validation", return_value=previous):
+        with mock.patch("hostai.commands.up.utils.git_commit", return_value="def"):
+            with mock.patch("hostai.commands.up.utils.is_dirty_tree", return_value=False):
+                with mock.patch("hostai.commands.up.utils.file_hash", return_value="h"):
+                    with mock.patch("hostai.commands.up._image_info", return_value=("id", "dig")):
+                        with mock.patch("hostai.commands.up.compare_validations", return_value=["git commit drift"]):
+                            with pytest.raises(click.ClickException):
+                                up._check_production_validation(config, allow_unvalidated=False)
+
+
+def test_do_restart_no_cache_unsecure(config, project_dir):
+    state = _make_state(project_dir)
     config.proxy.tokenized_only = False
     config.cache.enabled = False
     client = mock.Mock()
-    with mock.patch("hostai.commands.up._wait_for_ssh_endpoint"):
-        with mock.patch("hostai.commands.up.ssh.wait_for_ssh", return_value=True):
-            with mock.patch("hostai.commands.up.ssh.run_remote") as run:
-                run.return_value = mock.Mock(returncode=0)
-                with mock.patch("hostai.commands.up.ssh.ensure_tunnel", return_value=18080):
-                    with mock.patch("hostai.commands.up.State.load", return_value=state):
-                        with mock.patch("hostai.commands.up._write_env_file") as write_env:
-                            with mock.patch("hostai.commands.up.LlamaClient", return_value=client):
-                                with mock.patch("hostai.commands.up._wait_for_api"):
-                                    with mock.patch("hostai.commands.up._capture_disk_telemetry", return_value=None):
-                                        with mock.patch("hostai.commands.up.maybe_start_watchdog"):
-                                            with mock.patch("hostai.commands.up.maybe_start_monitor"):
-                                                up._do_fresh_core(config, state, _make_image_mock(), no_cache=True, abort_if_shm_too_small=False)
+    provider = mock.Mock()
+    provider.get_instance.return_value = {"actual_status": "stopped"}
+    with mock.patch("hostai.commands.up._check_production_validation"):
+        with mock.patch("hostai.commands.up._resolve_client_port", return_value=18080):
+            with mock.patch("hostai.commands.up._provider", return_value=provider):
+                with mock.patch("hostai.commands.up._wait_for_ssh_endpoint"):
+                    with mock.patch("hostai.commands.up.ssh.wait_for_ssh", return_value=True):
+                        with mock.patch("hostai.commands.up.ssh.ensure_tunnel", return_value=18080):
+                            with mock.patch("hostai.commands.up.State.load", return_value=state):
+                                with mock.patch("hostai.commands.up._write_env_file"):
+                                    with mock.patch("hostai.commands.up.LlamaClient", return_value=client):
+                                        with mock.patch("hostai.commands.up._wait_for_api"):
+                                            with mock.patch("hostai.commands.up.maybe_start_watchdog"):
+                                                with mock.patch("hostai.commands.up.maybe_start_monitor"):
+                                                    up._do_restart(config, "test", None, True, no_cache=True)
     assert state.status == "running"
-    write_env.assert_called_once()
+    provider.start_instance.assert_called_once()
+
+
+def test_do_restart_with_cache_and_tls(config, project_dir):
+    state = _make_state(project_dir, slot_cache_enabled=True, unsecure=False)
+    state.data["llama_cpp_commit"] = "commit123"
+    config.proxy.tokenized_only = False
+    config.cache.enabled = True
+    config.cache.use_shm = False
+    config.cache.rclone = False
+    client = mock.Mock()
+    client.slot_restore.return_value = True
+    provider = mock.Mock()
+    provider.get_instance.return_value = {"actual_status": "running"}
+    with mock.patch("hostai.commands.up._check_production_validation"):
+        with mock.patch("hostai.commands.up._resolve_client_port", return_value=18080):
+            with mock.patch("hostai.commands.up._provider", return_value=provider):
+                with mock.patch("hostai.commands.up._wait_for_ssh_endpoint"):
+                    with mock.patch("hostai.commands.up.ssh.wait_for_ssh", return_value=True):
+                        with mock.patch("hostai.commands.up.ssh.ensure_tunnel", return_value=18080):
+                            with mock.patch("hostai.commands.up.State.load", return_value=state):
+                                with mock.patch("hostai.commands.up.tls.ensure_local_tls_dir", return_value=Path("/tmp/tls")):
+                                    with mock.patch("hostai.commands.up.Path.exists", return_value=True):
+                                        with mock.patch("hostai.commands.up.tls.deliver_cert", return_value=True):
+                                            with mock.patch("hostai.commands.up.cache.validate_cache_config", return_value=True):
+                                                with mock.patch("hostai.commands.up.cache.install_cache_key_on_vast", return_value=True):
+                                                    with mock.patch("hostai.commands.up.cache._signature_for_state", return_value="sig"):
+                                                        with mock.patch("hostai.commands.up.cache.remote_cache_dir", return_value="remote"):
+                                                            with mock.patch("hostai.commands.up._prefetch_slot_cache_to_vast", return_value=False):
+                                                                with mock.patch("hostai.commands.up._write_env_file"):
+                                                                    with mock.patch("hostai.commands.up.LlamaClient", return_value=client):
+                                                                        with mock.patch("hostai.commands.up._wait_for_api"):
+                                                                            with mock.patch("hostai.commands.up.maybe_start_watchdog"):
+                                                                                with mock.patch("hostai.commands.up.maybe_start_monitor"):
+                                                                                    up._do_restart(config, "test", None, False, no_cache=False)
+    assert state.status == "running"
