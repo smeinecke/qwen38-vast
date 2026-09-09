@@ -1,5 +1,6 @@
 """Additional tests for hostai.commands.down."""
 
+import json
 from unittest import mock
 
 from click.testing import CliRunner
@@ -64,6 +65,46 @@ def test_client_log_writes_to_file(tmp_path):
 def test_format_upload_log_handles_bytes():
     res = mock.Mock(stdout="uploaded 12345 bytes", stderr="")
     assert down._format_upload_log(res) == "=== STDOUT ===\nuploaded 12345 bytes"
+
+
+def _make_slot_response(payload, status=200):
+    resp = mock.Mock(status_code=status, text=json.dumps(payload))
+    resp.json.return_value = payload
+    return resp
+
+
+def test_slot_save_success(config, running_state):
+    running_state.instance_id = 12345
+    running_state.local_port = 18080
+    payload = {"n_saved": 100, "n_written": 1000, "timings": {"save_ms": 50}}
+    with mock.patch("requests.post", return_value=_make_slot_response(payload)):
+        details = down._slot_save(config, running_state)
+    assert details is not None
+    assert details["n_saved"] == 100
+
+
+def test_slot_save_bad_status(config, running_state):
+    running_state.instance_id = 12345
+    running_state.local_port = 18080
+    response = mock.Mock(status_code=500, text="")
+    response.json.return_value = {}
+    with mock.patch("requests.post", return_value=response):
+        details = down._slot_save(config, running_state)
+    assert details is None
+
+
+def test_parse_rsync_transferred_bytes_kilobytes():
+    stdout = "Total bytes sent: 1.5K\n"
+    assert down._parse_rsync_transferred_bytes(stdout) == 1536
+
+
+def test_parse_rsync_transferred_bytes_sent_line():
+    stdout = "sent 2.25M bytes  received 79 bytes\n"
+    assert down._parse_rsync_transferred_bytes(stdout) == 2359296
+
+
+def test_parse_rsync_transferred_bytes_no_match():
+    assert down._parse_rsync_transferred_bytes("") is None
 
 
 def test_archive_session_creates_json(config, state, tmp_path):
