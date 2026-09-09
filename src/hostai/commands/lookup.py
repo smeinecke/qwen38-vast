@@ -83,7 +83,7 @@ def _render_table(offers: List[Dict[str, Any]], max_results: int) -> None:
             _fmt_num(o.get("dph_total")),
             _fmt_num(o.get("discounted_dph_total")),
             _fmt_num(o.get("reliability2") or o.get("reliability"), ".2f"),
-            str(o.get("geolocation") or "?"),
+            market._format_country(o.get("geolocation")),
             _fmt_num(o.get("inet_down_cost"), ".6f"),
             _fmt_num(o.get("inet_up_cost"), ".6f"),
         )

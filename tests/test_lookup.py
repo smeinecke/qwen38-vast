@@ -127,15 +127,42 @@ def test_cmd_lookup_with_offers(config, project_dir):
         profiles.market_policy.require_free_traffic = False
         from_file.return_value = profiles
 
-        runner = CliRunner()
+        runner = CliRunner(env={"COLUMNS": "160"})
         result = runner.invoke(cmd_lookup, ["--max-results", "1"], obj=config)
 
     assert result.exit_code == 0
     assert "RTX 4090" in result.output
+    assert "United States \U0001f1fa\U0001f1f8" in result.output
     assert provider.search_offers.call_count == 1
     call_args = provider.search_offers.call_args
     assert "RTX 4090" in call_args.args[0]
     assert call_args.kwargs == {"limit": 50, "order": "dph_total", "storage": config.market.disk_gb}
+
+
+def test_cmd_lookup_country_fallback(config, project_dir):
+    provider = _mock_provider([make_offer({"geolocation": "local"})])
+    with (
+        mock.patch("hostai.commands.lookup.Profiles.from_file") as from_file,
+        mock.patch("hostai.commands.lookup.get_provider", return_value=provider),
+    ):
+        profile = mock.Mock()
+        profile.name = "test"
+        profile.gpu_query = "gpu_name == RTX 4090"
+        profile.ctx_size = 32768
+        profile.image = "test-image"
+        image = mock.Mock()
+        image.cuda_arch = "89"
+        profiles = mock.Mock()
+        profiles.resolve_profile.return_value = profile
+        profiles.image_by_name.return_value = image
+        profiles.market_policy.require_free_traffic = False
+        from_file.return_value = profiles
+
+        runner = CliRunner(env={"COLUMNS": "160"})
+        result = runner.invoke(cmd_lookup, ["--max-results", "1"], obj=config)
+
+    assert result.exit_code == 0
+    assert "local" in result.output
 
 
 def test_cmd_lookup_invalid_max_results(config):
