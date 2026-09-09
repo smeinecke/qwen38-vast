@@ -30,7 +30,7 @@ HOSTAI_PROFILE="${HOSTAI_PROFILE:-custom}"
 SLOT_SAVE_PATH_DEFAULT="${SLOT_SAVE_PATH:-/var/lib/qwen38/slots}"
 SLOT_SAVE_PATH="${HOSTAI_SLOT_CACHE_LOCAL_DIR:-$SLOT_SAVE_PATH_DEFAULT}"
 if [[ "$SLOT_SAVE_PATH" == /dev/shm/* ]]; then
-  slot_min_gb="${HOSTAI_SLOT_CACHE_MIN_GB:-${HOSTAI_SHM_MIN_GB:-32}}"
+  slot_min_gb="${HOSTAI_SLOT_CACHE_MIN_GB:-${HOSTAI_SHM_MIN_GB:-30}}"
   if [[ "$slot_min_gb" =~ ^[0-9]+$ ]]; then
     shm_avail=$(df -P -B1 /dev/shm | awk 'NR==2{print $4}')
     min_bytes=$((slot_min_gb * 1024 * 1024 * 1024))

@@ -86,7 +86,7 @@ def test_cache_copy_happy_path(config, running_state, project_dir):
     def fake_save(cfg, st, rd, **kwargs):
         # Simulate _save_and_upload_slot_cache writing the save file.
         (rd / "cache-save.json").write_text(json.dumps({"n_written": 1024}))
-        return True
+        return {"uploaded": True}
 
     key_path = project_dir / "cache_key"
     key_path.write_text("private")

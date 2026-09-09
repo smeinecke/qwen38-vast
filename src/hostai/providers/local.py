@@ -116,9 +116,28 @@ class LocalProvider(Provider):
         if not shutil.which("docker"):
             raise LocalProviderError("docker command not found; is Docker installed?")
         self._docker = "docker"
-        self._ssh_private_key, self._ssh_public_key = self._ensure_ssh_key()
-        self.config.secrets["SSH_PUBLIC_KEY"] = self._ssh_public_key
-        self.config.secrets["SSH_PRIVATE_KEY"] = str(self._ssh_private_key)
+
+        # Respect a user-supplied keypair.  If only a public key is provided,
+        # we still generate a provider key so hostai can SSH into the
+        # container, but the user's key is also authorized.
+        user_private = config.secrets.get("SSH_PRIVATE_KEY")
+        user_public = config.secrets.get("SSH_PUBLIC_KEY")
+        if user_private and user_public:
+            self._ssh_private_key = Path(user_private)
+            self._ssh_public_key = user_public
+            # Ensure config.secrets has the path values the rest of the app
+            # expects (it already should, but be defensive).
+            self.config.secrets["SSH_PRIVATE_KEY"] = user_private
+            self.config.secrets["SSH_PUBLIC_KEY"] = user_public
+        else:
+            self._ssh_private_key, self._ssh_public_key = self._ensure_ssh_key()
+            if user_public:
+                self.config.secrets["SSH_PUBLIC_KEY"] = user_public
+            if user_private:
+                self.config.secrets["SSH_PRIVATE_KEY"] = user_private
+            else:
+                self.config.secrets["SSH_PRIVATE_KEY"] = str(self._ssh_private_key)
+
         self._state_file = state_dir(config.root_dir) / "local-provider.json"
         self._state = self._load_state()
 
@@ -186,12 +205,13 @@ class LocalProvider(Provider):
         extra: Optional[str] = None,
         runtype: Optional[str] = None,
         args: Optional[str] = None,
+        ports: Optional[List[int]] = None,
         force: bool = False,
         cancel_unavail: bool = False,
         template_hash: Optional[str] = None,
         volume_info: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        _ = price, bid_price, runtype, args, force, cancel_unavail, template_hash, volume_info
+        _ = price, bid_price, runtype, args, ports, force, cancel_unavail, template_hash, volume_info
         offer = next((o for o in _LOCAL_OFFERS if o["id"] == offer_id or o["ask_contract_id"] == offer_id), None)
         if not offer:
             raise LocalProviderError(f"unknown local offer {offer_id}")
@@ -204,7 +224,10 @@ class LocalProvider(Provider):
         run_env = {k: v for k, v in env.items() if self._is_valid_env_key(k)}
         run_env.setdefault("HOSTAI_PROVIDER", "local")
         run_env.setdefault("HOSTAI_LOCAL_INSTANCE", str(instance_id))
-        run_env["HOSTAI_SSH_PUBLIC_KEY_B64"] = base64_if_needed(self._ssh_public_key)
+        run_env["HOSTAI_SSH_PUBLIC_KEY_B64"] = _merge_public_keys_b64(
+            run_env.get("HOSTAI_SSH_PUBLIC_KEY_B64"),
+            base64_if_needed(self._ssh_public_key),
+        )
 
         container_name = f"hostai-test-{instance_id}-{secrets.token_hex(4)}"
 
@@ -533,3 +556,29 @@ def base64_if_needed(value: str) -> str:
     except Exception:
         pass
     return base64.b64encode(value.encode()).decode()
+
+
+def _merge_public_keys_b64(*keys: Optional[str]) -> str:
+    """Merge one or more base64-encoded public-key strings into one.
+
+    Values may be literal base64 blobs or already-base64; each is decoded,
+    the resulting OpenSSH lines are de-duplicated, and the final list is
+    base64-encoded back into the single runtime variable.
+    """
+    import base64
+
+    lines: List[str] = []
+    for key in keys:
+        if not key:
+            continue
+        try:
+            decoded = base64.b64decode(key, validate=True).decode()
+        except Exception:
+            # Not valid base64 (should not happen); skip to keep container
+            # startup from failing because of a malformed config value.
+            continue
+        for line in decoded.strip().splitlines():
+            line = line.strip()
+            if line and line not in lines:
+                lines.append(line)
+    return base64.b64encode("\n".join(lines).encode()).decode()

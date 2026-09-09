@@ -389,7 +389,8 @@ def _env_dict(
         env["HOSTAI_SLOT_CACHE_SESSION"] = session
         env["HOSTAI_SLOT_CACHE_MAX_GB"] = str(config.cache.max_gb)
         env["HOSTAI_SLOT_CACHE_USE_SHM"] = "1" if config.cache.use_shm else "0"
-        env["HOSTAI_SLOT_CACHE_MIN_GB"] = str(config.cache.shm_min_gb)
+        # A value of 0 means "use the runtime default" (30 GB).
+        env["HOSTAI_SLOT_CACHE_MIN_GB"] = str(config.cache.shm_min_gb or 30)
         env["HOSTAI_SLOT_CACHE_LOCAL_DIR"] = slot_dir
         if config.cache.rclone:
             env["HOSTAI_SLOT_CACHE_RCLONE"] = "1"
@@ -1100,7 +1101,7 @@ def _do_fresh_core(
                 state.ssh_url,
                 config,
                 known_hosts,
-                config.cache.shm_min_gb,
+                config.cache.shm_min_gb or 30,
             )
             if shm_rc == 1:
                 if abort_if_shm_too_small or config.cache.shm_require:
@@ -1298,7 +1299,7 @@ def _do_restart(
                     state.ssh_url,
                     config,
                     known_hosts,
-                    config.cache.shm_min_gb,
+                    config.cache.shm_min_gb or 30,
                 )
                 if shm_rc == 1:
                     if config.cache.shm_require:

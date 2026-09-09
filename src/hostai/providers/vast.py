@@ -7,11 +7,13 @@ from this module for backward compatibility.
 
 from __future__ import annotations
 
+import shlex
 from typing import Any, Dict, List, Optional
 
 from vastai.api.client import VastClient
 from vastai.api.instances import (
-    create_instance,
+    build_create_instance_payload,
+    create_instance_from_payload,
     destroy_instance,
     show_instance,
     show_instances,
@@ -118,6 +120,7 @@ class VastProvider(Provider):
         extra: Optional[str] = None,
         runtype: Optional[str] = None,
         args: Optional[str] = None,
+        ports: Optional[List[int]] = None,
         force: bool = False,
         cancel_unavail: bool = False,
         template_hash: Optional[str] = None,
@@ -126,32 +129,26 @@ class VastProvider(Provider):
         if price is not None and bid_price is not None:
             raise ProviderError("pass either price or bid_price, not both")
         client = self._client(timeout=120.0)
-        if bid_price is not None:
-            return create_instance(
-                client,
-                offer_id,
-                image=image,
-                disk=int(disk),
-                env=env,
-                bid_price=bid_price,
-                label=label,
-                extra=extra,
-                runtype=runtype,
-                args=args,
-                force=force,
-                cancel_unavail=cancel_unavail,
-                template_hash=template_hash,
-                volume_info=volume_info,
-            )
-        return create_instance(
-            client,
-            offer_id,
+
+        # Vast's `env` payload is used for Docker-style options (port
+        # mappings, hostname, etc.) in addition to environment variables.
+        # In practice bare environment-variable keys in the `env` object are
+        # not reliably applied to the container, while `-e KEY=VAL` tokens
+        # passed through the `extra` Docker options string are.  Keep the
+        # port mapping (`-p 22:22`) in `env` and duplicate the real
+        # environment variables as `-e ...` flags in `extra` so they reach
+        # the container regardless of how Vast parses `env`.
+        price_for_payload = bid_price if bid_price is not None else price
+        extra_env = _build_extra_env(env)
+        full_extra = " ".join([s for s in (extra, extra_env) if s]).strip() or None
+
+        json_blob = build_create_instance_payload(
             image=image,
-            disk=int(disk),
+            disk=disk,
             env=env,
-            price=price,
+            price=price_for_payload,
             label=label,
-            extra=extra,
+            extra=full_extra,
             runtype=runtype,
             args=args,
             force=force,
@@ -159,6 +156,7 @@ class VastProvider(Provider):
             template_hash=template_hash,
             volume_info=volume_info,
         )
+        return create_instance_from_payload(client, offer_id, json_blob)
 
     def destroy_instance(self, instance_id: int) -> Dict[str, Any]:
         client = self._client(timeout=self.config.vast.destroy_timeout_seconds)
@@ -175,6 +173,21 @@ class VastProvider(Provider):
 
 # Backward-compatible module-level aliases used by older code/tests.
 VastError = ProviderError
+
+
+def _build_extra_env(env: Dict[str, str]) -> str:
+    """Return a Docker option string with `-e KEY=VAL` for real env vars.
+
+    Port mapping / docker-option keys such as `-p 22:22` are left in `env`
+    and skipped here; real environment variables are quoted with `shlex.quote`
+    so spaces in paths or values survive Vast's Docker option parsing.
+    """
+    parts: List[str] = []
+    for key, value in env.items():
+        if key.startswith("-"):
+            continue
+        parts.append(f"-e {key}={shlex.quote(value)}")
+    return " ".join(parts)
 
 
 def _client(api_key: str, timeout: float = 120.0) -> VastClient:

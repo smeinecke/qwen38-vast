@@ -89,7 +89,9 @@ def test_start(config):
 
 def test_create_instance_from_offer(config):
     config = config_with_key(config)
-    with mock.patch("hostai.providers.vast.create_instance", return_value={"id": 42}) as create:
+    with mock.patch(
+        "hostai.providers.vast.create_instance_from_payload", return_value={"id": 42}
+    ) as create:
         result = vast.create_instance_from_offer(
             config,
             1,
@@ -99,10 +101,14 @@ def test_create_instance_from_offer(config):
             price=0.5,
         )
     assert result["id"] == 42
-    assert create.call_args.kwargs["image"] == "test-image"
-    assert create.call_args.kwargs["disk"] == 100
-    assert create.call_args.kwargs["env"] == {"FOO": "bar"}
-    assert create.call_args.kwargs["price"] == 0.5
+    json_blob = create.call_args.args[2]
+    assert json_blob["image"] == "test-image"
+    assert json_blob["disk"] == 100
+    assert json_blob["env"] == {"FOO": "bar"}
+    assert json_blob["price"] == 0.5
+    # Environment variables are duplicated in `extra` as Docker `-e` flags
+    # because bare keys in the `env` object are not reliably applied by Vast.
+    assert "-e FOO=bar" in (json_blob["extra"] or "")
 
 
 def test_get_instance_logs_returns_none_for_dict(config):

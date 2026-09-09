@@ -1,5 +1,6 @@
 """Tests for the provider abstraction and its built-in implementations."""
 
+import base64
 import shutil
 from unittest import mock
 
@@ -129,3 +130,23 @@ def test_local_provider_resolve_image_with_unconfigured(project_dir):
     with mock.patch.dict("os.environ", {}, clear=True):
         resolved = provider._resolve_image("ghcr.io/smeinecke/qwen38-vast:v100")
     assert resolved == "ghcr.io/smeinecke/qwen38-vast:v100"
+
+
+def test_merge_public_keys_b64():
+    from hostai.providers.local import _merge_public_keys_b64
+
+    user_key = "ssh-ed25519 AAAA user@host"
+    provider_key = "ssh-ed25519 BBBB provider@host"
+    user_b64 = base64.b64encode(user_key.encode()).decode()
+    provider_b64 = base64.b64encode(provider_key.encode()).decode()
+
+    merged = _merge_public_keys_b64(user_b64, provider_b64)
+    decoded = base64.b64decode(merged).decode()
+    assert user_key in decoded
+    assert provider_key in decoded
+    assert decoded.count("\n") == 1
+
+    # Empty/None values are ignored and duplicates are collapsed.
+    merged = _merge_public_keys_b64(user_b64, None, user_b64)
+    decoded = base64.b64decode(merged).decode()
+    assert decoded == user_key

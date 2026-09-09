@@ -52,6 +52,7 @@ class Provider(ABC):
         extra: Optional[str] = None,
         runtype: Optional[str] = None,
         args: Optional[str] = None,
+        ports: Optional[List[int]] = None,
         force: bool = False,
         cancel_unavail: bool = False,
         template_hash: Optional[str] = None,

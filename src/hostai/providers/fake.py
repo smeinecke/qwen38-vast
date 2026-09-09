@@ -126,12 +126,13 @@ class FakeProvider(Provider):
         extra: Optional[str] = None,
         runtype: Optional[str] = None,
         args: Optional[str] = None,
+        ports: Optional[List[int]] = None,
         force: bool = False,
         cancel_unavail: bool = False,
         template_hash: Optional[str] = None,
         volume_info: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        _ = price, bid_price, label, extra, runtype, args, force, cancel_unavail, template_hash, volume_info
+        _ = price, bid_price, label, extra, runtype, args, ports, force, cancel_unavail, template_hash, volume_info
         offer = self._offers.get(offer_id)
         if not offer:
             raise ProviderError(f"unknown offer {offer_id}")
