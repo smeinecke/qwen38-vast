@@ -19,6 +19,7 @@ from hostai.commands.monitor import (
     cmd_monitor_start,
     cmd_monitor_status,
     cmd_monitor_stop,
+    cmd_monitor_watch,
     maybe_start_monitor,
     stop_monitor,
 )
@@ -317,6 +318,89 @@ def test_maybe_start_monitor_launches_daemon(config, project_dir, running_state)
     with mock.patch("hostai.commands.monitor._start_monitor", fake_callback):
         maybe_start_monitor(config, running_state)
     assert _monitor_pid_file(config).read_text() == "12345"
+
+
+def test_resolve_monitor_targets_by_group(config, project_dir):
+    profiles = Profiles(
+        schema_version=1,
+        images=[],
+        profiles=[
+            make_profile(name="test"),
+            make_profile(name="other", group="g1"),
+        ],
+    )
+    current = State(project_dir / ".hostai-vast" / "state.json")
+    targets = _resolve_monitor_targets(config, profiles, None, "g1", current)
+    assert len(targets) == 1
+    assert targets[0].name == "other"
+
+
+def test_resolve_monitor_targets_unknown_profile(config, project_dir):
+    profiles = Profiles(schema_version=1, images=[], profiles=[make_profile()])
+    current = State(project_dir / ".hostai-vast" / "state.json")
+    with pytest.raises(click.ClickException, match="unknown"):
+        _resolve_monitor_targets(config, profiles, "missing", None, current)
+
+
+def test_search_profiles_collects_offers(config, project_dir):
+    profiles = Profiles(schema_version=1, images=[], profiles=[make_profile()])
+    target = profiles.profiles[0]
+    current = State(project_dir / ".hostai-vast" / "state.json")
+    with mock.patch("hostai.market.search_offers", return_value=[{"id": 1, "dph_total": 0.3}]):
+        offers = _search_profiles(config, profiles, [target], current)
+    assert len(offers) == 1
+
+
+def test_ranked_best_for_monitor_upgrade(config, project_dir):
+    profiles = Profiles(schema_version=1, images=[], profiles=[make_profile()])
+    current = State(project_dir / ".hostai-vast" / "state.json")
+    current.gpu = "RTX 4090"
+    current.dph = 0.5
+    candidates = [
+        {"id": 1, "dph_total": 0.3, "gpu_name": "RTX 4090"},
+        {"id": 2, "dph_total": 0.4, "gpu_name": "RTX 4090"},
+    ]
+    best = _ranked_best_for_monitor(config, profiles, current, candidates)
+    assert best["id"] == 1
+
+
+def test_cmd_monitor_watch_single_iteration(config, project_dir):
+    config.root_dir = project_dir
+    profiles = Profiles(schema_version=1, images=[], profiles=[make_profile()])
+    with mock.patch("hostai.profiles.Profiles.from_file", return_value=profiles):
+        with mock.patch("hostai.state.State.load", return_value=State(project_dir / ".hostai-vast" / "state.json")):
+            with mock.patch("hostai.commands.monitor._search_profiles", return_value=[{"id": 1, "dph_total": 0.3, "gpu_name": "RTX 4090"}]):
+                with mock.patch("time.sleep", side_effect=KeyboardInterrupt):
+                    runner = CliRunner()
+                    result = runner.invoke(cmd_monitor_watch, ["--interval", "1"], obj=config)
+    assert result.exit_code == 0
+
+
+def test_cmd_monitor_status_not_running(config, project_dir):
+    config.root_dir = project_dir
+    runner = CliRunner()
+    result = runner.invoke(cmd_monitor_status, [], obj=config)
+    assert result.exit_code == 0
+    assert "not running" in result.output.lower()
+
+
+def test_cmd_monitor_logs_empty(config, project_dir):
+    config.root_dir = project_dir
+    runner = CliRunner()
+    result = runner.invoke(cmd_monitor_logs, [], obj=config)
+    assert result.exit_code == 0
+
+
+def test_cmd_monitor_once_no_offers_mocked(config, project_dir):
+    config.root_dir = project_dir
+    profiles = Profiles(schema_version=1, images=[], profiles=[make_profile()])
+    with mock.patch("hostai.profiles.Profiles.from_file", return_value=profiles):
+        with mock.patch("hostai.state.State.load", return_value=State(project_dir / ".hostai-vast" / "state.json")):
+            with mock.patch("hostai.commands.monitor._search_profiles", return_value=[]):
+                runner = CliRunner()
+                result = runner.invoke(cmd_monitor_once, [], obj=config)
+    assert result.exit_code == 0
+    assert "no matching offers" in result.output
 
 
 def test_maybe_start_monitor_inside_click_context(config, project_dir, running_state):
