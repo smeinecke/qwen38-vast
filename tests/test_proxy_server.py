@@ -116,3 +116,35 @@ def test_proxy_stream_chat(config, running_state, fake_tokenizer, tmp_path):
         assert text.startswith("data:")
 
     asyncio.run(run_proxy(config, running_state, fake_tokenizer, tmp_path, requests))
+
+
+def test_proxy_completions_forwarded(config, running_state, fake_tokenizer, tmp_path):
+    running_state.unsecure = True
+    config.proxy.tokenized_only = True
+    config.model.model = "qwen-test"
+
+    async def requests(client):
+        resp = await client.post("/v1/completions", json={
+            "prompt": "hi",
+            "max_tokens": 10,
+            "stream": False,
+        })
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["path"] == "/v1/completions"
+
+    asyncio.run(run_proxy(config, running_state, fake_tokenizer, tmp_path, requests))
+
+
+def test_proxy_generic_route(config, running_state, fake_tokenizer, tmp_path):
+    running_state.unsecure = True
+    config.proxy.tokenized_only = True
+    config.model.model = "qwen-test"
+
+    async def requests(client):
+        resp = await client.get("/unknown/path")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["path"] == "/unknown/path"
+
+    asyncio.run(run_proxy(config, running_state, fake_tokenizer, tmp_path, requests))
