@@ -107,6 +107,77 @@ def test_parse_rsync_transferred_bytes_no_match():
     assert down._parse_rsync_transferred_bytes("") is None
 
 
+def test_cmd_down_pause_and_no_cache(config, project_dir):
+    _write_state(
+        project_dir,
+        instance_id=12345,
+        profile="test",
+        local_port=18080,
+        dph=0.5,
+        ctx_size=32768,
+        ssh_url="ssh://root@10.0.0.1:22",
+    )
+
+    with (
+        mock.patch("hostai.commands.down.down_instance", return_value="paused") as di,
+        mock.patch("hostai.commands.watchdog.stop_watchdog"),
+    ):
+        runner = CliRunner()
+        result = runner.invoke(down.cmd_down, ["--yes", "--pause", "--no-cache"], obj=config)
+
+    assert result.exit_code == 0, result.output
+    di.assert_called_once()
+    _, kwargs = di.call_args
+    assert kwargs["pause"] is True
+    assert kwargs["no_cache"] is True
+
+
+def test_down_instance_cancel_on_confirm(config, project_dir):
+    state = _write_state(
+        project_dir,
+        instance_id=12345,
+        profile="test",
+        local_port=18080,
+        dph=0.5,
+        ctx_size=32768,
+    )
+    state = State(project_dir / ".hostai-vast" / "state.json")
+    state.instance_id = 12345
+    with mock.patch("click.confirm", return_value=False):
+        outcome = down.down_instance(config, state)
+    assert outcome == "cancelled"
+
+
+def test_down_instance_pause_with_skip_confirm(config, project_dir):
+    _write_state(
+        project_dir,
+        instance_id=12345,
+        profile="test",
+        local_port=18080,
+        dph=0.5,
+        ctx_size=32768,
+        ssh_url="ssh://root@10.0.0.1:22",
+    )
+    state = State(project_dir / ".hostai-vast" / "state.json")
+    state.instance_id = 12345
+    run_dir = project_dir / "run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    with (
+        mock.patch("hostai.commands.down.init_run_dir", return_value=run_dir),
+        mock.patch("hostai.commands.down._stop_proxy"),
+        mock.patch("hostai.commands.down._refresh_ssh_state"),
+        mock.patch("hostai.commands.down.ssh.ensure_tunnel"),
+        mock.patch("hostai.commands.down._save_and_upload_slot_cache", return_value=None),
+        mock.patch("hostai.commands.down._archive_session"),
+        mock.patch("hostai.commands.down._stop_remote_model"),
+        mock.patch("hostai.commands.down.ssh.stop_tunnel"),
+        mock.patch("hostai.commands.down._pause_or_destroy", return_value="paused"),
+    ):
+        outcome = down.down_instance(config, state, pause=True, skip_confirm=True)
+    assert outcome == "paused"
+
+
 def test_archive_session_creates_json(config, state, tmp_path):
     run_dir = tmp_path / "run"
     run_dir.mkdir()
