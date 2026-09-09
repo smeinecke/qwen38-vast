@@ -32,9 +32,20 @@ _TOOL_CALL_RE = re.compile(
 )
 
 # The Qwen chat template puts the opening thinking marker into the prompt, so
-# generated output normally contains only the closing marker. Split on it.
-_THINK_START = "▶"
-_THINK_END = "◀"
+# generated output normally contains only the closing tag. Split on it. Both
+# the canonical ``</think>`` and the ``◀`` variant are accepted.
+_THINK_START_MARKERS = ("<think>", "▶")
+_THINK_END_MARKERS = ("</think>", "◀")
+
+
+def _find_marker(text: str, markers: Tuple[str, ...]) -> int:
+    """Return the index of the earliest marker occurrence, or -1."""
+    pos = -1
+    for marker in markers:
+        i = text.find(marker)
+        if i >= 0 and (pos < 0 or i < pos):
+            pos = i
+    return pos
 
 
 def _split_reasoning(content: str) -> Tuple[str, str]:
@@ -44,11 +55,19 @@ def _split_reasoning(content: str) -> Tuple[str, str]:
     typically contains only the closing tag. If the model also emitted the
     opening tag, it is stripped from the reasoning text.
     """
-    if _THINK_END not in content:
+    end = _find_marker(content, _THINK_END_MARKERS)
+    if end < 0:
         return "", content
-    reasoning, answer = content.split(_THINK_END, 1)
-    if _THINK_START in reasoning:
-        reasoning = reasoning.split(_THINK_START, 1)[1]
+    reasoning = content[:end]
+    answer = content[end:]
+    for marker in _THINK_END_MARKERS:
+        if answer.startswith(marker):
+            answer = answer[len(marker) :]
+            break
+    start = _find_marker(reasoning, _THINK_START_MARKERS)
+    if start >= 0:
+        marker = next(m for m in _THINK_START_MARKERS if reasoning.startswith(m, start))
+        reasoning = reasoning[start + len(marker) :]
     return reasoning.strip(), answer.lstrip()
 
 
@@ -96,6 +115,109 @@ def _parse_tool_calls(content: str) -> List[Dict[str, Any]]:
 def _strip_tool_call_tags(content: str) -> str:
     """Return content with tool-call tags removed, preserving surrounding text."""
     return _TOOL_CALL_RE.sub("", content).strip()
+
+
+def _find_stop(text: str, stops: List[str]) -> int:
+    """Return the index of the earliest stop-string match, or -1."""
+    cut = -1
+    for word in stops:
+        pos = text.find(word)
+        if pos >= 0 and (cut < 0 or pos < cut):
+            cut = pos
+    return cut
+
+
+def _split_delta(text: str, start: int, end: int, expect_reasoning: bool) -> Dict[str, str]:
+    """Split the new range ``text[start:end]`` into reasoning/content delta keys.
+
+    The closing thinking marker (when ``expect_reasoning`` is set) separates
+    reasoning from the final answer: everything before it is reasoning,
+    everything after is content. Without an expected marker, or before it
+    appears, text is attributed to the current phase.
+    """
+    if start >= end:
+        return {}
+    marker = _find_marker(text, _THINK_END_MARKERS) if expect_reasoning else -1
+    marker_len = 0
+    if marker >= 0:
+        marker_len = len(next(m for m in _THINK_END_MARKERS if text.startswith(m, marker)))
+    delta: Dict[str, str] = {}
+    if marker < 0:
+        delta["reasoning_content" if expect_reasoning else "content"] = text[start:end]
+        return delta
+    reasoning = text[start : min(end, marker)]
+    content = text[max(start, marker + marker_len) : end]
+    if reasoning:
+        if start == 0:
+            for m in _THINK_START_MARKERS:
+                if reasoning.startswith(m):
+                    reasoning = reasoning[len(m) :]
+                    break
+        if reasoning:
+            delta["reasoning_content"] = reasoning
+    if content:
+        delta["content"] = content
+    return delta
+
+
+class _TokenDetokenizer:
+    """Incrementally detokenize generated token ids into response deltas.
+
+    With ``token_only`` upstream requests, the server emits raw token ids
+    instead of text. The proxy decodes them locally, splits reasoning from
+    content on ``◀``, and applies ``stop`` strings itself since server-side
+    stop matching is text-based and cannot run without detokenization.
+    """
+
+    def __init__(
+        self,
+        tokenizer: Tokenizer,
+        stop_strings: Optional[List[str]] = None,
+        expect_reasoning: bool = True,
+    ) -> None:
+        self._tokenizer = tokenizer
+        self._stops = [s for s in stop_strings or [] if s]
+        self._expect_reasoning = expect_reasoning
+        self._ids: List[int] = []
+        self._emitted = 0
+        self._cut = -1
+        self.stopped = False
+        # Hold back trailing chars so a stop string or reasoning marker that
+        # straddles a decode boundary can still be detected before its prefix
+        # is emitted.
+        boundary_lengths = [len(s) for s in self._stops]
+        if expect_reasoning:
+            boundary_lengths += [len(m) for m in _THINK_END_MARKERS]
+        self._holdback = max(0, max(boundary_lengths, default=0) - 1)
+
+    def add(self, token_ids: List[int]) -> Dict[str, str]:
+        """Append generated token ids and return the new delta text."""
+        self._ids.extend(token_ids)
+        return self._drain(final=False)
+
+    def finish(self) -> Dict[str, str]:
+        """Flush any held-back text at the end of the stream."""
+        return self._drain(final=True)
+
+    @property
+    def token_count(self) -> int:
+        return len(self._ids)
+
+    def _drain(self, final: bool) -> Dict[str, str]:
+        text = self._tokenizer.decode(self._ids, skip_special_tokens=True)
+        if self._cut < 0:
+            self._cut = _find_stop(text, self._stops)
+            if self._cut >= 0:
+                self.stopped = True
+        if self._cut >= 0:
+            text = text[: self._cut]
+        limit = len(text)
+        if not final and self._cut < 0:
+            limit = max(0, limit - self._holdback)
+        limit = min(limit, len(text))
+        start = min(self._emitted, limit)
+        self._emitted = limit
+        return _split_delta(text, start, limit, self._expect_reasoning)
 
 
 class ProxyError(Exception):
@@ -285,12 +407,23 @@ class TokenizedProxy:
         tools = body.get("tools")
         stream = bool(body.get("stream", False))
 
+        stop_param = body.get("stop")
+        if isinstance(stop_param, str):
+            stop_strings = [stop_param]
+        elif isinstance(stop_param, list):
+            stop_strings = [s for s in stop_param if isinstance(s, str) and s]
+        else:
+            stop_strings = []
+
+        reasoning_kwargs = default_reasoning_kwargs(self.config)
+        expect_reasoning = bool(reasoning_kwargs.get("enable_thinking", True))
+
         try:
             token_ids = self.tokenizer.apply_chat_template(
                 messages,
                 tools=tools,
                 add_generation_prompt=True,
-                **default_reasoning_kwargs(self.config),
+                **reasoning_kwargs,
             )
         except TokenizerError as exc:
             raise web.HTTPBadRequest(reason=f"tokenization failed: {exc}") from exc
@@ -306,9 +439,15 @@ class TokenizedProxy:
             text = await upstream_response.text()
             raise web.HTTPInternalServerError(reason=f"upstream returned {upstream_response.status}: {text[:200]}")
 
+        _logger.info(
+            "chat request: %d prompt tokens, stream=%s, stops=%d",
+            len(token_ids),
+            stream,
+            len(stop_strings),
+        )
         if stream:
-            return await self._stream_chat(request, upstream_response)
-        return await self._complete_chat(upstream_response, len(token_ids))
+            return await self._stream_chat(request, upstream_response, stop_strings, expect_reasoning)
+        return await self._complete_chat(upstream_response, len(token_ids), stop_strings)
 
     @staticmethod
     def build_completion_payload(
@@ -324,6 +463,11 @@ class TokenizedProxy:
             "n_predict": max_tokens,
             "temperature": temperature,
             "stream": stream,
+            # Ask the upstream to return raw token ids (and, on patched images,
+            # to skip detokenization entirely). The proxy decodes them locally
+            # so generated text never exists on the remote host.
+            "return_tokens": True,
+            "token_only": True,
         }
 
         # Forward common OpenAI/llama-server sampling parameters.
@@ -358,18 +502,34 @@ class TokenizedProxy:
         self,
         response: aiohttp.ClientResponse,
         prompt_tokens: int,
+        stop_strings: Optional[List[str]] = None,
     ) -> web.Response:
         try:
             data = await response.json()
         except json.JSONDecodeError as exc:
             raise web.HTTPInternalServerError(reason=f"invalid upstream JSON: {exc}") from exc
 
-        content = data.get("content", "")
-        reasoning = data.get("reasoning_content") or ""
-        if not reasoning:
-            reasoning, content = _split_reasoning(content)
         finish_reason = self._map_finish_reason(data)
         completion_tokens = data.get("tokens_predicted", 0) or 0
+
+        tokens = data.get("tokens") or []
+        if tokens:
+            # token_only path: detokenize locally, then apply stop strings
+            # client-side since upstream cannot match them without text.
+            text = self.tokenizer.decode(tokens, skip_special_tokens=True)
+            cut = _find_stop(text, stop_strings or [])
+            if cut >= 0:
+                text = text[:cut]
+                finish_reason = "stop"
+                _logger.warning("stop string matched client-side; truncated decoded output")
+            reasoning, content = _split_reasoning(text)
+            completion_tokens = completion_tokens or len(tokens)
+        else:
+            _logger.debug("upstream returned no token ids; using text fallback")
+            content = data.get("content", "")
+            reasoning = data.get("reasoning_content") or ""
+            if not reasoning:
+                reasoning, content = _split_reasoning(content)
 
         tool_calls = _parse_tool_calls(content)
         if tool_calls:
@@ -405,6 +565,8 @@ class TokenizedProxy:
         self,
         request: web.Request,
         response: aiohttp.ClientResponse,
+        stop_strings: Optional[List[str]] = None,
+        expect_reasoning: bool = True,
     ) -> web.StreamResponse:
         stream = web.StreamResponse(
             status=200,
@@ -421,6 +583,11 @@ class TokenizedProxy:
         model = self.config.model.model or "local"
         created = int(time.time())
         sent_reasoning = False
+        detok = _TokenDetokenizer(self.tokenizer, stop_strings, expect_reasoning)
+        # Decided by the first chunk carrying data: upstream partials always
+        # populate `tokens`, so the detokenize path is used whenever ids are
+        # present; upstream text deltas are ignored in that case.
+        token_mode: Optional[bool] = None
 
         async for raw in response.content:
             for line in raw.decode("utf-8", errors="replace").splitlines():
@@ -435,15 +602,25 @@ class TokenizedProxy:
                 except json.JSONDecodeError:
                     continue
 
+                stop = obj.get("stop", False)
+                if token_mode is None and not stop:
+                    if obj.get("tokens"):
+                        token_mode = True
+                    elif obj.get("content") or obj.get("reasoning_content"):
+                        token_mode = False
+
+                if token_mode:
+                    delta_payload = detok.finish() if stop else detok.add(obj.get("tokens") or [])
+                    finish = "stop" if detok.stopped else (self._map_finish_reason(obj) if stop else None)
                 # The final chunk carries the full content/reasoning_content,
                 # not deltas. Its content was already streamed, so only the
                 # reasoning blob is forwarded, and only when no deltas were sent.
-                stop = obj.get("stop", False)
-                if stop:
+                elif stop:
                     delta_payload = {}
                     reasoning = (obj.get("reasoning_content") or "") if not sent_reasoning else ""
                     if reasoning:
                         delta_payload["reasoning_content"] = reasoning
+                    finish = self._map_finish_reason(obj)
                 else:
                     delta_payload = {}
                     delta = obj.get("content", "")
@@ -453,6 +630,7 @@ class TokenizedProxy:
                     if reasoning_delta:
                         delta_payload["reasoning_content"] = reasoning_delta
                         sent_reasoning = True
+                    finish = None
 
                 chunk: Dict[str, Any] = {
                     "id": completion_id,
@@ -463,18 +641,40 @@ class TokenizedProxy:
                         {
                             "index": 0,
                             "delta": delta_payload,
-                            "finish_reason": None,
+                            "finish_reason": finish,
                         }
                     ],
                 }
-                if stop:
-                    chunk["choices"][0]["finish_reason"] = self._map_finish_reason(obj)
 
                 await stream.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
-                if stop:
+                if stop or (token_mode and detok.stopped):
                     await stream.write(b"data: [DONE]\n\n")
+                    if token_mode and detok.stopped and not stop:
+                        # Cancel upstream generation; the server stops the task
+                        # when the client connection closes.
+                        response.close()
+                        _logger.warning(
+                            "stop string matched client-side; aborted upstream stream at %d tokens",
+                            detok.token_count,
+                        )
+                    _logger.info(
+                        "stream finished: %d tokens, finish=%s",
+                        detok.token_count,
+                        finish,
+                    )
                     return stream
 
+        if token_mode:
+            tail = detok.finish()
+            if tail:
+                chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": tail, "finish_reason": None}],
+                }
+                await stream.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
         await stream.write(b"data: [DONE]\n\n")
         return stream
 
@@ -676,6 +876,33 @@ async def _bootstrap_proxy(
     _logger.info("proxy ready")
 
 
+def _proxy_log_file(config: Config) -> Path:
+    return config.root_dir / ".hostai-cache" / "proxy.log"
+
+
+def _configure_proxy_logging(config: Config) -> Path:
+    """Attach a file handler so proxy activity is logged locally.
+
+    Only operational metadata is logged (token counts, timings, warnings) —
+    never prompt or generated content.
+    """
+    log_file = _proxy_log_file(config)
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("hostai")
+    existing = [
+        h
+        for h in logger.handlers
+        if isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", "") == str(log_file)
+    ]
+    if not existing:
+        handler = logging.FileHandler(log_file, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+        logger.addHandler(handler)
+        if logger.level > logging.INFO or logger.level == logging.NOTSET:
+            logger.setLevel(logging.INFO)
+    return log_file
+
+
 async def run_proxy(config: Config, state: State) -> None:
     """Start the local proxy for the active state.
 
@@ -683,6 +910,9 @@ async def run_proxy(config: Config, state: State) -> None:
     connection alive as long as it is running. When tokenized-only is enabled it
     tokenizes /v1/chat/completions; otherwise it passes traffic through.
     """
+    log_file = _configure_proxy_logging(config)
+    _logger.info("proxy starting, logging to %s", log_file)
+
     # Record the proxy pid so hostai down can stop it.
     state.data["proxy_pid"] = os.getpid()
     state.save()

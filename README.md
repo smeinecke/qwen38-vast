@@ -42,12 +42,22 @@ The model weights are downloaded at instance startup, not baked into the image.
 - You run `hostai proxy` locally. It listens on a Unix socket, applies the model
   chat template with `transformers`, and forwards token IDs to the remote
   `llama-server` through the SSH tunnel.
-- The generated text is then decoded and streamed back as an OpenAI-compatible
-  response.
+- The proxy requests `token_only` responses: patched images skip server-side
+  detokenization entirely and return raw generated token IDs (`tokens`) — the
+  response body never contains plaintext. The proxy decodes them locally,
+  splits reasoning from the final answer on the model's thinking marker, parses
+  tool calls, and streams back an OpenAI-compatible response.
+- Because server-side `stop` strings are matched against text, they cannot fire
+  in `token_only` mode. The proxy applies them client-side: it truncates the
+  decoded output at the first match, logs a warning, and aborts the upstream
+  stream early. EOS and `n_predict` limits still stop generation remotely.
+- Proxy activity is logged to `.hostai-cache/proxy.log` (metadata only — token
+  counts, timings, and warnings; never prompt or output content).
 
-This makes prompt extraction from the remote VM more difficult because the
-remote never sees the raw user text. The feature is **not** absolute protection:
-a root-level attacker with the tokenizer can still reverse token IDs.
+This makes prompt and output extraction from the remote VM more difficult
+because plaintext never crosses the remote HTTP API. The feature is **not**
+absolute protection: a root-level attacker can still inspect process memory or
+reverse token IDs with the tokenizer.
 
 Enable it in `hostai.toml` or as a shell environment variable:
 
