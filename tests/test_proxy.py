@@ -1,14 +1,19 @@
 """Tests for the local tokenizing proxy."""
 
 import json
+import ssl
+from unittest import mock
 
 import pytest
 
 from hostai.proxy import (
     TokenizedProxy,
+    UnixTLSConnector,
     _find_stop,
     _parse_tool_calls,
+    _resolve_upstream,
     _split_reasoning,
+    _ssl_context,
     _TokenDetokenizer,
 )
 from hostai.tokenize import default_reasoning_kwargs
@@ -214,3 +219,48 @@ def test_detokenizer_strips_leading_open_marker():
     assert detok.add([1, 2, 3]) == {"reasoning_content": "think"}
     assert detok.finish() == {"content": "ok"}
 
+
+
+def test_resolve_upstream_uses_local_port(state):
+    state.local_port = 12345
+    state.unsecure = True
+    assert _resolve_upstream(state) == ("http://127.0.0.1:12345", None)
+
+
+def test_resolve_upstream_uses_unix_socket(state):
+    state.unsecure = True
+    state.data["upstream_socket"] = "/tmp/upstream.sock"
+    assert _resolve_upstream(state) == ("http://localhost", "/tmp/upstream.sock")
+
+
+def test_resolve_upstream_secure(state):
+    state.local_port = 12345
+    state.unsecure = False
+    assert _resolve_upstream(state) == ("https://127.0.0.1:12345", None)
+
+
+def test_ssl_context_unsecure(state):
+    state.unsecure = True
+    ctx = _ssl_context(state)
+    assert ctx.check_hostname is False
+    assert ctx.verify_mode == ssl.CERT_NONE
+
+
+def test_unix_tls_connector_get_ssl_context():
+    async def inner():
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        conn = UnixTLSConnector("/tmp/test.sock", ssl=ctx)
+        req = mock.Mock(is_ssl=mock.Mock(return_value=True), ssl=True)
+        assert conn._get_ssl_context(req) is ctx
+    import asyncio
+    asyncio.run(inner())
+
+
+def test_unix_tls_connector_get_ssl_context_false():
+    async def inner():
+        conn = UnixTLSConnector("/tmp/test.sock", ssl=False)
+        req = mock.Mock(is_ssl=mock.Mock(return_value=True), ssl=False)
+        ctx = conn._get_ssl_context(req)
+        assert ctx.verify_mode == ssl.CERT_NONE
+    import asyncio
+    asyncio.run(inner())

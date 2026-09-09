@@ -368,3 +368,58 @@ def test_offer_summary_country_falls_back_to_raw_value():
     }
     summary = market.offer_summary(offer)
     assert "local" in summary
+
+
+def test_effective_dph_falls_back_to_infinity():
+    assert market._effective_dph({}) == float("inf")
+
+
+def test_is_same_or_better_gpu_branches():
+    profiles = Profiles(
+        schema_version=1,
+        images=[],
+        profiles=[],
+        monitor_hardware=MonitorHardware(
+            policy="same_or_better",
+            gpu_ranks=[
+                HardwareRank(gpu="A40", aliases=["A40"], rank=100),
+                HardwareRank(gpu="RTX 4090", aliases=["RTX_4090"], rank=200),
+            ],
+        ),
+        market_policy=MarketPolicy(),
+    )
+    assert market.is_same_or_better_gpu(profiles, None, "RTX 4090") is False
+    assert market.is_same_or_better_gpu(profiles, "RTX 4090", None) is False
+    with pytest.raises(ValueError):
+        market.is_same_or_better_gpu(profiles, "RTX 4090", "RTX 4090", policy="worse")
+    # Both unknown but same normalized.
+    assert market.is_same_or_better_gpu(profiles, "Unknown1", "Unknown1") is True
+    # One unknown.
+    assert market.is_same_or_better_gpu(profiles, "RTX 4090", "Unknown") is False
+    assert market.is_same_or_better_gpu(profiles, "Unknown", "RTX 4090") is False
+
+
+def test_build_search_query_rejects_negative_max_price(config):
+    profiles = Profiles(
+        schema_version=1,
+        images=[],
+        profiles=[make_profile()],
+        monitor_hardware=MonitorHardware(),
+        market_policy=MarketPolicy(),
+    )
+    with pytest.raises(Exception):
+        market.build_search_query(config, profiles, make_profile(), max_price=-1)
+
+
+def test_build_search_query_warns_on_small_disk_space(config):
+    config.market.disk_gb = 100
+    profiles = Profiles(
+        schema_version=1,
+        images=[],
+        profiles=[make_profile(query="gpu_name == RTX_4090 disk_space>=50")],
+        monitor_hardware=MonitorHardware(),
+        market_policy=MarketPolicy(),
+    )
+    with pytest.warns(UserWarning):
+        query, _ = market.build_search_query(config, profiles, profiles.profiles[0])
+    assert "disk_space>=100" in query

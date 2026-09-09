@@ -408,6 +408,167 @@ def test_rclone_prefetch_eta_aborts_and_cleans(config, tmp_path):
     assert not (slot_dir / "current.bin").exists()
 
 
+def test_default_local_dir_uses_config(config, tmp_path):
+    config.cache.local_dir = str(tmp_path / "slots")
+    assert cache._default_local_dir(config) == str(tmp_path / "slots")
+
+
+def test_default_local_dir_uses_shm(config):
+    config.cache.local_dir = ""
+    config.cache.use_shm = True
+    assert cache._default_local_dir(config) == "/dev/shm/qwen38/slots"
+
+
+def test_default_local_dir_falls_back_to_var(config):
+    config.cache.local_dir = ""
+    config.cache.use_shm = False
+    assert cache._default_local_dir(config) == "/var/lib/qwen38/slots"
+
+
+def test_cache_config_returns_namespace(config, tmp_path):
+    config.cache.local_dir = str(tmp_path / "slots")
+    cfg = cache.cache_config(config)
+    assert cfg.host == config.cache.host
+    assert cfg.local_dir == str(tmp_path / "slots")
+
+
+def test_rclone_type_defaults_to_webdav(config):
+    config.cache.rclone_type = ""
+    assert cache._rclone_type(config) == "webdav"
+
+
+def test_rclone_user_falls_back_to_cache_user(config):
+    config.cache.rclone_user = ""
+    assert cache._rclone_user(config) == config.cache.user
+
+
+def test_rclone_env_script_empty_when_remote_preconfigured(config):
+    config.cache.rclone_remote = "myremote"
+    assert cache._rclone_env_script(config) == ""
+
+
+def test_rclone_env_script_includes_password(config):
+    config.cache.rclone = True
+    config.cache.rclone_url = "https://cache.example.com/"
+    config.cache.rclone_password = "secret"
+    config.cache.rclone_remote = ""
+    script = cache._rclone_env_script(config)
+    assert "rclone obscure" in script
+    assert "secret" in script
+
+
+def test_cache_ssh_url(config):
+    assert cache.cache_ssh_url(config) == "ssh://qwen-cache@cache.example.com:22"
+
+
+def test_cache_ssh_url_empty_host(config):
+    config.cache.host = ""
+    assert cache.cache_ssh_url(config) == ""
+
+
+def test_parse_ssh_url_with_prefix(config):
+    user, host, port = cache._parse_ssh_url("ssh://root@host:2222", config)
+    assert (user, host, port) == ("root", "host", 2222)
+
+
+def test_parse_ssh_url_without_prefix(config):
+    user, host, port = cache._parse_ssh_url("user@host:2222", config)
+    assert (user, host, port) == ("user", "host", 2222)
+
+
+def test_parse_ssh_url_defaults(config):
+    user, host, port = cache._parse_ssh_url("host", config)
+    assert user == config.cache.user
+    assert host == "host"
+    assert port == config.cache.port
+
+
+def test_parse_ssh_url_invalid():
+    user, host, port = cache._parse_ssh_url(":::", None)
+    assert (user, host, port) == ("", "", 0)
+
+
+def test_public_key_uses_ensure_cache_key(config, project_dir, monkeypatch):
+    key_path = project_dir / "cache_ed25519"
+    pub_path = key_path.with_suffix(".pub")
+    pub_path.parent.mkdir(parents=True, exist_ok=True)
+    key_path.write_text("private")
+    pub_path.write_text("ssh-ed25519 AAAA test\n")
+    monkeypatch.setattr(cache, "_cache_key_path", lambda root: key_path)
+    with mock.patch("hostai.cache.utils.run") as run:
+        assert cache._public_key(config, project_dir) == "ssh-ed25519 AAAA test"
+    run.assert_not_called()
+
+
+def test_copy_cache_key_returns_false_without_target(config):
+    config.cache.host = ""
+    assert cache.copy_cache_key(config) is False
+
+
+def test_copy_cache_key_installs_on_cache_server(config, project_dir, monkeypatch):
+    key_path = project_dir / "cache_ed25519"
+    pub_path = key_path.with_suffix(".pub")
+    pub_path.parent.mkdir(parents=True, exist_ok=True)
+    key_path.write_text("private")
+    pub_path.write_text("ssh-ed25519 AAAA test\n")
+    monkeypatch.setattr(cache, "_cache_key_path", lambda root: key_path)
+
+    with mock.patch("hostai.cache.utils.run", return_value=fake_completed()) as run:
+        assert cache.copy_cache_key(config) is True
+    assert run.called
+
+
+def test_preflight_remote_returns_false_without_host(config):
+    config.cache.host = ""
+    assert cache.preflight_remote(config) is False
+
+
+def test_preflight_remote_runs_ssh_check(config, project_dir):
+    key_path = project_dir / ".hostai-cache" / "cache_ed25519"
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    key_path.write_text("private")
+    key_path.with_suffix(".pub").write_text("ssh-ed25519 AAAA\n")
+    with mock.patch("hostai.cache.utils.run", return_value=fake_completed()) as run:
+        assert cache.preflight_remote(config) is True
+    assert run.called
+
+
+def test_ensure_local_dir_uses_private_perms(tmp_path):
+    d = tmp_path / "slot"
+    cache._ensure_local_dir(d)
+    assert d.is_dir()
+    assert oct(d.stat().st_mode)[-3:] == "700"
+
+
+def test_signature_for_state(config, running_state):
+    sig = cache._signature_for_state(config, running_state, "abc123")
+    assert len(sig) == 20
+
+
+def test_prefetch_cache_disabled(config, state, tmp_path):
+    config.cache.enabled = False
+    assert cache.prefetch_cache(config, state, tmp_path / "slot") is False
+
+
+def test_prefetch_cache_runs_rsync(config, state, project_dir, tmp_path):
+    key_path = project_dir / ".hostai-cache" / "cache_ed25519"
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    key_path.write_text("private")
+    key_path.with_suffix(".pub").write_text("ssh-ed25519 AAAA\n")
+    local = tmp_path / "slot"
+    local.mkdir()
+    (local / "current.bin").write_bytes(b"x")
+    with mock.patch("hostai.cache.utils.run", return_value=fake_completed()) as run:
+        assert cache.prefetch_cache(config, state, local, "abc123") is True
+    assert run.called
+
+
+def test_validate_cache_sentinel_file(tmp_path):
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_text("current.bin ok")
+    assert cache.validate_cache(sentinel) is True
+
+
 def test_rclone_upload_script_contains_rclone_copyto(config):
     config.cache.rclone = True
     config.cache.rclone_url = "https://cache.example.com/"

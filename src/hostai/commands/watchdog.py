@@ -258,21 +258,10 @@ def cmd_watchdog_run(config: Config):
     run_watchdog(config)
 
 
-@cmd_watchdog.command("start", help="Start the watchdog daemon.")
-@click.pass_obj
-def cmd_watchdog_start(config: Config):
-    pid_file = _watchdog_pid_file(config)
-
-    if pid_file.exists():
-        try:
-            pid = int(pid_file.read_text().strip())
-            if _is_running(pid):
-                click.echo(f"[watchdog] already running (pid {pid})")
-                return
-        except (ValueError, OSError):
-            pass
-
+def _start_watchdog(config: Config) -> None:
+    """Launch the watchdog daemon in a detached subprocess."""
     log_file = _watchdog_log_file(config)
+    pid_file = _watchdog_pid_file(config)
     log_file.parent.mkdir(parents=True, exist_ok=True)
     with log_file.open("a", encoding="utf-8") as f:
         f.write("\n")
@@ -292,30 +281,33 @@ def cmd_watchdog_start(config: Config):
     click.echo(f"[watchdog] started daemon (pid {proc.pid}) logging to {log_file}")
 
 
-@cmd_watchdog.command("stop", help="Stop the watchdog daemon.")
-@click.pass_obj
-def cmd_watchdog_stop(config: Config):
+def _stop_watchdog(config: Config, echo: bool = False) -> None:
+    """Kill the watchdog daemon and remove its pid file."""
     pid_file = _watchdog_pid_file(config)
     if not pid_file.exists():
-        click.echo("[watchdog] not running")
+        if echo:
+            click.echo("[watchdog] not running")
         return
 
     try:
         pid = int(pid_file.read_text().strip())
     except (ValueError, OSError):
         pid_file.unlink(missing_ok=True)
-        click.echo("[watchdog] not running")
+        if echo:
+            click.echo("[watchdog] not running")
         return
 
     if not _is_running(pid):
         pid_file.unlink(missing_ok=True)
-        click.echo("[watchdog] not running")
+        if echo:
+            click.echo("[watchdog] not running")
         return
 
     try:
         os.kill(pid, signal.SIGTERM)
     except Exception as exc:
-        click.echo(f"[watchdog] could not stop daemon: {exc}", err=True)
+        if echo:
+            click.echo(f"[watchdog] could not stop daemon: {exc}", err=True)
         return
 
     for _ in range(20):
@@ -327,10 +319,33 @@ def cmd_watchdog_stop(config: Config):
         try:
             os.kill(pid, signal.SIGKILL)
         except Exception as exc:
-            click.echo(f"[watchdog] could not kill daemon: {exc}", err=True)
+            if echo:
+                click.echo(f"[watchdog] could not kill daemon: {exc}", err=True)
 
     pid_file.unlink(missing_ok=True)
-    click.echo("[watchdog] stopped")
+    if echo:
+        click.echo("[watchdog] stopped")
+
+
+@cmd_watchdog.command("start", help="Start the watchdog daemon.")
+@click.pass_obj
+def cmd_watchdog_start(config: Config):
+    pid_file = _watchdog_pid_file(config)
+    if pid_file.exists():
+        try:
+            pid = int(pid_file.read_text().strip())
+            if _is_running(pid):
+                click.echo(f"[watchdog] already running (pid {pid})")
+                return
+        except (ValueError, OSError):
+            pass
+    _start_watchdog(config)
+
+
+@cmd_watchdog.command("stop", help="Stop the watchdog daemon.")
+@click.pass_obj
+def cmd_watchdog_stop(config: Config):
+    _stop_watchdog(config, echo=True)
 
 
 @cmd_watchdog.command("status", help="Show watchdog daemon status.")
@@ -365,17 +380,9 @@ def maybe_start_watchdog(config: Config, state: State) -> None:
     if not state.instance_id:
         return
     _log(config, f"auto-starting watchdog for instance {state.instance_id}")
-    if cmd_watchdog_start.callback is not None:
-        cmd_watchdog_start.callback(config)
+    _start_watchdog(config)
 
 
 def stop_watchdog(config: Config) -> None:
     """Stop the watchdog daemon, if running."""
-    pid_file = _watchdog_pid_file(config)
-    if pid_file.exists():
-        try:
-            pid = int(pid_file.read_text().strip())
-            if _is_running(pid) and cmd_watchdog_stop.callback is not None:
-                cmd_watchdog_stop.callback(config)
-        except (ValueError, OSError):
-            pid_file.unlink(missing_ok=True)
+    _stop_watchdog(config, echo=False)

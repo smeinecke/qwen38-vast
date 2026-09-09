@@ -261,26 +261,16 @@ def cmd_monitor_watch(
         click.echo("\n[monitor] stopped")
 
 
-@cmd_monitor.command("start", help="Start the price monitor daemon.")
-@click.option("--profile", help="Profile to monitor.")
-@click.option("--group", help="Monitor group to search.")
-@click.option("--interval", type=int, default=None, help="Seconds between checks.")
-@click.option("--threshold", type=float, default=None, help="Pct saving before alerting.")
-@click.pass_obj
-def cmd_monitor_start(
-    config: Config, profile: Optional[str], group: Optional[str], interval: Optional[int], threshold: Optional[float]
-):
+def _start_monitor(
+    config: Config,
+    profile: Optional[str],
+    group: Optional[str],
+    interval: Optional[int],
+    threshold: Optional[float],
+) -> None:
+    """Launch the monitor daemon in a detached subprocess."""
     pid_file = _monitor_pid_file(config)
     log_file = _monitor_log_file(config)
-
-    if pid_file.exists():
-        try:
-            pid = int(pid_file.read_text().strip())
-            if _monitor_is_running(pid):
-                click.echo(f"[monitor] already running (pid {pid})")
-                return
-        except (ValueError, OSError):
-            pass
 
     sec = interval if interval is not None else config.monitor.interval
     pct = threshold if threshold is not None else config.monitor.threshold_pct
@@ -310,29 +300,32 @@ def cmd_monitor_start(
     click.echo(f"[monitor] started daemon (pid {proc.pid}) logging to {log_file}")
 
 
-@cmd_monitor.command("stop", help="Stop the price monitor daemon.")
-@click.pass_obj
-def cmd_monitor_stop(config: Config):
+def _stop_monitor(config: Config, echo: bool = False) -> None:
+    """Kill the monitor daemon and remove its pid file."""
     pid_file = _monitor_pid_file(config)
     if not pid_file.exists():
-        click.echo("[monitor] not running")
+        if echo:
+            click.echo("[monitor] not running")
         return
     try:
         pid = int(pid_file.read_text().strip())
     except (ValueError, OSError):
         pid_file.unlink(missing_ok=True)
-        click.echo("[monitor] not running")
+        if echo:
+            click.echo("[monitor] not running")
         return
 
     if not _monitor_is_running(pid):
         pid_file.unlink(missing_ok=True)
-        click.echo("[monitor] not running")
+        if echo:
+            click.echo("[monitor] not running")
         return
 
     try:
         os.kill(pid, signal.SIGTERM)
     except Exception as exc:
-        click.echo(f"[monitor] could not stop daemon: {exc}", err=True)
+        if echo:
+            click.echo(f"[monitor] could not stop daemon: {exc}", err=True)
         return
 
     # Wait briefly for the process to exit.
@@ -345,10 +338,39 @@ def cmd_monitor_stop(config: Config):
         try:
             os.kill(pid, signal.SIGKILL)
         except Exception as exc:
-            click.echo(f"[monitor] could not kill daemon: {exc}", err=True)
+            if echo:
+                click.echo(f"[monitor] could not kill daemon: {exc}", err=True)
 
     pid_file.unlink(missing_ok=True)
-    click.echo("[monitor] stopped")
+    if echo:
+        click.echo("[monitor] stopped")
+
+
+@cmd_monitor.command("start", help="Start the price monitor daemon.")
+@click.option("--profile", help="Profile to monitor.")
+@click.option("--group", help="Monitor group to search.")
+@click.option("--interval", type=int, default=None, help="Seconds between checks.")
+@click.option("--threshold", type=float, default=None, help="Pct saving before alerting.")
+@click.pass_obj
+def cmd_monitor_start(
+    config: Config, profile: Optional[str], group: Optional[str], interval: Optional[int], threshold: Optional[float]
+):
+    pid_file = _monitor_pid_file(config)
+    if pid_file.exists():
+        try:
+            pid = int(pid_file.read_text().strip())
+            if _monitor_is_running(pid):
+                click.echo(f"[monitor] already running (pid {pid})")
+                return
+        except (ValueError, OSError):
+            pass
+    _start_monitor(config, profile, group, interval, threshold)
+
+
+@cmd_monitor.command("stop", help="Stop the price monitor daemon.")
+@click.pass_obj
+def cmd_monitor_stop(config: Config):
+    _stop_monitor(config, echo=True)
 
 
 @cmd_monitor.command("status", help="Show monitor daemon status.")
@@ -388,25 +410,12 @@ def maybe_start_monitor(config: Config, state: State) -> None:
         except (ValueError, OSError):
             pass
     _log_monitor(config, f"auto-starting monitor for instance {state.instance_id}")
-    if cmd_monitor_start.callback is not None:
-        cmd_monitor_start.callback(config, profile=None, group=None, interval=None, threshold=None)
+    _start_monitor(config, profile=None, group=None, interval=None, threshold=None)
 
 
 def stop_monitor(config: Config) -> None:
     """Stop the monitor daemon if it is running."""
-    pid_file = _monitor_pid_file(config)
-    if not pid_file.exists():
-        return
-    try:
-        pid = int(pid_file.read_text().strip())
-    except (ValueError, OSError):
-        pid_file.unlink(missing_ok=True)
-        return
-    if not _monitor_is_running(pid):
-        pid_file.unlink(missing_ok=True)
-        return
-    if cmd_monitor_stop.callback is not None:
-        cmd_monitor_stop.callback(config)
+    _stop_monitor(config, echo=False)
 
 
 def _log_monitor(config: Config, message: str) -> None:

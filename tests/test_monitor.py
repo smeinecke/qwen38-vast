@@ -8,10 +8,19 @@ import pytest
 from click.testing import CliRunner
 
 from hostai.commands.monitor import (
+    _monitor_is_running,
+    _monitor_log_file,
+    _monitor_pid_file,
     _ranked_best_for_monitor,
     _resolve_monitor_targets,
     _search_profiles,
+    cmd_monitor_logs,
     cmd_monitor_once,
+    cmd_monitor_start,
+    cmd_monitor_status,
+    cmd_monitor_stop,
+    maybe_start_monitor,
+    stop_monitor,
 )
 from hostai.profiles import HardwareRank, MonitorHardware, Profile, Profiles
 from hostai.state import State
@@ -277,3 +286,109 @@ def test_cmd_monitor_once_no_offers(config, project_dir):
 
     assert result.exit_code == 0
     assert "no matching offers" in result.output
+
+
+def test_monitor_is_running_with_missing_pid():
+    assert _monitor_is_running(9999999) is False
+
+
+def test_monitor_paths(config, project_dir):
+    config.root_dir = project_dir
+    assert _monitor_pid_file(config) == project_dir / ".hostai-cache" / "monitor.pid"
+    assert _monitor_log_file(config) == project_dir / ".hostai-cache" / "monitor.log"
+
+
+def test_maybe_start_monitor_skips_when_disabled(config, project_dir, running_state):
+    config.root_dir = project_dir
+    config.monitor.auto_start = False
+    maybe_start_monitor(config, running_state)
+    assert not _monitor_pid_file(config).exists()
+
+
+def test_maybe_start_monitor_launches_daemon(config, project_dir, running_state):
+    config.root_dir = project_dir
+    config.monitor.auto_start = True
+    running_state.instance_id = 12345
+
+    def fake_callback(config, profile, group, interval, threshold):
+        _monitor_pid_file(config).parent.mkdir(parents=True, exist_ok=True)
+        _monitor_pid_file(config).write_text("12345")
+
+    with mock.patch("hostai.commands.monitor._start_monitor", fake_callback):
+        maybe_start_monitor(config, running_state)
+    assert _monitor_pid_file(config).read_text() == "12345"
+
+
+def test_maybe_start_monitor_inside_click_context(config, project_dir, running_state):
+    """Regression test: maybe_start_monitor used to double-pass config to the command callback."""
+    config.root_dir = project_dir
+    config.monitor.auto_start = True
+    running_state.instance_id = 12345
+
+    @click.command()
+    @click.pass_obj
+    def inner(cfg):
+        maybe_start_monitor(cfg, running_state)
+
+    def fake_start(cfg, profile, group, interval, threshold):
+        _monitor_pid_file(cfg).parent.mkdir(parents=True, exist_ok=True)
+        _monitor_pid_file(cfg).write_text("12345")
+
+    with mock.patch("hostai.commands.monitor._start_monitor", fake_start):
+        runner = CliRunner()
+        result = runner.invoke(inner, [], obj=config)
+    assert result.exit_code == 0
+    assert _monitor_pid_file(config).read_text() == "12345"
+
+
+def test_stop_monitor_with_missing_pid(config, project_dir):
+    config.root_dir = project_dir
+    stop_monitor(config)
+    # No-op should not raise.
+
+
+def test_cmd_monitor_stop_kills_running(config, project_dir):
+    config.root_dir = project_dir
+    _monitor_pid_file(config).parent.mkdir(parents=True, exist_ok=True)
+    _monitor_pid_file(config).write_text("12345")
+    with mock.patch("os.kill") as kill:
+        with mock.patch("hostai.commands.monitor._monitor_is_running", return_value=True):
+            runner = CliRunner()
+            result = runner.invoke(cmd_monitor_stop, [], obj=config)
+    assert result.exit_code == 0
+    assert kill.called
+
+
+def test_cmd_monitor_start_and_stop(config, project_dir):
+    config.root_dir = project_dir
+    config.monitor.enabled = True
+    config.monitor.interval_seconds = 60
+    with mock.patch("subprocess.Popen") as popen:
+        popen.return_value.pid = 12345
+        runner = CliRunner()
+        result = runner.invoke(cmd_monitor_start, [], obj=config)
+        assert result.exit_code == 0
+
+    runner = CliRunner()
+    with mock.patch("os.kill"):
+        with mock.patch("hostai.commands.monitor._monitor_is_running", return_value=True):
+            result = runner.invoke(cmd_monitor_stop, [], obj=config)
+    assert result.exit_code == 0
+
+
+def test_cmd_monitor_status_no_daemon(config, project_dir):
+    config.root_dir = project_dir
+    runner = CliRunner()
+    result = runner.invoke(cmd_monitor_status, [], obj=config)
+    assert result.exit_code == 0
+    assert "not running" in result.output.lower()
+
+
+def test_cmd_monitor_logs(config, project_dir):
+    config.root_dir = project_dir
+    _monitor_log_file(config).parent.mkdir(parents=True, exist_ok=True)
+    _monitor_log_file(config).write_text("log line 1\nlog line 2\n")
+    runner = CliRunner()
+    result = runner.invoke(cmd_monitor_logs, ["--lines", "1"], obj=config)
+    assert result.exit_code == 0
+    assert "log line 2" in result.output
