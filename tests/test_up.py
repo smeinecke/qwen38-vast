@@ -258,3 +258,39 @@ def test_cmd_up_fresh(config, project_dir):
     assert result.exit_code == 0
     assert provider.create_instance.called
     assert core.called
+
+
+def test_do_fresh_core_no_cache_unsecure(config, project_dir):
+    state = State(project_dir / ".hostai-vast" / "state.json")
+    state.instance_id = 12345
+    state.ssh_url = "ssh://root@203.0.113.1:2222"
+    state.unsecure = True
+    state.slot_cache_enabled = False
+    state.proxy_tokenized_only = False
+    state.started_epoch = up._now_epoch()
+    state.dph = 0.5
+    state.profile = "test"
+    state.image = "ghcr.io/test"
+    state.gpu = "A100"
+    state.ctx_size = 32768
+    state.run_dir = project_dir / "run-123"
+    state.run_dir.mkdir()
+    state.save()
+    config.proxy.tokenized_only = False
+    config.cache.enabled = False
+    client = mock.Mock()
+    with mock.patch("hostai.commands.up._wait_for_ssh_endpoint"):
+        with mock.patch("hostai.commands.up.ssh.wait_for_ssh", return_value=True):
+            with mock.patch("hostai.commands.up.ssh.run_remote") as run:
+                run.return_value = mock.Mock(returncode=0)
+                with mock.patch("hostai.commands.up.ssh.ensure_tunnel", return_value=18080):
+                    with mock.patch("hostai.commands.up.State.load", return_value=state):
+                        with mock.patch("hostai.commands.up._write_env_file") as write_env:
+                            with mock.patch("hostai.commands.up.LlamaClient", return_value=client):
+                                with mock.patch("hostai.commands.up._wait_for_api"):
+                                    with mock.patch("hostai.commands.up._capture_disk_telemetry", return_value=None):
+                                        with mock.patch("hostai.commands.up.maybe_start_watchdog"):
+                                            with mock.patch("hostai.commands.up.maybe_start_monitor"):
+                                                up._do_fresh_core(config, state, _make_image_mock(), no_cache=True, abort_if_shm_too_small=False)
+    assert state.status == "running"
+    write_env.assert_called_once()
