@@ -162,9 +162,6 @@ def build_search_query(
     query = re.sub(r"\s+", " ", query).strip()
     query += f" disk_space>={disk_gb}"
 
-    # Exclude the consistently slow/unstable China RTX 5090 host.
-    query += " machine_id != 148003"
-
     return query, max_dph
 
 
