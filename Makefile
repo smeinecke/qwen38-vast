@@ -37,7 +37,7 @@ test-cov:
 		--cov=hostai \
 		--cov-report=xml \
 		--cov-report=term-missing \
-		--cov-fail-under=60
+		--cov-fail-under=85
 
 # Dead code detection
 vulture:

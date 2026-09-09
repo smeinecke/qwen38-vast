@@ -1,6 +1,8 @@
 """Regression tests for the validation/gating machinery."""
 
 import json
+import sys
+from unittest import mock
 
 import pytest
 from click.testing import CliRunner
@@ -187,3 +189,56 @@ def test_record_validation_overwrites_current_but_not_success_on_repo_only(tmp_p
     last_success = load_last_validation(tmp_path, success=True)
     assert last_success is not None
     assert last_success.level == "production"
+
+
+def test_cmd_validate_production_runs_docker_and_tests(config, tmp_path, monkeypatch):
+    """A clean production run with --no-build must still inspect the image and run tests."""
+    config.root_dir = tmp_path
+    monkeypatch.setattr("hostai.commands.validate_repo.validate_repo", lambda root, cfg=None: [])
+    monkeypatch.setattr(utils, "git_commit", lambda root: "abc1234")
+    monkeypatch.setattr(utils, "is_dirty_tree", lambda root: False)
+    monkeypatch.setattr("shutil.which", lambda cmd: cmd == "docker")
+    monkeypatch.setattr("hostai.validate._image_info", lambda image: ("sha256:111111111111", ""))
+
+    completed = mock.Mock(returncode=0, stdout="5 passed", stderr="")
+    with mock.patch("subprocess.run", return_value=completed) as run:
+        runner = CliRunner()
+        result = runner.invoke(cmd_validate, ["--production", "--no-build"], obj=config)
+
+    assert result.exit_code == 0
+    assert "level=production" in result.output
+    assert any(call.args[0][0] == "docker" and call.args[0][1] == "image" for call in run.call_args_list)
+    assert any(call.args[0][0] == sys.executable for call in run.call_args_list)
+
+
+def test_cmd_validate_production_fails_when_docker_missing(config, tmp_path, monkeypatch):
+    """Production validation without docker reports an error."""
+    config.root_dir = tmp_path
+    monkeypatch.setattr("hostai.commands.validate_repo.validate_repo", lambda root, cfg=None: [])
+    monkeypatch.setattr(utils, "git_commit", lambda root: "abc1234")
+    monkeypatch.setattr(utils, "is_dirty_tree", lambda root: False)
+    monkeypatch.setattr("hostai.commands.validate_repo.shutil.which", lambda cmd: None)
+
+    runner = CliRunner()
+    result = runner.invoke(cmd_validate, ["--production"], obj=config)
+    assert result.exit_code != 0
+    assert "docker" in result.output.lower()
+
+
+def test_cmd_validate_compare_warns_on_drift(config, tmp_path, monkeypatch):
+    """--compare must warn when the last successful validation differs."""
+    config.root_dir = tmp_path
+    monkeypatch.setattr("hostai.commands.validate_repo.validate_repo", lambda root, cfg=None: [])
+    monkeypatch.setattr(utils, "git_commit", lambda root: "abc1234")
+    monkeypatch.setattr(utils, "is_dirty_tree", lambda root: False)
+    monkeypatch.setattr("hostai.validate._image_info", lambda image: ("sha256:111111111111", ""))
+
+    previous = _make_record(git_commit="oldcommit")
+    success = tmp_path / ".hostai-vast" / "validation-last-success.json"
+    success.parent.mkdir(parents=True, exist_ok=True)
+    success.write_text(json.dumps(previous.to_dict()))
+
+    runner = CliRunner()
+    result = runner.invoke(cmd_validate, ["--compare"], obj=config)
+    assert result.exit_code == 0
+    assert "DRIFT" in result.output

@@ -111,6 +111,11 @@ def _connect_kwargs(known_hosts: Optional[Path] = None, identity: Optional[Path]
         kwargs["known_hosts"] = None
     if identity:
         kwargs["client_keys"] = [str(identity)]
+        # Only use the explicitly selected key.  If the user has many keys
+        # loaded in an ssh-agent, asyncssh may offer them all and the server
+        # can disconnect with "Too many authentication failures" before the
+        # correct one is tried.
+        kwargs["agent_path"] = None
     return kwargs
 
 
