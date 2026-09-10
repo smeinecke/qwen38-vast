@@ -110,6 +110,56 @@ def _is_request_active(client: api.LlamaClient, previous: Dict[str, Any]) -> tup
     return "inactive", current
 
 
+def _decide_shutdown(
+    config: Config,
+    state: State,
+    activity_state: ActivityState,
+    consecutive_inactive: int,
+    trigger: str,
+    now: float,
+    last_activity_epoch: float,
+) -> Optional[str]:
+    """Return a shutdown reason if the trigger should now stop the instance.
+
+    ``trigger`` is either ``idle-timeout`` or ``max-runtime``.  Emits the
+    appropriate log line and returns the trigger string when shutdown should
+    proceed; otherwise returns ``None``.
+    """
+    idle_observations_ok = consecutive_inactive >= MIN_IDLE_OBSERVATIONS
+    is_idle = activity_state == "inactive" and idle_observations_ok
+
+    if trigger == "idle-timeout":
+        if is_idle:
+            _log(
+                config,
+                f"idle for {now - last_activity_epoch:.0f}s ({consecutive_inactive} consecutive inactive observations); destroying instance {state.instance_id}",
+            )
+            return "idle-timeout"
+        if activity_state == "inactive":
+            _log(
+                config,
+                f"idle timeout reached but only {consecutive_inactive} inactive observation(s); waiting for {MIN_IDLE_OBSERVATIONS}",
+            )
+        elif activity_state == "active":
+            _log(config, "idle timeout reached but request still active; waiting")
+        else:
+            _log(config, "idle timeout reached but activity state unknown; waiting")
+    else:  # max-runtime
+        if is_idle:
+            _log(
+                config,
+                f"max runtime reached and idle ({consecutive_inactive} observations); destroying instance {state.instance_id}",
+            )
+            return "max-runtime"
+        if activity_state == "inactive":
+            _log(config, f"max runtime reached but only {consecutive_inactive} inactive observation(s); waiting")
+        elif activity_state == "active":
+            _log(config, "max runtime reached but request still active; waiting")
+        else:
+            _log(config, "max runtime reached but activity state unknown; waiting")
+    return None
+
+
 def _run_once(
     config: Config,
     state: State,
@@ -147,38 +197,16 @@ def _run_once(
     idle_elapsed = (
         config.vast.idle_timeout_seconds is not None and now - last_activity_epoch >= config.vast.idle_timeout_seconds
     )
-    idle_observations_ok = consecutive_inactive >= MIN_IDLE_OBSERVATIONS
 
     reason: Optional[str] = None
     if idle_elapsed:
-        if activity_state == "inactive" and idle_observations_ok:
-            reason = "idle-timeout"
-            _log(
-                config,
-                f"idle for {now - last_activity_epoch:.0f}s ({consecutive_inactive} consecutive inactive observations); destroying instance {state.instance_id}",
-            )
-        elif activity_state == "inactive":
-            _log(
-                config,
-                f"idle timeout reached but only {consecutive_inactive} inactive observation(s); waiting for {MIN_IDLE_OBSERVATIONS}",
-            )
-        elif activity_state == "active":
-            _log(config, "idle timeout reached but request still active; waiting")
-        elif activity_state == "unknown":
-            _log(config, "idle timeout reached but activity state unknown; waiting")
+        reason = _decide_shutdown(
+            config, state, activity_state, consecutive_inactive, "idle-timeout", now, last_activity_epoch
+        )
     elif max_runtime_elapsed:
-        if activity_state == "inactive" and idle_observations_ok:
-            reason = "max-runtime"
-            _log(
-                config,
-                f"max runtime reached and idle ({consecutive_inactive} observations); destroying instance {state.instance_id}",
-            )
-        elif activity_state == "inactive":
-            _log(config, f"max runtime reached but only {consecutive_inactive} inactive observation(s); waiting")
-        elif activity_state == "active":
-            _log(config, "max runtime reached but request still active; waiting")
-        elif activity_state == "unknown":
-            _log(config, "max runtime reached but activity state unknown; waiting")
+        reason = _decide_shutdown(
+            config, state, activity_state, consecutive_inactive, "max-runtime", now, last_activity_epoch
+        )
 
     if reason:
         try:
