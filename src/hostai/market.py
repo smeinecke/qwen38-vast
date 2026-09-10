@@ -225,6 +225,69 @@ def offer_download_estimate(
     return size_gb, download_seconds, transfer_cost
 
 
+def _read_run_metadata(run_dir: Path) -> Dict[str, Any]:
+    """Read a run directory's ``metadata.json`` (``{}`` when absent/invalid)."""
+    meta_path = run_dir / "metadata.json"
+    if not meta_path.exists():
+        return {}
+    try:
+        return json.loads(meta_path.read_text())
+    except Exception:
+        return {}
+
+
+def _collect_benchmark_samples(
+    run_dir: Path,
+    meta: Dict[str, Any],
+    stats: Dict[str, Dict[str, List[float]]],
+) -> None:
+    """Append prompt/decode tps samples from a run's benchmarks into ``stats``."""
+    bench_root = run_dir / "benchmarks"
+    if not bench_root.exists():
+        return
+    for bench_dir in bench_root.iterdir():
+        metrics_path = bench_dir / "metrics.json"
+        if not metrics_path.exists():
+            continue
+        try:
+            data = json.loads(metrics_path.read_text())
+        except Exception:
+            continue
+        perf = data.get("performance") or {}
+        session = data.get("session") or {}
+        bench_gpu = re_normalize_gpu(str(session.get("gpu", meta.get("gpu", ""))))
+        if not bench_gpu:
+            continue
+        entry = stats.setdefault(bench_gpu, {})
+        for key in ("prompt_tps", "decode_tps"):
+            value = perf.get(key)
+            if isinstance(value, (int, float)) and value > 0:
+                entry.setdefault(key, []).append(float(value))
+
+
+def _aggregate_gpu_stats(
+    stats: Dict[str, Dict[str, List[float]]],
+    startup_stats: Dict[str, List[float]],
+) -> Dict[str, Dict[str, Any]]:
+    """Reduce per-GPU sample lists into median statistics."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for gpu, values in stats.items():
+        prompt = values.get("prompt_tps", [])
+        decode = values.get("decode_tps", [])
+        if len(prompt) + len(decode) == 0:
+            continue
+        out[gpu] = {
+            "prompt_tps": statistics.median(prompt) if prompt else None,
+            "decode_tps": statistics.median(decode) if decode else None,
+            "prompt_samples": len(prompt),
+            "decode_samples": len(decode),
+        }
+        if gpu in startup_stats:
+            out[gpu]["startup_seconds"] = statistics.median(startup_stats[gpu])
+            out[gpu]["startup_samples"] = len(startup_stats[gpu])
+    return out
+
+
 def historical_per_gpu_stats(
     runs_dir: Path,
     min_samples: int = 3,
@@ -248,13 +311,7 @@ def historical_per_gpu_stats(
     for run_dir in runs_dir.iterdir():
         if not run_dir.is_dir():
             continue
-        meta_path = run_dir / "metadata.json"
-        meta: Dict[str, Any] = {}
-        if meta_path.exists():
-            try:
-                meta = json.loads(meta_path.read_text())
-            except Exception:
-                pass
+        meta = _read_run_metadata(run_dir)
         started = meta.get("started_epoch") or meta.get("run_started_epoch")
         if started and int(started) < cutoff:
             continue
@@ -267,44 +324,9 @@ def historical_per_gpu_stats(
         if isinstance(startup, (int, float)) and startup > 0:
             startup_stats.setdefault(gpu, []).append(float(startup))
 
-        bench_root = run_dir / "benchmarks"
-        if not bench_root.exists():
-            continue
-        for bench_dir in bench_root.iterdir():
-            metrics_path = bench_dir / "metrics.json"
-            if not metrics_path.exists():
-                continue
-            try:
-                data = json.loads(metrics_path.read_text())
-            except Exception:
-                continue
-            perf = data.get("performance") or {}
-            session = data.get("session") or {}
-            bench_gpu = re_normalize_gpu(str(session.get("gpu", meta.get("gpu", ""))))
-            if not bench_gpu:
-                continue
-            entry = stats.setdefault(bench_gpu, {})
-            for key in ("prompt_tps", "decode_tps"):
-                value = perf.get(key)
-                if isinstance(value, (int, float)) and value > 0:
-                    entry.setdefault(key, []).append(float(value))
+        _collect_benchmark_samples(run_dir, meta, stats)
 
-    out: Dict[str, Dict[str, Any]] = {}
-    for gpu, values in stats.items():
-        prompt = values.get("prompt_tps", [])
-        decode = values.get("decode_tps", [])
-        if len(prompt) + len(decode) == 0:
-            continue
-        out[gpu] = {
-            "prompt_tps": statistics.median(prompt) if prompt else None,
-            "decode_tps": statistics.median(decode) if decode else None,
-            "prompt_samples": len(prompt),
-            "decode_samples": len(decode),
-        }
-        if gpu in startup_stats:
-            out[gpu]["startup_seconds"] = statistics.median(startup_stats[gpu])
-            out[gpu]["startup_samples"] = len(startup_stats[gpu])
-    return out
+    return _aggregate_gpu_stats(stats, startup_stats)
 
 
 def _median(values: List[float]) -> Optional[float]:
