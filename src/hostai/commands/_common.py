@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-import re
 from pathlib import Path
 from typing import Optional
 
@@ -49,28 +47,6 @@ def refresh_ssh_state(config: Config, state: State) -> bool:
         state.save()
         return True
     return False
-
-
-def fetch_llama_commit(ssh_url: Optional[str], known_hosts: Path) -> str:
-    """Read the llama.cpp commit from /etc/qwen38-build.json on the remote host."""
-    if not ssh_url:
-        return "unknown"
-    res = ssh.run_remote(
-        ssh_url,
-        "cat /etc/qwen38-build.json 2>/dev/null || true",
-        known_hosts=known_hosts,
-        timeout=30,
-    )
-    if res.returncode != 0:
-        return "unknown"
-    try:
-        data = json.loads(res.stdout or "{}")
-        commit = data.get("llama_cpp_commit", "unknown")
-        if not re.match(r"^[a-f0-9]+$", str(commit)) and commit != "unknown":
-            return "unknown"
-        return str(commit)
-    except Exception:
-        return "unknown"
 
 
 def stop_remote_model(ssh_url: Optional[str], known_hosts: Path) -> None:

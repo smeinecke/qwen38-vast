@@ -5,6 +5,7 @@ from unittest import mock
 
 from click.testing import CliRunner
 
+from hostai.cache import format_upload_log, parse_rsync_transferred_bytes, save_slot
 from hostai.commands import down
 from hostai.state import State
 
@@ -64,7 +65,7 @@ def test_client_log_writes_to_file(tmp_path):
 
 def test_format_upload_log_handles_bytes():
     res = mock.Mock(stdout="uploaded 12345 bytes", stderr="")
-    assert down._format_upload_log(res) == "=== STDOUT ===\nuploaded 12345 bytes"
+    assert format_upload_log(res) == "=== STDOUT ===\nuploaded 12345 bytes"
 
 
 def _make_slot_response(payload, status=200):
@@ -78,7 +79,7 @@ def test_slot_save_success(config, running_state):
     running_state.local_port = 18080
     payload = {"n_saved": 100, "n_written": 1000, "timings": {"save_ms": 50}}
     with mock.patch("requests.post", return_value=_make_slot_response(payload)):
-        details = down._slot_save(config, running_state)
+        details = save_slot(config, running_state)
     assert details is not None
     assert details["n_saved"] == 100
 
@@ -89,22 +90,22 @@ def test_slot_save_bad_status(config, running_state):
     response = mock.Mock(status_code=500, text="")
     response.json.return_value = {}
     with mock.patch("requests.post", return_value=response):
-        details = down._slot_save(config, running_state)
+        details = save_slot(config, running_state)
     assert details is None
 
 
 def test_parse_rsync_transferred_bytes_kilobytes():
     stdout = "Total bytes sent: 1.5K\n"
-    assert down._parse_rsync_transferred_bytes(stdout) == 1536
+    assert parse_rsync_transferred_bytes(stdout) == 1536
 
 
 def test_parse_rsync_transferred_bytes_sent_line():
     stdout = "sent 2.25M bytes  received 79 bytes\n"
-    assert down._parse_rsync_transferred_bytes(stdout) == 2359296
+    assert parse_rsync_transferred_bytes(stdout) == 2359296
 
 
 def test_parse_rsync_transferred_bytes_no_match():
-    assert down._parse_rsync_transferred_bytes("") is None
+    assert parse_rsync_transferred_bytes("") is None
 
 
 def test_cmd_down_pause_and_no_cache(config, project_dir):
@@ -168,7 +169,7 @@ def test_down_instance_pause_with_skip_confirm(config, project_dir):
         mock.patch("hostai.commands.down._stop_proxy"),
         mock.patch("hostai.commands.down._refresh_ssh_state"),
         mock.patch("hostai.commands.down.ssh.ensure_tunnel"),
-        mock.patch("hostai.commands.down._save_and_upload_slot_cache", return_value=None),
+        mock.patch("hostai.cache.save_and_upload_slot_cache", return_value=None),
         mock.patch("hostai.commands.down._archive_session"),
         mock.patch("hostai.commands.down._stop_remote_model"),
         mock.patch("hostai.commands.down.ssh.stop_tunnel"),
@@ -189,9 +190,13 @@ def test_archive_session_creates_json(config, state, tmp_path):
     state.data["slot_cache_save"] = "not-yet"
     state.ssh_url = "ssh://root@10.0.0.1:22"
     with (
-        mock.patch("hostai.commands.down._provider", return_value=mock.Mock(get_instance=mock.Mock(return_value={}))) as pi,
+        mock.patch(
+            "hostai.commands.down._provider", return_value=mock.Mock(get_instance=mock.Mock(return_value={}))
+        ) as pi,
         mock.patch("hostai.commands.down.ssh.run_remote", return_value=fake_completed()),
-        mock.patch("hostai.commands.down.api.LlamaClient", return_value=mock.Mock(health=mock.Mock(return_value=False))),
+        mock.patch(
+            "hostai.commands.down.api.LlamaClient", return_value=mock.Mock(health=mock.Mock(return_value=False))
+        ),
     ):
         down._archive_session(config, state, run_dir, no_archive=False)
     assert (run_dir / "metadata.json").exists()

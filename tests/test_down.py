@@ -5,12 +5,8 @@ from unittest import mock
 
 import requests
 
-from hostai.commands.down import (
-    _parse_rsync_transferred_bytes,
-    _pause_or_destroy,
-    _save_and_upload_slot_cache,
-    _slot_save,
-)
+from hostai.cache import parse_rsync_transferred_bytes, save_and_upload_slot_cache, save_slot
+from hostai.commands.down import _pause_or_destroy
 
 
 def fake_completed(returncode=0, stdout="", stderr=""):
@@ -22,7 +18,7 @@ def test_slot_save_parses_payload(config, running_state):
     with mock.patch(
         "requests.post", return_value=mock.Mock(status_code=200, text=json.dumps(payload), json=lambda: payload)
     ) as post:
-        result = _slot_save(config, running_state)
+        result = save_slot(config, running_state)
     assert result["n_saved"] == 100
     assert result["n_written"] == 1024
     assert post.call_args.args[0] == "https://127.0.0.1:18080/slots/0?action=save"
@@ -34,13 +30,13 @@ def test_slot_save_empty_slot(config, running_state):
     with mock.patch(
         "requests.post", return_value=mock.Mock(status_code=200, text=json.dumps(payload), json=lambda: payload)
     ):
-        result = _slot_save(config, running_state)
+        result = save_slot(config, running_state)
     assert result is None
 
 
 def test_slot_save_api_error(config, running_state):
     with mock.patch("requests.post", side_effect=requests.RequestException("boom")):
-        result = _slot_save(config, running_state)
+        result = save_slot(config, running_state)
     assert result is None
 
 
@@ -52,14 +48,12 @@ def test_save_and_upload_slot_cache_happy_path(config, running_state, tmp_path):
     with mock.patch(
         "requests.post", return_value=mock.Mock(status_code=200, text=json.dumps(payload), json=lambda: payload)
     ):
-        with mock.patch("hostai.commands.down._install_cache_key_on_vast", return_value=True):
-            with mock.patch("hostai.commands.down._fetch_llama_commit", return_value="abc123"):
-                with mock.patch("hostai.commands.down.ssh.run_remote", return_value=fake_completed()):
-                    with mock.patch("hostai.commands.down.ssh.scp_to", return_value=fake_completed()):
-                        with mock.patch(
-                            "hostai.commands.down._upload_slot_cache_from_vast", return_value=(True, 12345)
-                        ):
-                            result = _save_and_upload_slot_cache(
+        with mock.patch("hostai.cache.install_cache_key_on_vast", return_value=True):
+            with mock.patch("hostai.cache.fetch_llama_commit", return_value="abc123"):
+                with mock.patch("hostai.cache.ssh.run_remote", return_value=fake_completed()):
+                    with mock.patch("hostai.cache.ssh.scp_to", return_value=fake_completed()):
+                        with mock.patch("hostai.cache.upload_slot_cache_from_vast", return_value=(True, 12345)):
+                            result = save_and_upload_slot_cache(
                                 config,
                                 running_state,
                                 run_dir,
@@ -76,7 +70,7 @@ def test_save_and_upload_slot_cache_happy_path(config, running_state, tmp_path):
 
 def test_save_and_upload_slot_cache_disabled(config, running_state, tmp_path):
     running_state.slot_cache_enabled = False
-    result = _save_and_upload_slot_cache(
+    result = save_and_upload_slot_cache(
         config,
         running_state,
         tmp_path / "run",
@@ -89,7 +83,7 @@ def test_save_and_upload_slot_cache_disabled(config, running_state, tmp_path):
 def test_save_and_upload_slot_cache_no_ssh(config, running_state, tmp_path):
     running_state.ssh_url = None
     config.cache.require_save = False
-    result = _save_and_upload_slot_cache(
+    result = save_and_upload_slot_cache(
         config,
         running_state,
         tmp_path / "run",
@@ -101,18 +95,18 @@ def test_save_and_upload_slot_cache_no_ssh(config, running_state, tmp_path):
 
 def test_parse_rsync_transferred_bytes_with_units():
     stdout = "...\nTotal bytes sent: 838.46K\n...\n"
-    assert _parse_rsync_transferred_bytes(stdout) == int(838.46 * 1024)
+    assert parse_rsync_transferred_bytes(stdout) == int(838.46 * 1024)
 
     stdout = "...\nsent 12.5M bytes  received 100 bytes\n"
-    assert _parse_rsync_transferred_bytes(stdout) == int(12.5 * 1024 * 1024)
+    assert parse_rsync_transferred_bytes(stdout) == int(12.5 * 1024 * 1024)
 
     stdout = "...\nTotal bytes sent: 1234\n"
-    assert _parse_rsync_transferred_bytes(stdout) == 1234
+    assert parse_rsync_transferred_bytes(stdout) == 1234
 
 
 def test_parse_rsync_transferred_bytes_no_match():
-    assert _parse_rsync_transferred_bytes("") is None
-    assert _parse_rsync_transferred_bytes("no stats here") is None
+    assert parse_rsync_transferred_bytes("") is None
+    assert parse_rsync_transferred_bytes("no stats here") is None
 
 
 def _mock_provider(**kwargs):

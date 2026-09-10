@@ -14,11 +14,12 @@ import shlex
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import click
+import requests
 
-from hostai import ssh, utils
+from hostai import api, ssh, utils
 from hostai.config import Config
 from hostai.state import State
 
@@ -905,3 +906,315 @@ def validate_cache(local_dir: Path) -> bool:
         return True
 
     return True
+
+
+def fetch_llama_commit(ssh_url: Optional[str], known_hosts: Path) -> str:
+    """Read the llama.cpp commit from /etc/qwen38-build.json on the remote host."""
+    if not ssh_url:
+        return "unknown"
+    res = ssh.run_remote(
+        ssh_url,
+        "cat /etc/qwen38-build.json 2>/dev/null || true",
+        known_hosts=known_hosts,
+        timeout=30,
+    )
+    if res.returncode != 0:
+        return "unknown"
+    try:
+        data = json.loads(res.stdout or "{}")
+        commit = data.get("llama_cpp_commit", "unknown")
+        if not re.match(r"^[a-f0-9]+$", str(commit)) and commit != "unknown":
+            return "unknown"
+        return str(commit)
+    except Exception:
+        return "unknown"
+
+
+def save_slot(config: Config, state: State, slot_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    """POST /slots/<slot_id>?action=save and parse the response."""
+    client = api.LlamaClient(config, state)
+    slot_id = slot_id if slot_id is not None else config.cache.slot_id
+    url = f"{client.base_url}/slots/{slot_id}?action=save"
+    try:
+        response = requests.post(
+            url,
+            headers=client._headers,
+            json={"filename": "current.bin"},
+            verify=client._verify,
+            timeout=(5, 1800),
+        )
+    except Exception as exc:
+        click.echo(f"[slot-cache] WARNING: slot save API request failed: {exc}", err=True)
+        return None
+
+    if response.status_code != 200:
+        click.echo(f"[slot-cache] WARNING: slot save API returned {response.status_code}", err=True)
+        return None
+
+    payload = response.json() if response.text else {}
+    n_saved = payload.get("n_saved", 0)
+    n_written = payload.get("n_written", 0)
+    save_ms = payload.get("timings", {}).get("save_ms", 0)
+    if not n_saved:
+        click.echo("[slot-cache] slot is empty; nothing to persist.")
+        return None
+    return {
+        "n_saved": n_saved,
+        "n_written": n_written,
+        "save_ms": save_ms,
+        "payload": payload,
+    }
+
+
+_RSYNC_SIZE_UNITS = {
+    "B": 1,
+    "K": 1024,
+    "M": 1024**2,
+    "G": 1024**3,
+    "T": 1024**4,
+    "P": 1024**5,
+}
+
+
+def parse_rsync_transferred_bytes(stdout: str) -> Optional[int]:
+    """Extract the actual bytes rsync transferred from --stats/--info=stats2 output.
+
+    When a previous ``current.bin`` is delta-seeded, this will be far smaller
+    than the slot snapshot size.
+    """
+    if not stdout:
+        return None
+    # rsync --stats2 prints a line like:
+    #   Total bytes sent: 838.46K
+    # or, without stats2, a final line like:
+    #   sent 838.46K bytes  received 79 bytes ...
+    for pattern in (
+        r"Total bytes sent:\s+([\d.,]+)\s*([KMGTPE]?)B?",
+        r"\bsent\s+([\d.,]+)\s*([KMGTPE]?)\s*bytes?\b",
+    ):
+        m = re.search(pattern, stdout, re.IGNORECASE)
+        if m:
+            try:
+                num = float(m.group(1).replace(",", ""))
+            except ValueError:
+                continue
+            unit = m.group(2).upper()
+            return int(num * _RSYNC_SIZE_UNITS.get(unit, 1))
+    return None
+
+
+def format_upload_log(res: Any) -> str:
+    """Combine stdout and stderr from the upload remote command into one log.
+
+    Capturing both is essential for diagnosing rclone/rsync failures because
+    the scripts intentionally write little or no stdout and report errors on
+    stderr.
+    """
+    parts = []
+    if res.stdout:
+        parts.append("=== STDOUT ===\n" + res.stdout)
+    if res.stderr:
+        parts.append("=== STDERR ===\n" + res.stderr)
+    return "".join(parts)
+
+
+_RSYNC_UPLOAD_SCRIPT = """set -Eeuo pipefail
+umask 077
+cache_host="$1"; cache_port="$2"; cache_user="$3"; remote_dir="$4"; slot_dir="$5"; cache_root="$6"
+key=/root/.ssh/qwen-slot-cache
+known=/root/.ssh/qwen-slot-cache-known_hosts
+mkdir -p /root/.ssh
+touch "$known"
+chmod 600 "$known"
+ssh_base="ssh -n -i $key -p $cache_port -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$known"
+$ssh_base "${cache_user}@${cache_host}" "mkdir -p '$remote_dir' && chmod 700 '$cache_root' '$cache_root/'* 2>/dev/null || true; mkdir -p '$remote_dir'"
+# Delta-seed: if a previous current.bin exists, copy it to .current.bin.part so
+# rsync only has to ship the changed blocks.  cp --reflink=auto is best-effort.
+$ssh_base "${cache_user}@${cache_host}" "if [ -f '$remote_dir/current.bin' ]; then cp --reflink=auto '$remote_dir/current.bin' '$remote_dir/.current.bin.part' 2>/dev/null || cp '$remote_dir/current.bin' '$remote_dir/.current.bin.part' 2>/dev/null || true; fi"
+for attempt in 1 2 3; do
+  if rsync -a --inplace --partial --info=progress2,stats2 -e "ssh -i $key -p $cache_port -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$known" "$slot_dir/current.bin" "${cache_user}@${cache_host}:${remote_dir}/.current.bin.part" < /dev/null; then
+    break
+  fi
+  (( attempt == 3 )) && { echo >&2 "[slot-cache] upload failed after 3 attempts"; exit 15; }
+  echo >&2 "[slot-cache] upload attempt $attempt failed; retrying in 3s..."
+  sleep 3
+done
+for attempt in 1 2 3; do
+  if rsync -a --inplace --partial -e "ssh -i $key -p $cache_port -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$known" "$slot_dir/current.json" "${cache_user}@${cache_host}:${remote_dir}/.current.json.part" < /dev/null; then
+    break
+  fi
+  (( attempt == 3 )) && { echo >&2 "[slot-cache] metadata upload failed after 3 attempts"; exit 16; }
+  echo >&2 "[slot-cache] metadata upload attempt $attempt failed; retrying in 3s..."
+  sleep 3
+done
+$ssh_base "${cache_user}@${cache_host}" "chmod 600 '$remote_dir/.current.bin.part' '$remote_dir/.current.json.part' && mv -f '$remote_dir/.current.bin.part' '$remote_dir/current.bin' && mv -f '$remote_dir/.current.json.part' '$remote_dir/current.json'"
+echo "ok"
+"""
+
+
+def upload_slot_cache_from_vast(
+    ssh_url: str,
+    config: Config,
+    slot_dir: str,
+    remote_dir: str,
+    known_hosts: Path,
+    upload_log: Optional[Path] = None,
+) -> Tuple[bool, Optional[int]]:
+    """Push current.bin/json to the cache server (rsync or rclone).
+
+    Returns ``(success, transferred_bytes)``.  For rsync the transferred bytes
+    are parsed from the command output so delta-seeded uploads report the
+    incremental amount, not the full snapshot size.  For rclone the value is
+    ``None`` because rclone does not expose the same delta statistics in this
+    path.
+    """
+    cache_configured = config.cache.host or config.cache.rclone_url or config.cache.rclone_remote
+    if not cache_configured:
+        return False, None
+
+    if config.cache.rclone:
+        script = rclone_upload_script(config, slot_dir, remote_dir)
+        res = ssh.run_remote(ssh_url, "bash -s", input_data=script, known_hosts=known_hosts, timeout=5400)
+        if upload_log is not None:
+            upload_log.parent.mkdir(parents=True, exist_ok=True)
+            upload_log.write_text(format_upload_log(res))
+        ok = res.returncode == 0 and "ok" in (res.stdout or "")
+        return ok, None
+
+    args = [config.cache.host, str(config.cache.port), config.cache.user, remote_dir, slot_dir, config.cache.root]
+    arg_str = " ".join(shlex.quote(str(a)) for a in args)
+    res = ssh.run_remote(
+        ssh_url, f"bash -s {arg_str}", input_data=_RSYNC_UPLOAD_SCRIPT, known_hosts=known_hosts, timeout=5400
+    )
+    if upload_log is not None:
+        upload_log.parent.mkdir(parents=True, exist_ok=True)
+        upload_log.write_text(format_upload_log(res))
+    ok = res.returncode == 0 and "ok" in (res.stdout or "")
+    transferred = parse_rsync_transferred_bytes(res.stdout or "") if ok else None
+    return ok, transferred
+
+
+def save_and_upload_slot_cache(
+    config: Config,
+    state: State,
+    run_dir: Path,
+    no_cache: bool,
+    known_hosts: Path,
+    slot_id: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """Save slot, create metadata and upload to the cache server.
+
+    Returns the slot-save details (including ``save_ms``, ``n_written``,
+    ``upload_duration_s``, and ``uploaded``) when a cache is saved.  Returns
+    ``None`` when the slot is empty, cache is disabled, or the upload fails
+    without ``require_save``.
+    """
+    cache_configured = config.cache.host or config.cache.rclone_url or config.cache.rclone_remote
+    if no_cache or not state.slot_cache_enabled or not cache_configured:
+        return None
+
+    if not state.ssh_url:
+        click.echo("[slot-cache] WARNING: no SSH endpoint; cannot save slot", err=True)
+        if config.cache.require_save:
+            raise click.ClickException("slot cache save failed and require_save is set")
+        return None
+
+    if not config.cache.rclone and not install_cache_key_on_vast(state, config):
+        click.echo("[slot-cache] WARNING: could not install cache key on Vast", err=True)
+        if config.cache.require_save:
+            raise click.ClickException("slot cache key install failed and require_save is set")
+        return None
+
+    llama_commit = state.data.get("llama_cpp_commit")
+    if not llama_commit or not re.match(r"^[a-f0-9]+$", str(llama_commit)):
+        llama_commit = fetch_llama_commit(state.ssh_url, known_hosts)
+
+    signature = _signature_for_state(config, state, llama_commit)
+
+    state.set("llama_cpp_commit", llama_commit)
+    state.set("slot_cache_signature", signature)
+    state.save()
+
+    details = save_slot(config, state, slot_id=slot_id)
+    if not details:
+        state.set("slot_cache_save", "empty")
+        state.save()
+        return None
+
+    (run_dir / "cache-save.json").write_text(
+        json.dumps(details.get("payload", {}), indent=2, ensure_ascii=False) + "\n"
+    )
+
+    n_saved = int(details.get("n_saved", 0))
+    n_written = int(details.get("n_written", 0))
+    save_ms = float(details.get("save_ms", 0))
+    click.echo(
+        f"[slot-cache] llama.cpp wrote {n_saved} tokens / {n_written} bytes "
+        f"({save_ms} ms); uploading to {config.cache.host}..."
+    )
+
+    # Use the actual slot dir recorded by up.py (it may have fallen back to
+    # disk after a /dev/shm preflight), falling back to the configured default.
+    slot_dir = state.slot_cache_local_dir or _default_local_dir(config)
+    use_fastmtp = 1 if state.data.get("use_fastmtp", config.model.use_fastmtp) else 0
+    metadata = {
+        "schema_version": 1,
+        "saved_at": utils.now_rfc3339(),
+        "signature": signature,
+        "session": state.slot_cache_session,
+        "model": state.data.get("model", config.model.model),
+        "hf_revision": state.data.get("hf_revision", config.model.hf_revision),
+        "ctx_size": state.ctx_size,
+        "use_fastmtp": use_fastmtp,
+        "llama_cpp_commit": llama_commit,
+        "profile": state.profile,
+        "source_instance_id": state.instance_id,
+        "slot_id": slot_id if slot_id is not None else config.cache.slot_id,
+        "n_saved": n_saved,
+        "n_written": n_written,
+        "save_ms": save_ms,
+    }
+
+    meta_path = run_dir / "current.json"
+    meta_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False) + "\n")
+    meta_path.chmod(0o600)
+
+    ssh.run_remote(state.ssh_url, f"install -d -m 700 {slot_dir}", known_hosts=known_hosts, timeout=30)
+    res = ssh.scp_to(state.ssh_url, meta_path, f"{slot_dir}/current.json.tmp", known_hosts=known_hosts, timeout=60)
+    if res.returncode == 0:
+        ssh.run_remote(
+            state.ssh_url,
+            f"mv {slot_dir}/current.json.tmp {slot_dir}/current.json && chmod 600 {slot_dir}/current.json",
+            known_hosts=known_hosts,
+            timeout=30,
+        )
+
+    remote_dir = remote_cache_dir(config, signature, state.slot_cache_session)
+
+    upload_log = run_dir / "cache-upload.log"
+    upload_start = time.monotonic()
+    ok, transferred = upload_slot_cache_from_vast(state.ssh_url, config, slot_dir, remote_dir, known_hosts, upload_log)
+    details["uploaded"] = ok
+    details["cache_bytes_transferred"] = transferred
+    details["upload_duration_s"] = time.monotonic() - upload_start
+    details["n_saved"] = n_saved
+    details["n_written"] = n_written
+    details["save_ms"] = save_ms
+    if ok:
+        click.echo("[slot-cache] uploaded to cache server")
+        state.set("slot_cache_save", "uploaded")
+        state.set("slot_cache_n_saved", n_saved)
+        state.set("slot_cache_bytes_saved", n_written)
+    else:
+        click.echo("[slot-cache] WARNING: upload to cache server failed", err=True)
+        if upload_log.exists():
+            tail = "\n".join(upload_log.read_text().splitlines()[-30:])
+            if tail:
+                click.echo("[slot-cache] upload log tail:", err=True)
+                click.echo(tail, err=True)
+        state.set("slot_cache_save", "upload-failed")
+        if config.cache.require_save:
+            state.save()
+            raise click.ClickException("slot cache upload failed and require_save is set; instance not destroyed")
+    state.save()
+    return details

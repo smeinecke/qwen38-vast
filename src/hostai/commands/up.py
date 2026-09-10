@@ -1310,7 +1310,7 @@ def _start_instance_runtime(
     # slot cache restore (best effort)
     cache_remote = ""
     if cache_enabled:
-        llama_commit = state.data.get("llama_cpp_commit") or _common.fetch_llama_commit(state.ssh_url, known_hosts)
+        llama_commit = state.data.get("llama_cpp_commit") or cache.fetch_llama_commit(state.ssh_url, known_hosts)
         state.data["llama_cpp_commit"] = llama_commit
 
         if config.cache.use_shm:

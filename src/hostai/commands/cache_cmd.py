@@ -16,7 +16,6 @@ from hostai.cache import (
     rclone_remote_name,
     remote_cache_dir,
 )
-from hostai.commands import down
 from hostai.config import Config
 from hostai.state import State, runs_dir, state_dir
 
@@ -103,7 +102,7 @@ def cmd_cache_copy(config: Config, slot: Optional[int]):
     run_dir.mkdir(parents=True, exist_ok=True)
     run_dir.chmod(0o700)
 
-    details = down._save_and_upload_slot_cache(
+    details = cache.save_and_upload_slot_cache(
         config,
         state,
         run_dir,
