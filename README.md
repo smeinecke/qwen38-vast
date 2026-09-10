@@ -236,14 +236,16 @@ said success" from real avoided prompt processing.
 `profiles.json` is the single editable configuration file for architectures,
 context defaults and Vast search queries.
 
-There are four compiled CUDA images:
+There are six compiled CUDA images:
 
-| Image name | CUDA | Stable GHCR tag | GPUs |
-|---|---|---:|---|
-| `a6000` | SM86 | `:a6000` | RTX A6000, A40 |
-| `ada` | SM89 | `:ada-128k` | RTX 4090, RTX 6000 Ada, L40/L40S, RTX 5880 Ada |
-| `blackwell` | SM120 | `:blackwell-128k` | RTX 5090, RTX PRO 6000 Blackwell |
-| `v100` | SM70 | `:v100` | Tesla V100 |
+| Image name | CUDA | Platform | Stable GHCR tag | GPUs |
+|---|---|---|---:|---|
+| `a6000` | SM86 | `linux/amd64` | `:a6000` | RTX A6000, A40 |
+| `ada` | SM89 | `linux/amd64` | `:ada-128k` | RTX 4090, RTX 6000 Ada, L40/L40S, RTX 5880 Ada |
+| `blackwell` | SM120 | `linux/amd64` | `:blackwell-128k` | RTX 5090, RTX PRO 6000 Blackwell |
+| `ga100` | SM80 | `linux/amd64` | `:ga100` | NVIDIA A100 SXM4, unlocked CMP 170HX |
+| `gb10` | SM121 | `linux/arm64` | `:gb10` | NVIDIA GB10 / Grace Blackwell |
+| `v100` | SM70 | `linux/amd64` | `:v100` | Tesla V100 |
 
 Runtime profiles can reuse one compiled image. The included profiles are:
 
@@ -264,6 +266,10 @@ Runtime profiles can reuse one compiled image. The included profiles are:
 | `blackwell-128k` | `:blackwell-128k` | 131,072 | RTX 5090 or RTX PRO 6000 |
 | `blackwell-256k` | `:blackwell-128k` | 262,144 | exact RTX PRO 6000, 96 GB |
 | `pro6000-256k` | `:blackwell-128k` | 262,144 | RTX PRO 6000 family (WS/S), 96 GB |
+| `a100-128k` | `:ga100` | 131,072 | A100 SXM4 40 GB, fast single-GPU 128k option |
+| `cmp170hx-256k` | `:ga100` | 262,144 | unlocked CMP 170HX 64 GB, rejects <60 GB VRAM |
+| `gb10-128k` | `:gb10` | 131,072 | GB10 / Grace Blackwell / ARM64, 128k test/completeness |
+| `gb10-256k` | `:gb10` | 262,144 | GB10 / Grace Blackwell / ~119 GB unified / ARM64 / sm121 |
 | `v100-128k` | `:v100` | 131,072 | Tesla V100 |
 
 `256k` means the model's full 262,144-token native context. The 256k runtime
@@ -272,7 +278,8 @@ CUDA builds; `v100-128k` uses the dedicated `:v100` image. The 48 GB 256k
 profiles are deliberately explicit test profiles: actual headroom still depends
 on the selected model, KV-cache type and FastMTP configuration. The exact
 `blackwell-256k` profile is the conservative 256k Blackwell choice; the broader
-`pro6000-256k` profile also matches RTX PRO 6000 WS/S variants.
+`pro6000-256k` profile also matches RTX PRO 6000 WS/S variants. Both `a100-128k`
+and `cmp170hx-256k` share the single `:ga100` / SM80 image. `gb10-128k` and `gb10-256k` use a dedicated `:gb10` image: it is an ARM64 (`linux/arm64`) build on CUDA 13.x for sm121, separate from the x86_64 SM120 `blackwell` image.
 
 Edit `profiles.json` to tune GPU ordering, add another context profile or
 tighten a region/GPU query.
@@ -287,7 +294,9 @@ otherwise cost more than the short GPU rental itself. `hostai up` prints the
 selected offer's transfer prices before renting and also validates the raw offer
 response. Adjust `HOSTAI_MAX_INET_DOWN_COST` and `HOSTAI_MAX_INET_UP_COST` to
 allow paid traffic up to a specific price, or set them to `0.0` to require
-actually free traffic.
+actually free traffic. Current GB10 Vast offers usually charge for bandwidth
+(above $0.001/GB), so the `gb10` profiles will not match until these limits are
+raised in `.env` or `hostai.toml`.
 
 ### Market monitoring
 

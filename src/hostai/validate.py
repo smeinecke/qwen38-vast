@@ -102,6 +102,16 @@ def validate_repo(root_dir: Path, config: Optional[Config] = None) -> List[str]:
             if not profiles.resolve_profile(profiles.default_profile):
                 errors.append(f"default profile '{profiles.default_profile}' not found in profiles.json")
 
+            for p in profiles.profiles:
+                if not profiles.image_by_name(p.image):
+                    errors.append(f"profile '{p.name}' references unknown image '{p.image}'")
+
+            for img in profiles.images:
+                if img.platform not in ("linux/amd64", "linux/arm64"):
+                    errors.append(f"image '{img.name}' has unsupported platform '{img.platform}'")
+                if img.platform == "linux/arm64" and (not img.builder_base or not img.runtime_base):
+                    errors.append(f"image '{img.name}' is ARM64 but is missing builder_base and/or runtime_base")
+
             # Any explicit disk_space constraint in a profile query will be
             # replaced by the resolved disk allocation.  Flag values that are
             # lower than the resolved disk as contradictions.

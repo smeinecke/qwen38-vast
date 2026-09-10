@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -44,7 +45,8 @@ def _log(message: str, err: bool = False) -> None:
 @click.option("--max-price", type=float, help="Maximum all-in $/h.")
 @click.option("--unverified", is_flag=True, help="Also consider unverified/unknown hosts.")
 @click.option("--unsecure", is_flag=True, help="Use legacy TCP/no-TLS mode.")
-@click.option("--no-cache", is_flag=True, help="Disable slot cache.")
+@click.option("--cache", is_flag=True, help="Enable slot cache for this run.")
+@click.option("--no-cache", is_flag=True, help="Disable slot cache for this run.")
 @click.option("--keep-on-failure", is_flag=True, help="Do not destroy the instance if provisioning fails.")
 @click.option("--abort-if-shm-too-small", is_flag=True, help="Fail if /dev/shm is too small.")
 @click.option("--offer", type=int, help="Use a specific offer ID.")
@@ -69,6 +71,7 @@ def cmd_up(
     max_price: Optional[float],
     unverified: bool,
     unsecure: bool,
+    cache: bool,
     no_cache: bool,
     keep_on_failure: bool,
     abort_if_shm_too_small: bool,
@@ -95,6 +98,15 @@ def cmd_up(
 
     if scoring_mode:
         config.market.scoring_mode = scoring_mode
+
+    if cache and no_cache:
+        raise click.ClickException("cannot use both --cache and --no-cache")
+    cache_enabled = config.cache.enabled
+    if cache:
+        cache_enabled = True
+    if no_cache:
+        cache_enabled = False
+    no_cache = not cache_enabled
 
     if keep_on_failure:
         config.vast.keep_on_failure = True
@@ -267,6 +279,141 @@ def _shm_preflight(
     return 0
 
 
+def _parse_nvidia_smi_vram(output: str) -> List[Tuple[str, int]]:
+    """Parse nvidia-smi output into (gpu_name, total_mib) pairs.
+
+    Supports the machine-readable --query-gpu CSV form as well as the
+    human-readable table form used by integration test fixtures.
+    """
+    gpus: List[Tuple[str, int]] = []
+    lines = [line.rstrip() for line in output.splitlines()]
+
+    # CSV: "NVIDIA CMP 170HX, 65536" or "NVIDIA A100-SXM4-40GB, 40960 MiB"
+    for line in lines:
+        if "," not in line:
+            continue
+        parts = [p.strip() for p in line.split(",", 1)]
+        if len(parts) != 2:
+            continue
+        name, mem_part = parts
+        mem_str = re.sub(r"\s*(MiB|MB|GB|GiB|MIB|GIB)\s*$", "", mem_part, flags=re.IGNORECASE)
+        try:
+            total = int(float(mem_str))
+            gpus.append((name, total))
+        except (TypeError, ValueError):
+            continue
+
+    if gpus:
+        return gpus
+
+    # Table form: first line has the GPU name, next line has memory usage.
+    current_name: Optional[str] = None
+    for line in lines:
+        if not line:
+            continue
+        mem_match = re.search(r"(\d+)\s*(?:MiB|MB|GB|GiB)\s*/\s*(\d+)\s*(?:MiB|MB|GB|GiB)", line, re.IGNORECASE)
+        if mem_match:
+            if current_name:
+                try:
+                    total = int(mem_match.group(2))
+                    gpus.append((current_name.strip(), total))
+                except (TypeError, ValueError):
+                    pass
+                current_name = None
+            continue
+        # Look for a GPU name row: "|   0  NVIDIA ... | ..."
+        name_match = re.search(r"\|\s*\d+\s+([A-Za-z][A-Za-z0-9\s\-/_]*?)(?:\s+\||\s*$)", line)
+        if name_match:
+            current_name = name_match.group(1).strip()
+
+    return gpus
+
+
+def _gpu_vram_preflight(
+    ssh_url: Optional[str],
+    known_hosts: Path,
+    config: Config,
+    profile_name: str,
+    required_mb: Optional[int],
+    state: Optional[State] = None,
+) -> int:
+    """Check each visible GPU has at least *required_mb* of memory.
+
+    Returns 0 when the check passes or is not configured, 1 when a GPU has too
+    little memory, and 2 when nvidia-smi cannot be read.  The caller is
+    responsible for cleanup.
+    """
+    if not ssh_url or not required_mb:
+        return 0
+
+    res = ssh.run_remote(
+        ssh_url,
+        "nvidia-smi --query-gpu=gpu_name,memory.total --format=csv,noheader,nounits",
+        known_hosts=known_hosts,
+        config=config,
+        state=state,
+        timeout=30,
+    )
+    output = res.stdout if isinstance(res.stdout, str) else ""
+    if res.returncode != 0 or not output:
+        # Fall back to the default human-readable table.
+        res = ssh.run_remote(
+            ssh_url,
+            "nvidia-smi",
+            known_hosts=known_hosts,
+            config=config,
+            state=state,
+            timeout=30,
+        )
+        output = res.stdout if isinstance(res.stdout, str) else ""
+        if res.returncode != 0 or not output:
+            _log("[gpu] nvidia-smi is not available; cannot verify GPU VRAM", err=True)
+            return 2
+
+    gpus = _parse_nvidia_smi_vram(output)
+    if not gpus:
+        _log("[gpu] nvidia-smi output did not contain GPU memory; cannot verify", err=True)
+        return 2
+
+    for name, total in gpus:
+        _log(f"[gpu] {name} | VRAM={total} MiB | required>={required_mb} MiB")
+
+    smallest = min(total for _, total in gpus)
+    if smallest < required_mb:
+        _log(
+            f"ERROR: GPU exposes only {smallest} MiB VRAM; profile {profile_name} requires at least {required_mb} MiB",
+            err=True,
+        )
+        return 1
+    return 0
+
+
+def _cpu_arch_preflight(
+    ssh_url: Optional[str],
+    known_hosts: Path,
+    config: Config,
+    state: Optional[State] = None,
+) -> None:
+    """Capture the remote CPU architecture (e.g. aarch64 on GB10) for metadata."""
+    if not ssh_url or not state:
+        return
+    res = ssh.run_remote(
+        ssh_url,
+        "uname -m",
+        known_hosts=known_hosts,
+        config=config,
+        state=state,
+        timeout=5,
+    )
+    stdout = res.stdout if isinstance(res.stdout, str) else ""
+    arch = stdout.strip() if res.returncode == 0 and stdout else ""
+    if arch:
+        state.data["cpu_arch"] = arch
+        _log(f"[cpu] architecture={arch}")
+    else:
+        _log("[cpu] could not determine remote architecture; continuing", err=True)
+
+
 def _resolve_profile(config: Config, name: str) -> Tuple[Profiles, Any, Any]:
     profiles = Profiles.from_file(config.root_dir / config.hostai.profiles_file)
     p = profiles.resolve_profile(name)
@@ -380,7 +527,7 @@ def _env_dict(
     env["-p 22:22"] = "1"
 
     cache_configured = config.cache.host or config.cache.rclone_url or config.cache.rclone_remote
-    if not no_cache and config.cache.enabled and cache_configured:
+    if not no_cache and cache_configured:
         env["HOSTAI_SLOT_CACHE_ENABLED"] = "1"
         env["HOSTAI_SLOT_CACHE_HOST"] = config.cache.host
         env["HOSTAI_SLOT_CACHE_PORT"] = str(config.cache.port)
@@ -410,7 +557,7 @@ def _env_dict(
 def _extra_args(config: Config, no_cache: bool = False) -> str:
     parts = []
     shm_size_gb = config.vast.shm_size_gb
-    if shm_size_gb is None and config.cache.enabled and config.cache.use_shm and not no_cache:
+    if shm_size_gb is None and config.cache.use_shm and not no_cache:
         shm_size_gb = config.cache.shm_min_gb
     if shm_size_gb:
         parts.append(f"--shm-size={shm_size_gb}g")
@@ -906,7 +1053,7 @@ def _do_fresh(
         "use_fastmtp": config.model.use_fastmtp,
         "cache_type_k": config.model.cache_type_k or "default",
         "cache_type_v": config.model.cache_type_v or "default",
-        "slot_cache_enabled": config.cache.enabled and not no_cache,
+        "slot_cache_enabled": not no_cache,
         "slot_cache_host": config.cache.host,
         "slot_cache_port": config.cache.port,
         "slot_cache_user": config.cache.user,
@@ -976,6 +1123,8 @@ def _do_fresh(
     state.image = selected_image
     state.label = label
     state.profile = profile.name
+    state.data["min_gpu_vram_mb"] = profile.min_gpu_vram_mb
+    state.data["profile_name"] = profile.name
     state.monitor_group = profile.monitor_group or ""
     state.disk_gb = disk_gb
     state.interruptible = interruptible
@@ -988,7 +1137,7 @@ def _do_fresh(
     state.run_started_at = run_started
     state.run_started_epoch = run_epoch
     state.unsecure = unsecure
-    state.slot_cache_enabled = config.cache.enabled and not no_cache
+    state.slot_cache_enabled = not no_cache
     state.slot_cache_host = config.cache.host
     state.slot_cache_port = config.cache.port
     state.slot_cache_user = config.cache.user
@@ -1033,6 +1182,26 @@ def _do_fresh_core(
     if not ssh.wait_for_ssh(state.ssh_url, known_hosts=known_hosts, config=config, state=state, timeout=300):
         raise click.ClickException("[boot:ssh-command] timeout")
     _log(f"[boot:ssh-command] ready after {time.monotonic() - ssh_start:.1f}s")
+
+    # GPU memory preflight: fail before model download if the visible VRAM is
+    # below the profile's minimum (e.g. a locked 8/10 GB CMP 170HX).
+    vram_rc = _gpu_vram_preflight(
+        state.ssh_url,
+        known_hosts,
+        config,
+        state.data.get("profile_name") or state.profile or "unknown",
+        state.data.get("min_gpu_vram_mb"),
+        state=state,
+    )
+    if vram_rc == 1:
+        # The preflight already logged the exact GPU and requirement.
+        raise click.ClickException(
+            f"GPU does not meet the {state.data.get('profile_name') or state.profile} memory requirement"
+        )
+    if vram_rc == 2:
+        raise click.ClickException("[gpu] nvidia-smi failed; cannot verify GPU VRAM")
+
+    _cpu_arch_preflight(state.ssh_url, known_hosts, config, state=state)
 
     # runtime preflight
     result = ssh.run_remote(
@@ -1250,6 +1419,26 @@ def _do_restart(
     known_hosts = state.state_file.parent / "known_hosts"
     if not ssh.wait_for_ssh(state.ssh_url, known_hosts=known_hosts, config=config, state=state, timeout=300):
         raise click.ClickException("SSH daemon did not become reachable")
+
+    # GPU memory preflight on restart: if the profile has a minimum, verify it.
+    vram_rc = _gpu_vram_preflight(
+        state.ssh_url,
+        known_hosts,
+        config,
+        state.data.get("profile_name") or state.profile or "unknown",
+        state.data.get("min_gpu_vram_mb"),
+        state=state,
+    )
+    if vram_rc == 1:
+        _cleanup_instance(config, state, "GPU memory below profile minimum")
+        raise click.ClickException(
+            f"GPU does not meet the {state.data.get('profile_name') or state.profile} memory requirement"
+        )
+    if vram_rc == 2:
+        _cleanup_instance(config, state, "nvidia-smi failed")
+        raise click.ClickException("[gpu] nvidia-smi failed; cannot verify GPU VRAM")
+
+    _cpu_arch_preflight(state.ssh_url, known_hosts, config, state=state)
 
     # TLS: deliver certificates as soon as SSH is ready, before slower cache setup.
     if not state.unsecure:

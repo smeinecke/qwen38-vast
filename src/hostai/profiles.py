@@ -54,6 +54,7 @@ class Image:
     description: str = ""
     builder_base: Optional[str] = None
     runtime_base: Optional[str] = None
+    platform: str = "linux/amd64"
 
 
 @dataclass
@@ -68,6 +69,7 @@ class Profile:
     cache_ram: Optional[int] = None
     ctx_checkpoints: Optional[int] = None
     disk_gb: Optional[int] = None
+    min_gpu_vram_mb: Optional[int] = None
 
 
 @dataclass

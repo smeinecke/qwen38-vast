@@ -183,7 +183,7 @@ def _run_once(
     if reason:
         try:
             down_instance(
-                config, state, pause=False, no_archive=False, no_cache=False, reason=reason, skip_confirm=True
+                config, state, pause=False, no_archive=False, no_cache=not state.slot_cache_enabled, reason=reason, skip_confirm=True
             )
             _watchdog_pid_file(config).unlink(missing_ok=True)
         except Exception as exc:

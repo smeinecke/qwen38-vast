@@ -261,8 +261,9 @@ fi
 
 record_disk_usage "before-serve"
 
-echo "[serve] profile=$HOSTAI_PROFILE model=$MODEL revision=$HF_REVISION ctx=$CTX_SIZE fastmtp=$USE_FASTMTP bind=$llama_bind slot_save_path=$SLOT_SAVE_PATH"
-echo "[runtime] GPU snapshot:"
+ARCH=$(uname -m 2>/dev/null || echo "unknown")
+echo "[serve] profile=$HOSTAI_PROFILE model=$MODEL revision=$HF_REVISION ctx=$CTX_SIZE fastmtp=$USE_FASTMTP bind=$llama_bind slot_save_path=$SLOT_SAVE_PATH arch=$ARCH"
+echo "[runtime] arch=$ARCH GPU snapshot:"
 nvidia-smi --query-gpu=timestamp,index,name,driver_version,memory.total,power.limit --format=csv,noheader 2>&1 || nvidia-smi 2>&1 || true
 
 if [[ "$HOSTAI_UNSECURE" == "1" ]]; then

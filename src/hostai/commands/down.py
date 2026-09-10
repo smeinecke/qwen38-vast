@@ -140,7 +140,7 @@ def _upload_slot_cache_from_vast(
 
     if config.cache.rclone:
         script = cache.rclone_upload_script(config, slot_dir, remote_dir)
-        res = ssh.run_remote(ssh_url, "bash -s", input_data=script, known_hosts=known_hosts, timeout=1800)
+        res = ssh.run_remote(ssh_url, "bash -s", input_data=script, known_hosts=known_hosts, timeout=5400)
         if upload_log is not None:
             upload_log.parent.mkdir(parents=True, exist_ok=True)
             upload_log.write_text(_format_upload_log(res))
@@ -183,7 +183,7 @@ echo "ok"
 
     args = [config.cache.host, str(config.cache.port), config.cache.user, remote_dir, slot_dir, config.cache.root]
     arg_str = " ".join(shlex.quote(str(a)) for a in args)
-    res = ssh.run_remote(ssh_url, f"bash -s {arg_str}", input_data=script, known_hosts=known_hosts, timeout=1800)
+    res = ssh.run_remote(ssh_url, f"bash -s {arg_str}", input_data=script, known_hosts=known_hosts, timeout=5400)
     if upload_log is not None:
         upload_log.parent.mkdir(parents=True, exist_ok=True)
         upload_log.write_text(_format_upload_log(res))
@@ -208,7 +208,7 @@ def _save_and_upload_slot_cache(
     without ``require_save``.
     """
     cache_configured = config.cache.host or config.cache.rclone_url or config.cache.rclone_remote
-    if no_cache or not state.slot_cache_enabled or not config.cache.enabled or not cache_configured:
+    if no_cache or not state.slot_cache_enabled or not cache_configured:
         return None
 
     if not state.ssh_url:
@@ -593,11 +593,12 @@ def down_instance(
 @click.command("down", help="Stop, save cache, and destroy/pause the current instance.")
 @click.option("--yes", is_flag=True, help="Skip confirmation.")
 @click.option("--no-archive", is_flag=True, help="Skip telemetry archive.")
-@click.option("--no-cache", is_flag=True, help="Do not save/upload the slot cache.")
+@click.option("--cache", is_flag=True, help="Save/upload the slot cache for this shutdown.")
+@click.option("--no-cache", is_flag=True, help="Do not save/upload the slot cache for this shutdown.")
 @click.option("--pause", is_flag=True, help="Pause the instance instead of destroying it.")
 @click.option("--reason", help="Shutdown reason (used by watchdog).")
 @click.pass_obj
-def cmd_down(config: Config, yes: bool, no_archive: bool, no_cache: bool, pause: bool, reason: Optional[str]) -> None:
+def cmd_down(config: Config, yes: bool, no_archive: bool, cache: bool, no_cache: bool, pause: bool, reason: Optional[str]) -> None:
     sd = state_dir(config.root_dir)
     state_file = sd / "state.json"
 
@@ -610,12 +611,22 @@ def cmd_down(config: Config, yes: bool, no_archive: bool, no_cache: bool, pause:
         click.echo("No Vast instance id in local state.")
         return
 
+    if cache and no_cache:
+        raise click.ClickException("cannot use both --cache and --no-cache")
+    cache_enabled = config.cache.enabled
+    if cache:
+        cache_enabled = True
+    if no_cache:
+        cache_enabled = False
+    if cache_enabled:
+        state.set("slot_cache_enabled", True)
+
     down_instance(
         config,
         state,
         pause=pause,
         no_archive=no_archive,
-        no_cache=no_cache,
+        no_cache=not cache_enabled,
         reason=reason,
         skip_confirm=yes,
     )

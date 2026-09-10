@@ -12,7 +12,11 @@ on:
           - a6000
           - ada
           - blackwell
+          - ga100
           - all
+          # GB10 is ARM64 / sm121 and is built separately via the docker-gb10.yml
+          # workflow on GitHub's ubuntu-24.04-arm runners. It cannot build on this
+          # x86_64 local runner.
 
 permissions:
   contents: read
@@ -46,10 +50,11 @@ jobs:
         env:
           TARGET: ${{ inputs.target }}
         run: |
+          # The local runner is x86_64; it cannot natively build linux/arm64 images.
           if [[ "$TARGET" == "all" ]]; then
-            matrix="$(jq -c '{include:[.images[] | {profile:.name,cuda_arch:.cuda_arch,image_tag:.image_tag,description:.description}]}' profiles.json)"
+            matrix="$(jq -c '{include:[.images[] | select((.platform // "linux/amd64") == "linux/amd64") | {profile:.name,cuda_arch:.cuda_arch,image_tag:.image_tag,description:.description,platform:(.platform // "linux/amd64"),builder_base:(.builder_base // "vastai/base-image:cuda-12.8.1-cudnn-devel-ubuntu24.04-py312"),runtime_base:(.runtime_base // "nvidia/cuda:12.8.1-runtime-ubuntu24.04")}]}' profiles.json)"
           else
-            matrix="$(jq -c --arg target "$TARGET" '{include:[.images[] | select(.name == $target) | {profile:.name,cuda_arch:.cuda_arch,image_tag:.image_tag,description:.description}]}' profiles.json)"
+            matrix="$(jq -c --arg target "$TARGET" '{include:[.images[] | select(.name == $target and (.platform // "linux/amd64") == "linux/amd64") | {profile:.name,cuda_arch:.cuda_arch,image_tag:.image_tag,description:.description,platform:(.platform // "linux/amd64"),builder_base:(.builder_base // "vastai/base-image:cuda-12.8.1-cudnn-devel-ubuntu24.04-py312"),runtime_base:(.runtime_base // "nvidia/cuda:12.8.1-runtime-ubuntu24.04")}]}' profiles.json)"
           fi
           [[ "$(jq '.include | length' <<<"$matrix")" -gt 0 ]] || { echo >&2 "Unknown target: $TARGET"; exit 2; }
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
@@ -96,12 +101,12 @@ jobs:
         uses: actions/cache@v5
         with:
           path: .buildkit-cache-mount
-          key: qwen38-local-ccache-v4-${{ runner.os }}-sm${{ matrix.cuda_arch }}-${{ hashFiles('Dockerfile') }}
+          key: qwen38-local-ccache-v4-${{ runner.os }}-${{ runner.arch }}-sm${{ matrix.cuda_arch }}-${{ hashFiles('Dockerfile') }}
           restore-keys: |
-            qwen38-local-ccache-v4-${{ runner.os }}-sm${{ matrix.cuda_arch }}-
-            qwen38-local-ccache-v3-${{ runner.os }}-sm${{ matrix.cuda_arch }}-
-            qwen38-ccache-v4-${{ runner.os }}-sm${{ matrix.cuda_arch }}-
-            qwen38-ccache-v3-${{ runner.os }}-sm${{ matrix.cuda_arch }}-
+            qwen38-local-ccache-v4-${{ runner.os }}-${{ runner.arch }}-sm${{ matrix.cuda_arch }}-
+            qwen38-local-ccache-v3-${{ runner.os }}-${{ runner.arch }}-sm${{ matrix.cuda_arch }}-
+            qwen38-ccache-v4-${{ runner.os }}-${{ runner.arch }}-sm${{ matrix.cuda_arch }}-
+            qwen38-ccache-v3-${{ runner.os }}-${{ runner.arch }}-sm${{ matrix.cuda_arch }}-
           save-always: true
 
       - name: Report restored compiler cache
@@ -148,11 +153,14 @@ jobs:
           platforms: linux/amd64
           push: true
           build-args: |
+            BUILDER_BASE=${{ matrix.builder_base }}
+            RUNTIME_BASE=${{ matrix.runtime_base }}
             CUDA_ARCHITECTURES=${{ matrix.cuda_arch }}
             HOSTAI_BUILD_PROFILE=${{ matrix.profile }}
+            PLATFORM=${{ matrix.platform }}
             CCACHE_SEED=${{ hashFiles('Dockerfile') }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=qwen38-sm${{ matrix.cuda_arch }}
-          cache-to: type=gha,scope=qwen38-sm${{ matrix.cuda_arch }},mode=max,ignore-error=true
+          cache-from: type=gha,scope=qwen38-${{ matrix.platform }}-sm${{ matrix.cuda_arch }}
+          cache-to: type=gha,scope=qwen38-${{ matrix.platform }}-sm${{ matrix.cuda_arch }},mode=max,ignore-error=true
           provenance: mode=max

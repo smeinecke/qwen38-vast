@@ -21,6 +21,21 @@
       "description": "RTX 5090 / RTX PRO 6000 Blackwell / SM120"
     },
     {
+      "name": "gb10",
+      "cuda_arch": "121",
+      "platform": "linux/arm64",
+      "image_tag": "gb10",
+      "description": "NVIDIA GB10 / Grace Blackwell / ARM64",
+      "builder_base": "nvidia/cuda:13.3.1-cudnn-devel-ubuntu24.04",
+      "runtime_base": "nvidia/cuda:13.3.1-runtime-ubuntu24.04"
+    },
+    {
+      "name": "ga100",
+      "cuda_arch": "80",
+      "image_tag": "ga100",
+      "description": "GA100 / A100 / CMP 170HX"
+    },
+    {
       "name": "v100",
       "cuda_arch": "70",
       "image_tag": "v100",
@@ -239,6 +254,79 @@
       "disk_gb": 35
     },
     {
+      "name": "a100-128k",
+      "aliases": [
+        "a100",
+        "a100-sxm4",
+        "a100-sxm4-128k",
+        "sm80-128k"
+      ],
+      "image": "ga100",
+      "ctx_size": 131072,
+      "cache_ram": 24576,
+      "ctx_checkpoints": 0,
+      "monitor_group": "q4-128k",
+      "gpu_query": "num_gpus=1 gpu_name=A100_SXM4 gpu_ram>=40 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
+      "monitor_search": false,
+      "disk_gb": 35,
+      "min_gpu_vram_mb": 39000
+    },
+    {
+      "name": "cmp170hx-256k",
+      "aliases": [
+        "cmp170hx",
+        "cmp-170hx",
+        "cmp170hx-64gb",
+        "sm80-256k"
+      ],
+      "image": "ga100",
+      "ctx_size": 262144,
+      "cache_ram": 32768,
+      "ctx_checkpoints": 0,
+      "monitor_group": "q4-256k",
+      "gpu_query": "num_gpus=1 gpu_name=CMP_170HX gpu_ram>=60 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
+      "monitor_search": false,
+      "disk_gb": 35,
+      "min_gpu_vram_mb": 60000
+    },
+    {
+      "name": "gb10-128k",
+      "aliases": [
+        "gb10",
+        "gb10-128k",
+        "grace-blackwell-128k",
+        "spark-128k",
+        "sm121-128k"
+      ],
+      "image": "gb10",
+      "ctx_size": 131072,
+      "cache_ram": 24576,
+      "ctx_checkpoints": 0,
+      "monitor_group": "q4-128k",
+      "gpu_query": "num_gpus=1 gpu_name=GB10 cpu_arch=arm64 gpu_ram>=115 cpu_ram>=32 reliability>0.90 inet_down>=500 disk_bw>=200 cuda_max_good>=13.0 rented=False rentable=True direct_port_count>=1",
+      "monitor_search": false,
+      "disk_gb": 35,
+      "min_gpu_vram_mb": 115000
+    },
+    {
+      "name": "gb10-256k",
+      "aliases": [
+        "gb10-256k",
+        "grace-blackwell-256k",
+        "spark-256k",
+        "sm121-256k"
+      ],
+      "image": "gb10",
+      "ctx_size": 262144,
+      "cache_ram": 32768,
+      "ctx_checkpoints": 0,
+      "monitor_group": "q4-256k",
+      "gpu_query": "num_gpus=1 gpu_name=GB10 cpu_arch=arm64 gpu_ram>=115 cpu_ram>=32 reliability>0.90 inet_down>=500 disk_bw>=200 cuda_max_good>=13.0 rented=False rentable=True direct_port_count>=1",
+      "monitor_search": false,
+      "disk_gb": 35,
+      "min_gpu_vram_mb": 115000
+    },
+    {
       "name": "v100-128k",
       "aliases": [
         "volta-128k",
@@ -336,6 +424,15 @@
           "RTX PRO 6000 Blackwell"
         ],
         "rank": 210
+      },
+      {
+        "gpu": "GB10",
+        "aliases": [
+          "GB10",
+          "NVIDIA GB10",
+          "Grace Blackwell"
+        ],
+        "rank": 220
       }
     ]
   },

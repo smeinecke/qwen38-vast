@@ -142,12 +142,14 @@ def _rclone_env_script(config: Config) -> str:
         f"export RCLONE_CONFIG_{name}_URL={shlex.quote(url)}",
         f"export RCLONE_CONFIG_{name}_USER={shlex.quote(user)}",
     ]
+    if rtype == "webdav":
+        lines.append(f"export RCLONE_CONFIG_{name}_VENDOR=other")
     if password:
         pass_quoted = shlex.quote(password)
         lines.extend(
             [
                 f"pass_plain={pass_quoted}",
-                f'export RCLONE_CONFIG_{name}_PASS="$(printf \'%s\\n\' "$pass_plain" | rclone obscure -)"',
+                f'export RCLONE_CONFIG_{name}_PASS="$(printf \'%s\' "$pass_plain" | rclone obscure -)"',
                 "unset pass_plain",
             ]
         )

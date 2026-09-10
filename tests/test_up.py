@@ -208,6 +208,7 @@ def _make_profile_mock():
     profile.ctx_size = 32768
     profile.monitor_group = ""
     profile.image = "test-img"
+    profile.min_gpu_vram_mb = None
     return profile
 
 
@@ -545,3 +546,120 @@ def test_do_restart_with_cache_and_tls(config, project_dir):
                                                                                 with mock.patch("hostai.commands.up.maybe_start_monitor"):
                                                                                     up._do_restart(config, "test", None, False, no_cache=False)
     assert state.status == "running"
+
+
+def test_parse_nvidia_smi_vram_csv():
+    out = "NVIDIA CMP 170HX, 65536\nNVIDIA A100-SXM4-40GB, 40960 MiB"
+    gpus = up._parse_nvidia_smi_vram(out)
+    assert gpus == [("NVIDIA CMP 170HX", 65536), ("NVIDIA A100-SXM4-40GB", 40960)]
+
+
+def test_parse_nvidia_smi_vram_table():
+    table = """+-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 550.54.14              Driver Version: 550.54.14      CUDA Version: 12.8     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA CMP 170HX                 |   00000000:00:00.0 Off |                    0 |
+| N/A   45C    P0             35W /  300W |       0MiB /  65536MiB |      0%      Default |
+|   1  NVIDIA A100-SXM4-40GB            |   00000000:00:00.0 Off |                    0 |
+| N/A   45C    P0             35W /  300W |       0MiB /  40960MiB |      0%      Default |
++-----------------------------------------+------------------------+----------------------+"""
+    gpus = up._parse_nvidia_smi_vram(table)
+    assert ("NVIDIA CMP 170HX", 65536) in gpus
+    assert ("NVIDIA A100-SXM4-40GB", 40960) in gpus
+
+
+def test_gpu_vram_preflight_accepts_cmp(config, project_dir):
+    with mock.patch("hostai.commands.up.ssh.run_remote", return_value=mock.Mock(returncode=0, stdout="NVIDIA CMP 170HX, 65536\n")):
+        rc = up._gpu_vram_preflight("ssh://root@h:22", project_dir / "kh", config, "cmp170hx-256k", 60000)
+    assert rc == 0
+
+
+def test_gpu_vram_preflight_rejects_locked_cmp(config, project_dir):
+    with mock.patch("hostai.commands.up.ssh.run_remote", return_value=mock.Mock(returncode=0, stdout="NVIDIA CMP 170HX, 8192\n")):
+        rc = up._gpu_vram_preflight("ssh://root@h:22", project_dir / "kh", config, "cmp170hx-256k", 60000)
+    assert rc == 1
+
+
+def test_gpu_vram_preflight_accepts_gb10(config, project_dir):
+    with mock.patch("hostai.commands.up.ssh.run_remote", return_value=mock.Mock(returncode=0, stdout="NVIDIA GB10, 121856\n")):
+        rc = up._gpu_vram_preflight("ssh://root@h:22", project_dir / "kh", config, "gb10-256k", 115000)
+    assert rc == 0
+
+
+def test_gpu_vram_preflight_rejects_low_memory_gb10(config, project_dir):
+    with mock.patch("hostai.commands.up.ssh.run_remote", return_value=mock.Mock(returncode=0, stdout="NVIDIA GB10, 96000\n")):
+        rc = up._gpu_vram_preflight("ssh://root@h:22", project_dir / "kh", config, "gb10-256k", 115000)
+    assert rc == 1
+
+
+def test_gpu_vram_preflight_rejects_cmp_for_gb10_requirement(config, project_dir):
+    with mock.patch("hostai.commands.up.ssh.run_remote", return_value=mock.Mock(returncode=0, stdout="NVIDIA CMP 170HX, 65536\n")):
+        rc = up._gpu_vram_preflight("ssh://root@h:22", project_dir / "kh", config, "gb10-256k", 115000)
+    assert rc == 1
+
+
+def test_gpu_vram_preflight_skips_without_requirement(config, project_dir):
+    with mock.patch("hostai.commands.up.ssh.run_remote") as run:
+        rc = up._gpu_vram_preflight("ssh://root@h:22", project_dir / "kh", config, "a6000", None)
+    assert rc == 0
+    run.assert_not_called()
+
+
+def test_cpu_arch_preflight_captures_arch(config, project_dir):
+    state = State(project_dir / "state.json")
+    with mock.patch("hostai.commands.up.ssh.run_remote", return_value=mock.Mock(returncode=0, stdout="aarch64\n")):
+        up._cpu_arch_preflight("ssh://root@h:22", project_dir / "kh", config, state=state)
+    assert state.data.get("cpu_arch") == "aarch64"
+
+
+def test_cpu_arch_preflight_is_non_fatal_on_failure(config, project_dir):
+    state = State(project_dir / "state.json")
+    with mock.patch("hostai.commands.up.ssh.run_remote", return_value=mock.Mock(returncode=1, stdout="")):
+        up._cpu_arch_preflight("ssh://root@h:22", project_dir / "kh", config, state=state)
+    assert state.data.get("cpu_arch") is None
+
+
+def test_new_profiles_resolve():
+    repo_root = Path(__file__).parent.parent
+    profiles = up.Profiles.from_file(repo_root / "profiles.json")
+
+    a100 = profiles.resolve_profile("a100-128k")
+    assert a100 is not None
+    assert a100.image == "ga100"
+    assert a100.ctx_size == 131072
+    assert a100.min_gpu_vram_mb == 39000
+
+    cmp = profiles.resolve_profile("cmp170hx-256k")
+    assert cmp is not None
+    assert cmp.image == "ga100"
+    assert cmp.ctx_size == 262144
+    assert cmp.min_gpu_vram_mb == 60000
+
+    gb10 = profiles.resolve_profile("gb10-256k")
+    assert gb10 is not None
+    assert gb10.image == "gb10"
+    assert gb10.ctx_size == 262144
+    assert gb10.min_gpu_vram_mb == 115000
+
+    gb10_128 = profiles.resolve_profile("gb10-128k")
+    assert gb10_128 is not None
+    assert gb10_128.image == "gb10"
+    assert gb10_128.ctx_size == 131072
+    assert gb10_128.min_gpu_vram_mb == 115000
+
+    ga100 = profiles.image_by_name("ga100")
+    assert ga100 is not None
+    assert ga100.cuda_arch == "80"
+    assert ga100.image_tag == "ga100"
+
+    gb10_img = profiles.image_by_name("gb10")
+    assert gb10_img is not None
+    assert gb10_img.cuda_arch == "121"
+    assert gb10_img.image_tag == "gb10"
+    assert gb10_img.platform == "linux/arm64"
+    assert "13.3.1" in gb10_img.builder_base
+    assert "13.3.1" in gb10_img.runtime_base

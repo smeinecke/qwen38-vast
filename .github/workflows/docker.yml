@@ -68,6 +68,8 @@ jobs:
                 cuda_arch:.cuda_arch,
                 image_tag:.image_tag,
                 description:.description,
+                platform:(.platform // "linux/amd64"),
+                runs_on:(.runs_on // (if (.platform // "linux/amd64") == "linux/arm64" then "ubuntu-24.04-arm" else "ubuntu-24.04" end)),
                 builder_base:(.builder_base // "vastai/base-image:cuda-12.8.1-cudnn-devel-ubuntu24.04-py312"),
                 runtime_base:(.runtime_base // "nvidia/cuda:12.8.1-runtime-ubuntu24.04")
               }
@@ -79,7 +81,7 @@ jobs:
   build:
     needs: [changes, validate]
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || needs.changes.outputs.docker == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 330
     strategy:
       fail-fast: false
@@ -106,10 +108,10 @@ jobs:
         uses: actions/cache@v5
         with:
           path: .buildkit-cache-mount
-          key: qwen38-ccache-v4-${{ runner.os }}-sm${{ matrix.cuda_arch }}-${{ hashFiles('Dockerfile') }}
+          key: qwen38-ccache-v4-${{ runner.os }}-${{ runner.arch }}-sm${{ matrix.cuda_arch }}-${{ hashFiles('Dockerfile') }}
           restore-keys: |
-            qwen38-ccache-v4-${{ runner.os }}-sm${{ matrix.cuda_arch }}-
-            qwen38-ccache-v3-${{ runner.os }}-sm${{ matrix.cuda_arch }}-
+            qwen38-ccache-v4-${{ runner.os }}-${{ runner.arch }}-sm${{ matrix.cuda_arch }}-
+            qwen38-ccache-v3-${{ runner.os }}-${{ runner.arch }}-sm${{ matrix.cuda_arch }}-
           save-always: true
 
       - name: Report restored compiler cache
@@ -152,16 +154,17 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          platforms: linux/amd64
+          platforms: ${{ matrix.platform }}
           push: true
           build-args: |
             BUILDER_BASE=${{ matrix.builder_base }}
             RUNTIME_BASE=${{ matrix.runtime_base }}
             CUDA_ARCHITECTURES=${{ matrix.cuda_arch }}
             HOSTAI_BUILD_PROFILE=${{ matrix.profile }}
+            PLATFORM=${{ matrix.platform }}
             CCACHE_SEED=${{ hashFiles('Dockerfile') }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=qwen38-sm${{ matrix.cuda_arch }}
-          cache-to: type=gha,scope=qwen38-sm${{ matrix.cuda_arch }},mode=max,ignore-error=true
+          cache-from: type=gha,scope=qwen38-${{ matrix.platform }}-sm${{ matrix.cuda_arch }}
+          cache-to: type=gha,scope=qwen38-${{ matrix.platform }}-sm${{ matrix.cuda_arch }},mode=max,ignore-error=true
           provenance: mode=max

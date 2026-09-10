@@ -63,7 +63,9 @@ class TokenOnlyGuard:
         self.backend_socket = backend_socket
         self.cert_file = cert_file
         self.key_file = key_file
-        self.connector = aiohttp.UnixConnector(path=backend_socket)
+        # Force a new connection per request so we never try to reuse a
+        # connection that the backend (llama-server) has already half-closed.
+        self.connector = aiohttp.UnixConnector(path=backend_socket, force_close=True)
         self.session = aiohttp.ClientSession(
             connector=self.connector,
             timeout=aiohttp.ClientTimeout(total=None, connect=10, sock_read=900),
