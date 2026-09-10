@@ -99,14 +99,7 @@ def cmd_up(
     if scoring_mode:
         config.market.scoring_mode = scoring_mode
 
-    if cache and no_cache:
-        raise click.ClickException("cannot use both --cache and --no-cache")
-    cache_enabled = config.cache.enabled
-    if cache:
-        cache_enabled = True
-    if no_cache:
-        cache_enabled = False
-    no_cache = not cache_enabled
+    no_cache = not _common.resolve_cache_enabled(cache, no_cache, config.cache.enabled)
 
     if keep_on_failure:
         config.vast.keep_on_failure = True

@@ -613,13 +613,7 @@ def cmd_down(
         click.echo("No Vast instance id in local state.")
         return
 
-    if cache and no_cache:
-        raise click.ClickException("cannot use both --cache and --no-cache")
-    cache_enabled = config.cache.enabled
-    if cache:
-        cache_enabled = True
-    if no_cache:
-        cache_enabled = False
+    cache_enabled = _common.resolve_cache_enabled(cache, no_cache, config.cache.enabled)
     if cache_enabled:
         state.set("slot_cache_enabled", True)
 

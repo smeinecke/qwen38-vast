@@ -15,6 +15,17 @@ from hostai.providers import get_provider
 from hostai.state import State
 
 
+def resolve_cache_enabled(cache: bool, no_cache: bool, default: bool) -> bool:
+    """Resolve mutually exclusive --cache/--no-cache flags against the config default."""
+    if cache and no_cache:
+        raise click.ClickException("cannot use both --cache and --no-cache")
+    if cache:
+        return True
+    if no_cache:
+        return False
+    return default
+
+
 def _provider(config: Config):
     return get_provider(config)
 
