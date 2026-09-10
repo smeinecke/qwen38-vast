@@ -62,91 +62,120 @@ PACKAGE_MODULES = (
 )
 
 
-def validate_repo(root_dir: Path, config: Optional[Config] = None) -> List[str]:
-    """Validate the repository layout and return a list of error messages."""
-    errors: List[str] = []
-
+def _validate_required_files(root_dir: Path, errors: List[str]) -> None:
     for name in REQUIRED_FILES:
         if not (root_dir / name).exists():
             errors.append(f"missing required file: {name}")
 
+
+def _validate_pyproject(root_dir: Path, errors: List[str]) -> None:
     pyproject = root_dir / "pyproject.toml"
-    if pyproject.exists():
-        text = pyproject.read_text()
-        if 'name = "hostai"' not in text:
-            errors.append("pyproject.toml missing project name 'hostai'")
-        if 'hostai = "hostai.cli:main"' not in text:
-            errors.append("pyproject.toml missing hostai console script")
+    if not pyproject.exists():
+        return
+    text = pyproject.read_text()
+    if 'name = "hostai"' not in text:
+        errors.append("pyproject.toml missing project name 'hostai'")
+    if 'hostai = "hostai.cli:main"' not in text:
+        errors.append("pyproject.toml missing hostai console script")
 
+
+def _validate_hostai_toml_example(root_dir: Path, errors: List[str]) -> None:
     hostai_toml_example = root_dir / "hostai.toml.example"
-    if hostai_toml_example.exists():
-        try:
-            import tomllib
+    if not hostai_toml_example.exists():
+        return
+    try:
+        import tomllib
 
-            with hostai_toml_example.open("rb") as f:
-                tomllib.load(f)
-        except Exception as e:
-            errors.append(f"hostai.toml.example is not valid TOML: {e}")
+        with hostai_toml_example.open("rb") as f:
+            tomllib.load(f)
+    except Exception as e:
+        errors.append(f"hostai.toml.example is not valid TOML: {e}")
 
+
+def _validate_profiles_disk_space(profiles: Profiles, config: Config, errors: List[str]) -> None:
+    """Flag disk_space constraints in profile queries lower than the resolved disk."""
+    disk_space_pat = re.compile(r"\s*disk_space\s*(>=?|<=?|=)\s*([^\s]+)")
+    for p in profiles.profiles:
+        disk_gb = market.resolved_disk_gb(p, config)
+        for m in disk_space_pat.finditer(p.gpu_query):
+            try:
+                val = float(m.group(2))
+            except ValueError:
+                continue
+            if val < disk_gb:
+                errors.append(f"profile {p.name}: gpu_query disk_space>={val} is lower than resolved disk_gb={disk_gb}")
+
+
+def _validate_profiles(root_dir: Path, config: Optional[Config], errors: List[str]) -> None:
     profiles_path = root_dir / "profiles.json"
-    if profiles_path.exists():
-        try:
-            profiles = Profiles.from_file(profiles_path)
-        except Exception as e:
-            errors.append(f"profiles.json is invalid: {e}")
-        else:
-            if not profiles.images:
-                errors.append("profiles.json has no images")
-            if not profiles.profiles:
-                errors.append("profiles.json has no profiles")
-            if not profiles.resolve_profile(profiles.default_profile):
-                errors.append(f"default profile '{profiles.default_profile}' not found in profiles.json")
+    if not profiles_path.exists():
+        return
+    try:
+        profiles = Profiles.from_file(profiles_path)
+    except Exception as e:
+        errors.append(f"profiles.json is invalid: {e}")
+        return
 
-            for p in profiles.profiles:
-                if not profiles.image_by_name(p.image):
-                    errors.append(f"profile '{p.name}' references unknown image '{p.image}'")
+    if not profiles.images:
+        errors.append("profiles.json has no images")
+    if not profiles.profiles:
+        errors.append("profiles.json has no profiles")
+    if not profiles.resolve_profile(profiles.default_profile):
+        errors.append(f"default profile '{profiles.default_profile}' not found in profiles.json")
 
-            for img in profiles.images:
-                if img.platform not in ("linux/amd64", "linux/arm64"):
-                    errors.append(f"image '{img.name}' has unsupported platform '{img.platform}'")
-                if img.platform == "linux/arm64" and (not img.builder_base or not img.runtime_base):
-                    errors.append(f"image '{img.name}' is ARM64 but is missing builder_base and/or runtime_base")
+    for p in profiles.profiles:
+        if not profiles.image_by_name(p.image):
+            errors.append(f"profile '{p.name}' references unknown image '{p.image}'")
 
-            # Any explicit disk_space constraint in a profile query will be
-            # replaced by the resolved disk allocation.  Flag values that are
-            # lower than the resolved disk as contradictions.
-            if config is not None:
-                disk_space_pat = re.compile(r"\s*disk_space\s*(>=?|<=?|=)\s*([^\s]+)")
-                for p in profiles.profiles:
-                    disk_gb = market.resolved_disk_gb(p, config)
-                    for m in disk_space_pat.finditer(p.gpu_query):
-                        try:
-                            val = float(m.group(2))
-                        except ValueError:
-                            continue
-                        if val < disk_gb:
-                            errors.append(
-                                f"profile {p.name}: gpu_query disk_space>={val} is lower "
-                                f"than resolved disk_gb={disk_gb}"
-                            )
+    for img in profiles.images:
+        if img.platform not in ("linux/amd64", "linux/arm64"):
+            errors.append(f"image '{img.name}' has unsupported platform '{img.platform}'")
+        if img.platform == "linux/arm64" and (not img.builder_base or not img.runtime_base):
+            errors.append(f"image '{img.name}' is ARM64 but is missing builder_base and/or runtime_base")
 
+    # Any explicit disk_space constraint in a profile query will be
+    # replaced by the resolved disk allocation.  Flag values that are
+    # lower than the resolved disk as contradictions.
+    if config is not None:
+        _validate_profiles_disk_space(profiles, config, errors)
+
+
+def _validate_dockerfile(root_dir: Path, errors: List[str]) -> None:
     dockerfile = root_dir / "Dockerfile"
-    if dockerfile.exists():
-        text = dockerfile.read_text()
-        for marker in DOCKERFILE_MARKERS:
-            if marker not in text:
-                errors.append(f"Dockerfile missing marker: {marker}")
+    if not dockerfile.exists():
+        return
+    text = dockerfile.read_text()
+    for marker in DOCKERFILE_MARKERS:
+        if marker not in text:
+            errors.append(f"Dockerfile missing marker: {marker}")
 
+
+def _validate_gitignore(root_dir: Path, errors: List[str]) -> None:
     gitignore = root_dir / ".gitignore"
-    if gitignore.exists():
-        text = gitignore.read_text()
-        for pat in GITIGNORE_PATTERNS:
-            if pat not in text:
-                errors.append(f".gitignore missing pattern: {pat}")
+    if not gitignore.exists():
+        return
+    text = gitignore.read_text()
+    for pat in GITIGNORE_PATTERNS:
+        if pat not in text:
+            errors.append(f".gitignore missing pattern: {pat}")
 
+
+def _validate_package_modules(root_dir: Path, errors: List[str]) -> None:
     for mod in PACKAGE_MODULES:
         if not (root_dir / mod).exists():
             errors.append(f"missing package module: {mod}")
+
+
+def validate_repo(root_dir: Path, config: Optional[Config] = None) -> List[str]:
+    """Validate the repository layout and return a list of error messages."""
+    errors: List[str] = []
+    _validate_required_files(root_dir, errors)
+    _validate_pyproject(root_dir, errors)
+    _validate_hostai_toml_example(root_dir, errors)
+    _validate_profiles(root_dir, config, errors)
+    _validate_dockerfile(root_dir, errors)
+    _validate_gitignore(root_dir, errors)
+    _validate_package_modules(root_dir, errors)
 
     ssh_dir = root_dir / "ssh"
     if not (ssh_dir / "authorized_keys").exists() and not (ssh_dir / "authorized_keys.generated").exists():
