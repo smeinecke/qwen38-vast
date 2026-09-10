@@ -298,13 +298,3 @@ class LlamaClient:
             return response.json()
         except (json.JSONDecodeError, ValueError) as exc:
             raise requests.RequestException(f"invalid JSON in chat response: {exc}") from exc
-
-
-def is_api_ready(config: Config, state: State) -> bool:
-    """Standalone one-shot health check."""
-    return LlamaClient(config, state).health()
-
-
-def wait_for_api(config: Config, state: State, timeout: float, stage_label: str = "end-to-end") -> bool:
-    """Standalone blocking wait for llama-server /health."""
-    return LlamaClient(config, state).wait_for_health(timeout, quiet=False, stage_label=stage_label)

@@ -114,6 +114,22 @@ def _stop_proxy(state: State) -> None:
         pass
 
 
+def _session_end_summary(duration: int, cost: float, outcome: str) -> str:
+    return f"{outcome}. Session duration: {duration}s | estimated compute: ${cost:.4f}"
+
+
+def _record_session_end(
+    state: State, status: str, now: str, epoch: int, duration: int, cost: float, outcome_key: str, outcome: str
+) -> None:
+    state.status = status
+    state.set(outcome_key, outcome)
+    state.set("ended_at", now)
+    state.set("ended_epoch", epoch)
+    state.set("duration_seconds", duration)
+    state.set("estimated_compute_cost_usd", cost)
+    state.tunnel_pid = None
+
+
 def _pause_or_destroy(config: Config, state: State, pause: bool, run_dir: Path) -> str:
     """Pause or destroy the instance and update metadata."""
     if not state.instance_id:
@@ -137,14 +153,8 @@ def _pause_or_destroy(config: Config, state: State, pause: bool, run_dir: Path) 
                 raise click.ClickException(f"pause failed: {exc}")
         except requests.exceptions.RequestException as exc:
             raise click.ClickException(f"pause failed: {exc}")
-        state.status = "paused"
-        state.set("pause_outcome", pause_outcome)
-        state.set("ended_at", now)
-        state.set("ended_epoch", epoch)
-        state.set("duration_seconds", duration)
-        state.set("estimated_compute_cost_usd", cost)
-        state.set("pause_outcome", "ok")
-        state.tunnel_pid = None
+        _record_session_end(state, "paused", now, epoch, duration, cost, "pause_outcome", pause_outcome)
+        state.set("pause_outcome", "ok")  # backwards-compatible success flag
         state.save()
         state.save_metadata(run_dir, status="paused")
         _client_log(run_dir, f"paused instance {state.instance_id}")
@@ -162,13 +172,7 @@ def _pause_or_destroy(config: Config, state: State, pause: bool, run_dir: Path) 
     except requests.exceptions.RequestException as exc:
         raise click.ClickException(f"destroy failed (timeout): {exc}")
 
-    state.status = "destroyed"
-    state.set("ended_at", now)
-    state.set("ended_epoch", epoch)
-    state.set("duration_seconds", duration)
-    state.set("estimated_compute_cost_usd", cost)
-    state.set("destroy_outcome", destroy_outcome)
-    state.tunnel_pid = None
+    _record_session_end(state, "destroyed", now, epoch, duration, cost, "destroy_outcome", destroy_outcome)
     state.save_metadata(run_dir, status="destroyed")
 
     try:
@@ -177,7 +181,7 @@ def _pause_or_destroy(config: Config, state: State, pause: bool, run_dir: Path) 
         pass
 
     _client_log(run_dir, f"destroyed instance {state.instance_id} ({destroy_outcome})")
-    return f"{destroy_outcome}. Session duration: {duration}s | estimated compute: ${cost:.4f}"
+    return _session_end_summary(duration, cost, destroy_outcome)
 
 
 def _resolve_run_dir(config: Config, state: State) -> Path:

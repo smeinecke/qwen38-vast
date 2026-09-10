@@ -352,7 +352,3 @@ def compare_validations(current: ValidationRecord, previous: ValidationRecord) -
     if current.level != previous.level:
         diffs.append(f"validation level changed: {previous.level} -> {current.level}")
     return diffs
-
-
-def is_valid(root_dir: Path) -> bool:
-    return not validate_repo(root_dir)

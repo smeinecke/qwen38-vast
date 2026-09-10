@@ -22,8 +22,6 @@ from hostai.config import Config
 from hostai.profiles import Profile, Profiles, re_normalize_gpu
 from hostai.providers import get_provider
 
-MAX_INET_DOWN_MBPS = 1.0
-MAX_DISK_BW_MBPS = 1.0
 MIN_STARTUP_SECONDS = 30.0
 
 # Conservative TPS fallbacks for performance scoring when a GPU has no
@@ -68,11 +66,6 @@ def _effective_dph(offer: Dict[str, Any]) -> float:
 
 def _normalized_gpu_name(offer: Dict[str, Any]) -> str:
     return re_normalize_gpu(str(offer.get("gpu_name", "")))
-
-
-def hardware_rank_for_offer(profiles: Profiles, offer: Dict[str, Any]) -> Optional[int]:
-    """Return the hardware rank for an offer's GPU, or None if unknown."""
-    return profiles.hardware_rank(str(offer.get("gpu_name", "")))
 
 
 def is_same_or_better_gpu(
@@ -327,22 +320,6 @@ def historical_per_gpu_stats(
         _collect_benchmark_samples(run_dir, meta, stats)
 
     return _aggregate_gpu_stats(stats, startup_stats)
-
-
-def _median(values: List[float]) -> Optional[float]:
-    if not values:
-        return None
-    return float(statistics.median(values))
-
-
-def _robust_min(values: List[float]) -> Optional[float]:
-    """Return the median of the lower half to avoid one fast outlier dominating."""
-    if not values:
-        return None
-    sorted_values = sorted(values)
-    n = len(sorted_values)
-    lower = sorted_values[: (n // 2) + 1]
-    return float(statistics.median(lower))
 
 
 def estimate_startup_seconds(

@@ -112,11 +112,6 @@ def _parse_tool_calls(content: str) -> List[Dict[str, Any]]:
     return tool_calls
 
 
-def _strip_tool_call_tags(content: str) -> str:
-    """Return content with tool-call tags removed, preserving surrounding text."""
-    return _TOOL_CALL_RE.sub("", content).strip()
-
-
 def _find_stop(text: str, stops: List[str]) -> int:
     """Return the index of the earliest stop-string match, or -1."""
     cut = -1

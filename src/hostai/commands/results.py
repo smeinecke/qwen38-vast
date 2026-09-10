@@ -2,7 +2,7 @@ import csv
 import io
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import click
 from rich.console import Console
@@ -52,13 +52,18 @@ def _load_rows(runs_dir: Path) -> List[Dict[str, Any]]:
     return rows
 
 
-def _format_value(v: Any, digits: int = 1) -> str:
+def _try_float_format(v: Any, fmt: Callable[[float], str]) -> str:
+    """Return ``fmt(float(v))`` or ``"-"`` when *v* is missing or not a number."""
     if v is None or v == "":
         return "-"
     try:
-        return f"{float(v):.{digits}f}"
+        return fmt(float(v))
     except (TypeError, ValueError):
         return "-"
+
+
+def _format_value(v: Any, digits: int = 1) -> str:
+    return _try_float_format(v, lambda x: f"{x:.{digits}f}")
 
 
 def _ctx_label(v: Any) -> str:
@@ -74,39 +79,19 @@ def _ctx_label(v: Any) -> str:
 
 
 def _cache_pct(v: Any) -> str:
-    if v is None or v == "":
-        return "-"
-    try:
-        return _format_value(100 * float(v), 1) + "%"
-    except (TypeError, ValueError):
-        return "-"
+    return _try_float_format(v, lambda x: f"{100 * x:.1f}%")
 
 
 def _gb(v: Any) -> str:
-    if v is None or v == "":
-        return "-"
-    try:
-        return f"{float(v) / 1024:.1f}G"
-    except (TypeError, ValueError):
-        return "-"
+    return _try_float_format(v, lambda x: f"{x / 1024:.1f}G")
 
 
 def _watts(v: Any) -> str:
-    if v is None or v == "":
-        return "-"
-    try:
-        return f"{float(v):.0f}W"
-    except (TypeError, ValueError):
-        return "-"
+    return _try_float_format(v, lambda x: f"{x:.0f}W")
 
 
 def _cost(v: Any) -> str:
-    if v is None or v == "":
-        return "-"
-    try:
-        return f"{float(v):.5f}"
-    except (TypeError, ValueError):
-        return "-"
+    return _try_float_format(v, lambda x: f"{x:.5f}")
 
 
 def _short_gpu(v: str) -> str:

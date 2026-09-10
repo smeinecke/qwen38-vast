@@ -137,9 +137,6 @@ class Profiles:
                 return rank.rank
         return None
 
-    def gpu_name_matches(self, gpu_name: str, candidate_name: str) -> bool:
-        return re_normalize_gpu(gpu_name) == re_normalize_gpu(candidate_name)
-
 
 def re_normalize_gpu(name: str) -> str:
     import re

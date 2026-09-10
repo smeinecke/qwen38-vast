@@ -169,9 +169,6 @@ class FakeProvider(Provider):
     def get_instance(self, instance_id: int) -> Optional[Dict[str, Any]]:
         return self._instances.get(instance_id)
 
-    def list_instances(self) -> List[Dict[str, Any]]:
-        return list(self._instances.values())
-
     def start_instance(self, instance_id: int) -> Dict[str, Any]:
         inst = self._get_or_raise(instance_id)
         inst["actual_status"] = "running"

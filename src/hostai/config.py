@@ -340,11 +340,6 @@ ENV_MAP: Dict[str, tuple[str, str, Optional[Type[Any]]]] = {
 SECRETS = {"VAST_API_KEY", "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "SSH_PUBLIC_KEY", "MODEL_API_KEY"}
 
 
-CTX_SIZE_OVERRIDE = "CTX_SIZE_OVERRIDE"
-GPU_QUERY_OVERRIDE = "GPU_QUERY_OVERRIDE"
-GHCR_IMAGE_OVERRIDE = "GHCR_IMAGE_OVERRIDE"
-
-
 def _apply_env_to_config(config: Config, env: Dict[str, Optional[str]]) -> None:
     for key, raw in env.items():
         if not raw:

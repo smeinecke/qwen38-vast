@@ -91,12 +91,6 @@ def run(
     return subprocess.run(cmd, timeout=timeout, check=check, **kwargs)
 
 
-def run_output(cmd: List[str], **kwargs: Any) -> str:
-    """Run a command and return its stdout as a string."""
-    result = run(cmd, capture=True, check=False, **kwargs)
-    return (result.stdout or "").strip()
-
-
 def sanitize_for_shell(value: str) -> str:
     """Return a string that is safe to pass through shell-like interpolation."""
     return shlex.quote(value)

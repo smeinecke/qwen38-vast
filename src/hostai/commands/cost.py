@@ -147,9 +147,7 @@ def cmd_volume_break_even(
         "disk_bw": disk_bw,
         "inet_down_cost": inet_down_cost,
     }
-    _, full_startup_seconds, full_transfer_cost = market.offer_download_estimate(
-        offer, config, cache_state=market.CACHE_STATE_COLD
-    )
+    _, full_startup_seconds, _ = market.offer_download_estimate(offer, config, cache_state=market.CACHE_STATE_COLD)
     _, image_only_startup_seconds, _ = market.offer_download_estimate(
         offer, config, cache_state=market.CACHE_STATE_CACHED
     )

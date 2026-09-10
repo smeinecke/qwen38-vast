@@ -1299,6 +1299,34 @@ def _do_fresh(
         raise click.ClickException(str(exc)) from exc
 
 
+def _gpu_preflight_or_fail(
+    config: Config,
+    state: State,
+    known_hosts: Path,
+    *,
+    cleanup_on_fail: bool = False,
+) -> None:
+    """Verify GPU VRAM meets the profile minimum; raise ``ClickException`` on failure."""
+    profile_label = state.data.get("profile_name") or state.profile or "unknown"
+    vram_rc = _gpu_vram_preflight(
+        state.ssh_url,
+        known_hosts,
+        config,
+        profile_label,
+        state.data.get("min_gpu_vram_mb"),
+        state=state,
+    )
+    if vram_rc == 1:
+        # The preflight already logged the exact GPU and requirement.
+        if cleanup_on_fail:
+            _cleanup_instance(config, state, "GPU memory below profile minimum")
+        raise click.ClickException(f"GPU does not meet the {profile_label} memory requirement")
+    if vram_rc == 2:
+        if cleanup_on_fail:
+            _cleanup_instance(config, state, "nvidia-smi failed")
+        raise click.ClickException("[gpu] nvidia-smi failed; cannot verify GPU VRAM")
+
+
 def _do_fresh_core(
     config: Config,
     state: State,
@@ -1318,21 +1346,7 @@ def _do_fresh_core(
 
     # GPU memory preflight: fail before model download if the visible VRAM is
     # below the profile's minimum (e.g. a locked 8/10 GB CMP 170HX).
-    vram_rc = _gpu_vram_preflight(
-        state.ssh_url,
-        known_hosts,
-        config,
-        state.data.get("profile_name") or state.profile or "unknown",
-        state.data.get("min_gpu_vram_mb"),
-        state=state,
-    )
-    if vram_rc == 1:
-        # The preflight already logged the exact GPU and requirement.
-        raise click.ClickException(
-            f"GPU does not meet the {state.data.get('profile_name') or state.profile} memory requirement"
-        )
-    if vram_rc == 2:
-        raise click.ClickException("[gpu] nvidia-smi failed; cannot verify GPU VRAM")
+    _gpu_preflight_or_fail(config, state, known_hosts)
 
     _cpu_arch_preflight(state.ssh_url, known_hosts, config, state=state)
 
@@ -1436,16 +1450,20 @@ def _prepare_slot_cache(
         cache_enabled = False
         state.slot_cache_enabled = False
 
-    cache_remote = ""
     if not cache_enabled:
-        return cache_enabled, cache_remote
+        return False, ""
 
-    llama_commit = state.data.get("llama_cpp_commit") or cache.fetch_llama_commit(state.ssh_url, known_hosts)
+    ssh_url = state.ssh_url or ""
+    if not ssh_url:
+        _log("[cache] no SSH endpoint; continuing without cache", err=True)
+        return False, ""
+
+    llama_commit = cache.resolve_llama_commit(state, ssh_url, known_hosts)
     state.data["llama_cpp_commit"] = llama_commit
 
     if config.cache.use_shm:
         shm_rc = _shm_preflight(
-            state.ssh_url,
+            ssh_url,
             config,
             known_hosts,
             config.cache.shm_min_gb or 30,
@@ -1468,7 +1486,7 @@ def _prepare_slot_cache(
     state.data["slot_cache_restore"] = "pending"
     state.save()
 
-    if _prefetch_slot_cache_to_vast(state.ssh_url, config, state.slot_cache_local_dir, cache_remote, known_hosts):
+    if _prefetch_slot_cache_to_vast(ssh_url, config, state.slot_cache_local_dir, cache_remote, known_hosts):
         _log("[cache] prefetched slot from cache server")
         state.data["slot_cache_prefetch"] = "ok"
     else:
@@ -1607,22 +1625,7 @@ def _do_restart(
         raise click.ClickException("SSH daemon did not become reachable")
 
     # GPU memory preflight on restart: if the profile has a minimum, verify it.
-    vram_rc = _gpu_vram_preflight(
-        state.ssh_url,
-        known_hosts,
-        config,
-        state.data.get("profile_name") or state.profile or "unknown",
-        state.data.get("min_gpu_vram_mb"),
-        state=state,
-    )
-    if vram_rc == 1:
-        _cleanup_instance(config, state, "GPU memory below profile minimum")
-        raise click.ClickException(
-            f"GPU does not meet the {state.data.get('profile_name') or state.profile} memory requirement"
-        )
-    if vram_rc == 2:
-        _cleanup_instance(config, state, "nvidia-smi failed")
-        raise click.ClickException("[gpu] nvidia-smi failed; cannot verify GPU VRAM")
+    _gpu_preflight_or_fail(config, state, known_hosts, cleanup_on_fail=True)
 
     _cpu_arch_preflight(state.ssh_url, known_hosts, config, state=state)
 

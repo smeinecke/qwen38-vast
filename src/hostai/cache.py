@@ -14,7 +14,7 @@ import shlex
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import click
 import requests
@@ -629,31 +629,34 @@ def install_cache_key_on_vast(state: State, config: Config) -> bool:
     return True
 
 
-def _cache_ssh_cmd(config: Config, root_dir: Path) -> str:
-    """Build the SSH command string used by rsync's ``-e`` option."""
+def _cache_ssh_base_args(config: Config, root_dir: Path) -> List[str]:
+    """Return the common SSH arguments used to reach the cache server."""
     key_path = ensure_cache_key(config, root_dir)
     known_hosts = _known_hosts_path(root_dir)
-    return shlex.join(
-        [
-            "ssh",
-            "-i",
-            str(key_path),
-            "-p",
-            str(config.cache.port),
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=8",
-            "-o",
-            "ServerAliveInterval=15",
-            "-o",
-            "ServerAliveCountMax=3",
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-            "-o",
-            f"UserKnownHostsFile={known_hosts}",
-        ]
-    )
+    return [
+        "ssh",
+        "-i",
+        str(key_path),
+        "-p",
+        str(config.cache.port),
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=8",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=3",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        f"UserKnownHostsFile={known_hosts}",
+    ]
+
+
+def _cache_ssh_cmd(config: Config, root_dir: Path) -> str:
+    """Build the SSH command string used by rsync's ``-e`` option."""
+    return shlex.join(_cache_ssh_base_args(config, root_dir))
 
 
 def preflight_remote(config: Config) -> bool:
@@ -663,29 +666,12 @@ def preflight_remote(config: Config) -> bool:
 
     root_dir = config.root_dir
     qroot = utils.sanitize_for_shell(config.cache.root)
-    known_hosts = _known_hosts_path(root_dir)
-    key_path = ensure_cache_key(config, root_dir)
+    ssh_args = _cache_ssh_base_args(config, root_dir)
 
     try:
         result = utils.run(
             [
-                "ssh",
-                "-i",
-                str(key_path),
-                "-p",
-                str(config.cache.port),
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=8",
-                "-o",
-                "ServerAliveInterval=15",
-                "-o",
-                "ServerAliveCountMax=3",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                "-o",
-                f"UserKnownHostsFile={known_hosts}",
+                *ssh_args,
                 f"{config.cache.user}@{config.cache.host}",
                 f"command -v rsync >/dev/null 2>&1 && mkdir -p {qroot} && chmod 700 {qroot} && test -w {qroot}",
             ],
@@ -794,8 +780,7 @@ def upload_cache(
         return False
 
     remote_dir = _remote_cache_dir_for_state(config, state, llama_commit)
-    key_path = ensure_cache_key(config, config.root_dir)
-    known_hosts = _known_hosts_path(config.root_dir)
+    ssh_args = _cache_ssh_base_args(config, config.root_dir)
     ssh_cmd = _cache_ssh_cmd(config, config.root_dir)
 
     # Ensure the remote directory exists and is private.
@@ -803,19 +788,7 @@ def upload_cache(
     try:
         mkdir_result = utils.run(
             [
-                "ssh",
-                "-i",
-                str(key_path),
-                "-p",
-                str(config.cache.port),
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=8",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                "-o",
-                f"UserKnownHostsFile={known_hosts}",
+                *ssh_args,
                 f"{config.cache.user}@{config.cache.host}",
                 f"mkdir -p {qremote} && chmod 700 {qremote}",
             ],
@@ -856,19 +829,7 @@ def upload_cache(
             )
             finalize = utils.run(
                 [
-                    "ssh",
-                    "-i",
-                    str(key_path),
-                    "-p",
-                    str(config.cache.port),
-                    "-o",
-                    "BatchMode=yes",
-                    "-o",
-                    "ConnectTimeout=8",
-                    "-o",
-                    "StrictHostKeyChecking=accept-new",
-                    "-o",
-                    f"UserKnownHostsFile={known_hosts}",
+                    *ssh_args,
                     f"{config.cache.user}@{config.cache.host}",
                     f"cd {qremote} && chmod 600 {qparts} && {qfinals}",
                 ],
@@ -1116,6 +1077,14 @@ def _guard_cache_save(config: Config, state: State, no_cache: bool) -> Optional[
     return ssh_url
 
 
+def resolve_llama_commit(state: State, ssh_url: str, known_hosts: Path) -> str:
+    """Return the cached llama.cpp commit or fetch it from the remote binary."""
+    commit = state.data.get("llama_cpp_commit")
+    if not commit or not re.match(r"^[a-f0-9]+$", str(commit)):
+        commit = fetch_llama_commit(ssh_url, known_hosts)
+    return commit
+
+
 def _build_cache_metadata(
     config: Config,
     state: State,
@@ -1219,10 +1188,7 @@ def save_and_upload_slot_cache(
     if not ssh_url:
         return None
 
-    llama_commit = state.data.get("llama_cpp_commit")
-    if not llama_commit or not re.match(r"^[a-f0-9]+$", str(llama_commit)):
-        llama_commit = fetch_llama_commit(ssh_url, known_hosts)
-
+    llama_commit = resolve_llama_commit(state, ssh_url, known_hosts)
     signature = _signature_for_state(config, state, llama_commit)
 
     state.set("llama_cpp_commit", llama_commit)

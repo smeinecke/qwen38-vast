@@ -65,10 +65,6 @@ class Provider(ABC):
         """Return a single instance by ID."""
 
     @abstractmethod
-    def list_instances(self) -> List[Dict[str, Any]]:
-        """Return all instances known to this provider."""
-
-    @abstractmethod
     def start_instance(self, instance_id: int) -> Dict[str, Any]:
         """Start/resume a stopped instance."""
 
@@ -90,14 +86,3 @@ class Provider(ABC):
     ) -> Optional[str]:
         """Fetch container/daemon logs for an instance."""
         return None
-
-    def instance_to_endpoint(self, instance: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Convert an instance dict to an SSH endpoint dict.
-
-        The default implementation understands the same fields as
-        ``hostai.ssh.resolve_ssh_endpoint`` so callers can discover SSH the same
-        way for every backend.
-        """
-        from hostai.ssh import resolve_ssh_endpoint
-
-        return resolve_ssh_endpoint(instance)

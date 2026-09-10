@@ -56,10 +56,6 @@ def search_instance_offers(
     )
 
 
-def get_instances(config: Config) -> List[Dict[str, Any]]:
-    return _provider(config).list_instances()
-
-
 def get_instance(config: Config, instance_id: int) -> Optional[Dict[str, Any]]:
     return _provider(config).get_instance(instance_id)
 

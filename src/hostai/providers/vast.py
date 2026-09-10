@@ -16,7 +16,6 @@ from vastai.api.instances import (
     create_instance_from_payload,
     destroy_instance,
     show_instance,
-    show_instances,
     start_instance,
     stop_instance,
 )
@@ -81,10 +80,6 @@ class VastProvider(Provider):
             no_default=no_default,
             offer_type=offer_type,
         )
-
-    def list_instances(self) -> List[Dict[str, Any]]:
-        client = self._client(timeout=120.0)
-        return show_instances(client)
 
     def get_instance(self, instance_id: int) -> Optional[Dict[str, Any]]:
         client = self._client(timeout=120.0)

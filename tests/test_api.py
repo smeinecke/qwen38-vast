@@ -7,7 +7,7 @@ import pytest
 import requests
 import responses
 
-from hostai.api import LlamaClient, _parse_prom, is_api_ready, wait_for_api
+from hostai.api import LlamaClient, _parse_prom
 
 
 @pytest.fixture
@@ -211,19 +211,3 @@ def test_chat_streaming_ignores_malformed_lines(client):
         chunks = list(stream)
 
     assert len(chunks) == 1
-
-
-@responses.activate
-def test_is_api_ready(config, state):
-    state.local_port = 18080
-    state.unsecure = True
-    responses.add(responses.GET, "http://127.0.0.1:18080/health", body="ok", status=200)
-    assert is_api_ready(config, state) is True
-
-
-@responses.activate
-def test_wait_for_api(config, state):
-    state.local_port = 18080
-    state.unsecure = True
-    responses.add(responses.GET, "http://127.0.0.1:18080/health", body="ok", status=200)
-    assert wait_for_api(config, state, timeout=1.0) is True

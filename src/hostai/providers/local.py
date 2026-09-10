@@ -299,14 +299,6 @@ class LocalProvider(Provider):
         container_id = info["container_id"]
         return self._inspect_container(instance_id, container_id, info)
 
-    def list_instances(self) -> List[Dict[str, Any]]:
-        out = []
-        for instance_id_str, info in self._state["containers"].items():
-            inst = self._inspect_container(int(instance_id_str), info["container_id"], info)
-            if inst:
-                out.append(inst)
-        return out
-
     def start_instance(self, instance_id: int) -> Dict[str, Any]:
         container_id = self._container_id(instance_id)
         self._docker_cmd(["start", container_id], timeout=60)
