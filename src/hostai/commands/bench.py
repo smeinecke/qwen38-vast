@@ -64,6 +64,34 @@ def _read_prompt(prompt_file: Optional[Path]) -> str:
     return _DEFAULT_PROMPT
 
 
+def _process_bench_delta(
+    delta: Dict[str, Any],
+    content_parts: List[str],
+    reasoning_parts: List[str],
+    first_token_s: Optional[float],
+    t0: float,
+) -> Optional[float]:
+    content = delta.get("content")
+    if isinstance(content, str) and content:
+        content_parts.append(content)
+        if first_token_s is None:
+            first_token_s = time.perf_counter() - t0
+
+    reasoning = delta.get("reasoning_content")
+    if isinstance(reasoning, str) and reasoning:
+        reasoning_parts.append(reasoning)
+        if first_token_s is None:
+            first_token_s = time.perf_counter() - t0
+
+    reasoning_alt = delta.get("reasoning")
+    if isinstance(reasoning_alt, str) and reasoning_alt:
+        reasoning_parts.append(reasoning_alt)
+        if first_token_s is None:
+            first_token_s = time.perf_counter() - t0
+
+    return first_token_s
+
+
 def _stream_chat(
     client: LlamaClient,
     messages: List[Dict[str, str]],
@@ -119,28 +147,16 @@ def _stream_chat(
             if isinstance(obj.get("timings"), dict):
                 timings = obj["timings"]
             choices = obj.get("choices")
-            if isinstance(choices, list) and choices:
-                choice = choices[0]
-                if isinstance(choice, dict):
-                    if choice.get("finish_reason") is not None:
-                        finish_reason = choice.get("finish_reason")
-                    delta = choice.get("delta")
-                    if isinstance(delta, dict):
-                        content = delta.get("content")
-                        if isinstance(content, str) and content:
-                            content_parts.append(content)
-                            if first_token_s is None:
-                                first_token_s = time.perf_counter() - t0
-                        reasoning = delta.get("reasoning_content")
-                        if isinstance(reasoning, str) and reasoning:
-                            reasoning_parts.append(reasoning)
-                            if first_token_s is None:
-                                first_token_s = time.perf_counter() - t0
-                        reasoning_alt = delta.get("reasoning")
-                        if isinstance(reasoning_alt, str) and reasoning_alt:
-                            reasoning_parts.append(reasoning_alt)
-                            if first_token_s is None:
-                                first_token_s = time.perf_counter() - t0
+            if not (isinstance(choices, list) and choices):
+                continue
+            choice = choices[0]
+            if not isinstance(choice, dict):
+                continue
+            if choice.get("finish_reason") is not None:
+                finish_reason = choice.get("finish_reason")
+            delta = choice.get("delta")
+            if isinstance(delta, dict):
+                first_token_s = _process_bench_delta(delta, content_parts, reasoning_parts, first_token_s, t0)
         total_s = time.perf_counter() - t0
     except Exception as exc:
         total_s = time.perf_counter() - t0

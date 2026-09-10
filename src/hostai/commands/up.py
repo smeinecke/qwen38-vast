@@ -37,6 +37,53 @@ def _log(message: str, err: bool = False) -> None:
     click.echo(f"[{ts}] {message}", err=err)
 
 
+def _validate_up_options(
+    local_port: Optional[int],
+    max_price: Optional[float],
+    bid: Optional[float],
+    scoring_mode: Optional[str],
+) -> None:
+    if local_port is not None and not (1 <= local_port <= 65535):
+        raise click.ClickException("--local-port must be between 1 and 65535")
+    if max_price is not None and max_price < 0:
+        raise click.ClickException("--max-price must be non-negative")
+    if bid is not None and bid <= 0:
+        raise click.ClickException("--bid must be positive")
+    if scoring_mode is not None and scoring_mode not in ("dph", "perf", "session"):
+        raise click.ClickException("--scoring-mode must be dph, perf, or session")
+
+
+def _resolve_bid_price(
+    config: Config,
+    interruptible: bool,
+    bid: Optional[float],
+    max_price: Optional[float],
+) -> Optional[float]:
+    """Resolve the effective bid price for interruptible mode, or ``None``."""
+    use_interruptible = (
+        interruptible or config.vast.interruptible or bid is not None or config.vast.bid_price is not None
+    )
+    if not use_interruptible:
+        return None
+    bid_price = bid if bid is not None else config.vast.bid_price
+    if bid_price is None:
+        bid_price = max_price if max_price is not None else config.market.max_dph
+    if bid_price is None or bid_price <= 0:
+        raise click.ClickException(
+            "interruptible mode requires a positive bid price: set --bid, [vast].bid_price, or [market].max_dph"
+        )
+    return bid_price
+
+
+def _resolve_session_seconds(config: Config, expected_session: Optional[str]) -> Optional[int]:
+    if expected_session is not None:
+        try:
+            return utils.parse_duration_to_seconds(expected_session)
+        except ValueError as exc:
+            raise click.ClickException(str(exc))
+    return config.vast.expected_session_seconds
+
+
 @click.command("up", help="Start a Vast instance for a profile.")
 @click.argument("profile", required=False)
 @click.option("-p", "--profile", "profile_opt", help="Profile to run.")
@@ -87,14 +134,7 @@ def cmd_up(
     chosen_profile = profile or profile_opt or config.hostai.default_profile
     if not chosen_profile:
         raise click.ClickException("no profile specified and no default profile configured")
-    if local_port is not None and not (1 <= local_port <= 65535):
-        raise click.ClickException("--local-port must be between 1 and 65535")
-    if max_price is not None and max_price < 0:
-        raise click.ClickException("--max-price must be non-negative")
-    if bid is not None and bid <= 0:
-        raise click.ClickException("--bid must be positive")
-    if scoring_mode is not None and scoring_mode not in ("dph", "perf", "session"):
-        raise click.ClickException("--scoring-mode must be dph, perf, or session")
+    _validate_up_options(local_port, max_price, bid, scoring_mode)
 
     if scoring_mode:
         config.market.scoring_mode = scoring_mode
@@ -105,28 +145,8 @@ def cmd_up(
         config.vast.keep_on_failure = True
 
     # Interruptible mode is enabled by CLI flag, config flag, or an explicit bid.
-    use_interruptible = (
-        interruptible or config.vast.interruptible or bid is not None or config.vast.bid_price is not None
-    )
-    if use_interruptible:
-        bid_price = bid if bid is not None else config.vast.bid_price
-        if bid_price is None:
-            bid_price = max_price if max_price is not None else config.market.max_dph
-        if bid_price is None or bid_price <= 0:
-            raise click.ClickException(
-                "interruptible mode requires a positive bid price: set --bid, [vast].bid_price, or [market].max_dph"
-            )
-    else:
-        bid_price = None
-
-    session_seconds = None
-    if expected_session is not None:
-        try:
-            session_seconds = utils.parse_duration_to_seconds(expected_session)
-        except ValueError as exc:
-            raise click.ClickException(str(exc))
-    if session_seconds is None and config.vast.expected_session_seconds is not None:
-        session_seconds = config.vast.expected_session_seconds
+    bid_price = _resolve_bid_price(config, interruptible, bid, max_price)
+    session_seconds = _resolve_session_seconds(config, expected_session)
 
     if restart:
         _do_restart(config, chosen_profile, local_port, unsecure, no_cache, allow_unvalidated=allow_unvalidated)
@@ -464,6 +484,47 @@ def _resolve_client_port(
     return free_port
 
 
+def _env_model_overrides(config: Config, profile: Any, env: Dict[str, str]) -> None:
+    cache_ram = config.model.cache_ram if config.model.cache_ram is not None else profile.cache_ram
+    ctx_checkpoints = (
+        config.model.ctx_checkpoints if config.model.ctx_checkpoints is not None else profile.ctx_checkpoints
+    )
+    if cache_ram:
+        env["CACHE_RAM"] = str(cache_ram)
+    if ctx_checkpoints:
+        env["CTX_CHECKPOINTS"] = str(ctx_checkpoints)
+    if config.model.cache_type_k and config.model.cache_type_k != "default":
+        env["CACHE_TYPE_K"] = config.model.cache_type_k
+    if config.model.cache_type_v and config.model.cache_type_v != "default":
+        env["CACHE_TYPE_V"] = config.model.cache_type_v
+
+
+def _env_cache_vars(config: Config, session: str, slot_dir: str, env: Dict[str, str]) -> None:
+    env["HOSTAI_SLOT_CACHE_ENABLED"] = "1"
+    env["HOSTAI_SLOT_CACHE_HOST"] = config.cache.host
+    env["HOSTAI_SLOT_CACHE_PORT"] = str(config.cache.port)
+    env["HOSTAI_SLOT_CACHE_USER"] = config.cache.user
+    env["HOSTAI_SLOT_CACHE_ROOT"] = config.cache.root
+    env["HOSTAI_SLOT_CACHE_SESSION"] = session
+    env["HOSTAI_SLOT_CACHE_MAX_GB"] = str(config.cache.max_gb)
+    env["HOSTAI_SLOT_CACHE_USE_SHM"] = "1" if config.cache.use_shm else "0"
+    # A value of 0 means "use the runtime default" (30 GB).
+    env["HOSTAI_SLOT_CACHE_MIN_GB"] = str(config.cache.shm_min_gb or 30)
+    env["HOSTAI_SLOT_CACHE_LOCAL_DIR"] = slot_dir
+    if not config.cache.rclone:
+        return
+    env["HOSTAI_SLOT_CACHE_RCLONE"] = "1"
+    for key, value in (
+        ("HOSTAI_SLOT_CACHE_RCLONE_REMOTE", config.cache.rclone_remote),
+        ("HOSTAI_SLOT_CACHE_RCLONE_TYPE", config.cache.rclone_type),
+        ("HOSTAI_SLOT_CACHE_RCLONE_URL", config.cache.rclone_url),
+        ("HOSTAI_SLOT_CACHE_RCLONE_USER", config.cache.rclone_user),
+        ("HOSTAI_SLOT_CACHE_RCLONE_PASSWORD", config.cache.rclone_password),
+    ):
+        if value:
+            env[key] = value
+
+
 def _env_dict(
     config: Config,
     profile: Any,
@@ -492,23 +553,11 @@ def _env_dict(
     if hf_token:
         env["HF_TOKEN"] = hf_token
 
-    cache_ram = config.model.cache_ram if config.model.cache_ram is not None else profile.cache_ram
-    ctx_checkpoints = (
-        config.model.ctx_checkpoints if config.model.ctx_checkpoints is not None else profile.ctx_checkpoints
-    )
-    if cache_ram:
-        env["CACHE_RAM"] = str(cache_ram)
-    if ctx_checkpoints:
-        env["CTX_CHECKPOINTS"] = str(ctx_checkpoints)
+    _env_model_overrides(config, profile, env)
 
     ssh_public_key = config.secrets.get("SSH_PUBLIC_KEY")
     if ssh_public_key:
         env["HOSTAI_SSH_PUBLIC_KEY_B64"] = base64.b64encode(ssh_public_key.encode()).decode()
-
-    if config.model.cache_type_k and config.model.cache_type_k != "default":
-        env["CACHE_TYPE_K"] = config.model.cache_type_k
-    if config.model.cache_type_v and config.model.cache_type_v != "default":
-        env["CACHE_TYPE_V"] = config.model.cache_type_v
 
     # Forward deterministic fault-injection variables so integration tests can
     # exercise boot deadlines without changing production start.sh.
@@ -521,29 +570,7 @@ def _env_dict(
 
     cache_configured = config.cache.host or config.cache.rclone_url or config.cache.rclone_remote
     if not no_cache and cache_configured:
-        env["HOSTAI_SLOT_CACHE_ENABLED"] = "1"
-        env["HOSTAI_SLOT_CACHE_HOST"] = config.cache.host
-        env["HOSTAI_SLOT_CACHE_PORT"] = str(config.cache.port)
-        env["HOSTAI_SLOT_CACHE_USER"] = config.cache.user
-        env["HOSTAI_SLOT_CACHE_ROOT"] = config.cache.root
-        env["HOSTAI_SLOT_CACHE_SESSION"] = session
-        env["HOSTAI_SLOT_CACHE_MAX_GB"] = str(config.cache.max_gb)
-        env["HOSTAI_SLOT_CACHE_USE_SHM"] = "1" if config.cache.use_shm else "0"
-        # A value of 0 means "use the runtime default" (30 GB).
-        env["HOSTAI_SLOT_CACHE_MIN_GB"] = str(config.cache.shm_min_gb or 30)
-        env["HOSTAI_SLOT_CACHE_LOCAL_DIR"] = slot_dir
-        if config.cache.rclone:
-            env["HOSTAI_SLOT_CACHE_RCLONE"] = "1"
-            if config.cache.rclone_remote:
-                env["HOSTAI_SLOT_CACHE_RCLONE_REMOTE"] = config.cache.rclone_remote
-            if config.cache.rclone_type:
-                env["HOSTAI_SLOT_CACHE_RCLONE_TYPE"] = config.cache.rclone_type
-            if config.cache.rclone_url:
-                env["HOSTAI_SLOT_CACHE_RCLONE_URL"] = config.cache.rclone_url
-            if config.cache.rclone_user:
-                env["HOSTAI_SLOT_CACHE_RCLONE_USER"] = config.cache.rclone_user
-            if config.cache.rclone_password:
-                env["HOSTAI_SLOT_CACHE_RCLONE_PASSWORD"] = config.cache.rclone_password
+        _env_cache_vars(config, session, slot_dir, env)
     return env
 
 
@@ -1048,29 +1075,21 @@ def _resolve_fresh_offer(
     )
 
 
-def _create_fresh_instance(
+def _fresh_metadata(
     config: Config,
     offer: _FreshOffer,
-    cache_session: Optional[str],
+    session: str,
     no_cache: bool,
     unsecure: bool,
-) -> State:
-    """Create the provider instance and initialize a fresh ``State``."""
-    sdir = state_dir(config.root_dir)
+    run_id: str,
+    run_started: str,
+) -> Dict[str, Any]:
     profile = offer.profile
-    image = offer.image
-    run_id = utils.make_run_id(profile.name)
-    run_dir = init_run_dir(runs_dir(config.root_dir), profile.name, run_id)
-    run_started = _now_rfc()
-    run_epoch = _now_epoch()
-    api_key = config.secrets.get("MODEL_API_KEY") or utils.make_api_key()
-    session = cache_session or config.cache.session
-
-    metadata = {
+    return {
         "schema_version": 1,
         "run_id": run_id,
         "status": "provisioning",
-        "started_at": _now_rfc(),
+        "started_at": run_started,
         "profile": profile.name,
         "monitor_group": profile.monitor_group or "",
         "gpu_query": offer.query,
@@ -1079,7 +1098,7 @@ def _create_fresh_instance(
         "bid_price": offer.bid_price if offer.interruptible else None,
         "expected_session_seconds": offer.session_seconds,
         "scoring_mode": config.market.scoring_mode,
-        "cuda_arch": image.cuda_arch,
+        "cuda_arch": offer.image.cuda_arch,
         "image": offer.selected_image,
         "ctx_size": offer.ctx_size,
         "model": offer.model,
@@ -1098,42 +1117,24 @@ def _create_fresh_instance(
         "slot_cache_use_shm": config.cache.use_shm,
         "unsecure": unsecure,
     }
-    (run_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, default=str))
-    (run_dir / "metadata.json").chmod(0o600)
 
-    env = _env_dict(config, profile, image, offer.model, offer.ctx_size, api_key, unsecure, no_cache, session)
-    extra = _extra_args(config, no_cache=no_cache)
-    label = f"hostai-{profile.name}-{_now_epoch()}"
 
-    volume_info: Optional[Dict[str, Any]] = None
-    if config.vast.volume_id and config.vast.volume_mount_path:
-        try:
-            volume_info = {"volume_id": int(config.vast.volume_id), "mount_path": config.vast.volume_mount_path}
-        except ValueError:
-            volume_info = None
-
-    create_kwargs: Dict[str, Any] = {
-        "image": offer.selected_image,
-        "disk": offer.disk_gb,
-        "env": env,
-        "label": label,
-        "extra": extra,
-        "runtype": "args",
-        "args": None,
-        "volume_info": volume_info,
-    }
-    if offer.interruptible:
-        create_kwargs["bid_price"] = offer.bid_price
-    try:
-        create_raw = _provider(config).create_instance(offer.offer_id, **create_kwargs)
-    except Exception as exc:
-        raise click.ClickException(f"create instance failed: {exc}")
-
-    instance_id = create_raw.get("new_contract") or create_raw.get("instance_id") or create_raw.get("id")
-    if not instance_id:
-        raise click.ClickException(f"create response did not contain an instance ID: {create_raw}")
-
-    state = State.load(sdir / "state.json")
+def _fill_fresh_state(
+    state: State,
+    config: Config,
+    offer: _FreshOffer,
+    instance_id: int,
+    api_key: str,
+    label: str,
+    session: str,
+    run_id: str,
+    run_dir: Path,
+    run_started: str,
+    run_epoch: int,
+    no_cache: bool,
+    unsecure: bool,
+) -> None:
+    profile = offer.profile
     state.instance_id = int(instance_id)
     state.status = "provisioning"
     state.offer_id = offer.offer_id
@@ -1177,6 +1178,78 @@ def _create_fresh_instance(
     state.slot_cache_max_gb = config.cache.max_gb
     state.slot_cache_local_dir = cache._default_local_dir(config)
     state.slot_cache_use_shm = config.cache.use_shm
+
+
+def _create_fresh_instance(
+    config: Config,
+    offer: _FreshOffer,
+    cache_session: Optional[str],
+    no_cache: bool,
+    unsecure: bool,
+) -> State:
+    """Create the provider instance and initialize a fresh ``State``."""
+    sdir = state_dir(config.root_dir)
+    profile = offer.profile
+    image = offer.image
+    run_id = utils.make_run_id(profile.name)
+    run_dir = init_run_dir(runs_dir(config.root_dir), profile.name, run_id)
+    run_started = _now_rfc()
+    run_epoch = _now_epoch()
+    api_key = config.secrets.get("MODEL_API_KEY") or utils.make_api_key()
+    session = cache_session or config.cache.session
+
+    metadata = _fresh_metadata(config, offer, session, no_cache, unsecure, run_id, run_started)
+    (run_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, default=str))
+    (run_dir / "metadata.json").chmod(0o600)
+
+    env = _env_dict(config, profile, image, offer.model, offer.ctx_size, api_key, unsecure, no_cache, session)
+    extra = _extra_args(config, no_cache=no_cache)
+    label = f"hostai-{profile.name}-{_now_epoch()}"
+
+    volume_info: Optional[Dict[str, Any]] = None
+    if config.vast.volume_id and config.vast.volume_mount_path:
+        try:
+            volume_info = {"volume_id": int(config.vast.volume_id), "mount_path": config.vast.volume_mount_path}
+        except ValueError:
+            volume_info = None
+
+    create_kwargs: Dict[str, Any] = {
+        "image": offer.selected_image,
+        "disk": offer.disk_gb,
+        "env": env,
+        "label": label,
+        "extra": extra,
+        "runtype": "args",
+        "args": None,
+        "volume_info": volume_info,
+    }
+    if offer.interruptible:
+        create_kwargs["bid_price"] = offer.bid_price
+    try:
+        create_raw = _provider(config).create_instance(offer.offer_id, **create_kwargs)
+    except Exception as exc:
+        raise click.ClickException(f"create instance failed: {exc}")
+
+    instance_id = create_raw.get("new_contract") or create_raw.get("instance_id") or create_raw.get("id")
+    if not instance_id:
+        raise click.ClickException(f"create response did not contain an instance ID: {create_raw}")
+
+    state = State.load(sdir / "state.json")
+    _fill_fresh_state(
+        state,
+        config,
+        offer,
+        instance_id,
+        api_key,
+        label,
+        session,
+        run_id,
+        run_dir,
+        run_started,
+        run_epoch,
+        no_cache,
+        unsecure,
+    )
 
     provider = _provider(config)
     private_key: Optional[Path] = getattr(provider, "ssh_private_key", None)
@@ -1315,6 +1388,148 @@ def _do_fresh_core(
     maybe_start_monitor(config, state)
 
 
+def _deliver_tls_cert(config: Config, state: State, known_hosts: Path) -> str:
+    """Deliver TLS certs to the container; return ``https`` or ``http``."""
+    if state.unsecure:
+        return "http"
+    tls_dir = tls.ensure_local_tls_dir(config.root_dir)
+    if not (tls_dir / "server.crt").exists():
+        tls.generate_cert(tls_dir)
+    _log("[tls] delivering certificates to container")
+    tls_deadline = time.monotonic() + min(120.0, float(config.ssh.start_timeout or 1200))
+    while True:
+        if tls.deliver_cert(
+            state.ssh_url,
+            tls_dir,
+            known_hosts=known_hosts,
+            config=config,
+            state=state,
+            timeout=60,
+        ):
+            break
+        if time.monotonic() >= tls_deadline:
+            raise click.ClickException("TLS certificate delivery failed")
+        _log("[tls] delivery attempt failed; retrying in 5s", err=True)
+        time.sleep(5)
+    state.tls_ca = tls_dir / "ca.crt"
+    state.save()
+    _log("[tls] certificates delivered")
+    return "https"
+
+
+def _prepare_slot_cache(
+    config: Config,
+    state: State,
+    no_cache: bool,
+    abort_if_shm_too_small: bool,
+    known_hosts: Path,
+) -> Tuple[bool, str]:
+    """Validate/cache key/shm/prefetch; return ``(cache_enabled, cache_remote)``."""
+    cache_enabled = state.slot_cache_enabled and not no_cache
+    if cache_enabled and not cache.validate_cache_config(config):
+        _log("[cache] WARNING: cache config invalid; continuing cold", err=True)
+        cache_enabled = False
+        state.slot_cache_enabled = False
+
+    if cache_enabled and not config.cache.rclone and not cache.install_cache_key_on_vast(state, config):
+        _log("[cache] WARNING: could not install cache key; continuing cold", err=True)
+        cache_enabled = False
+        state.slot_cache_enabled = False
+
+    cache_remote = ""
+    if not cache_enabled:
+        return cache_enabled, cache_remote
+
+    llama_commit = state.data.get("llama_cpp_commit") or cache.fetch_llama_commit(state.ssh_url, known_hosts)
+    state.data["llama_cpp_commit"] = llama_commit
+
+    if config.cache.use_shm:
+        shm_rc = _shm_preflight(
+            state.ssh_url,
+            config,
+            known_hosts,
+            config.cache.shm_min_gb or 30,
+        )
+        if shm_rc == 1:
+            if abort_if_shm_too_small or config.cache.shm_require:
+                raise click.ClickException(
+                    "[cache] /dev/shm is too small and abort-if-shm-too-small/shm_require is set"
+                )
+            _log("[cache] /dev/shm is too small; falling back to disk slot cache", err=True)
+            state.slot_cache_use_shm = False
+            state.slot_cache_local_dir = "/var/lib/qwen38/slots"
+        elif shm_rc == 2:
+            raise click.ClickException("[cache] slot cache /dev/shm preflight failed")
+
+    signature = cache._signature_for_state(config, state, llama_commit)
+    cache_remote = cache.remote_cache_dir(config, signature, state.slot_cache_session)
+    state.data["slot_cache_signature"] = signature
+    state.data["slot_cache_remote_dir"] = cache_remote
+    state.data["slot_cache_restore"] = "pending"
+    state.save()
+
+    if _prefetch_slot_cache_to_vast(state.ssh_url, config, state.slot_cache_local_dir, cache_remote, known_hosts):
+        _log("[cache] prefetched slot from cache server")
+        state.data["slot_cache_prefetch"] = "ok"
+    else:
+        _log("[cache] no slot cache on server; will start cold", err=True)
+        state.data["slot_cache_prefetch"] = "empty"
+    state.save()
+    return cache_enabled, cache_remote
+
+
+def _start_client_endpoint(config: Config, state: State) -> Tuple[int, State]:
+    """Start the proxy or SSH tunnel and return ``(proxy_port, updated_state)``."""
+    if config.proxy.tokenized_only:
+        proxy_port = _start_proxy(config, state, client_api_scheme="http")
+        if not proxy_port:
+            raise click.ClickException("[proxy] failed to start")
+        _log(f"[tunnel] proxy on localhost:{proxy_port}")
+    else:
+        proxy_port = ssh.ensure_tunnel(config, state)
+        _log(f"[tunnel] localhost:{proxy_port}")
+
+    # Reload state after the proxy/tunnel process has written its metadata
+    # (proxy_pid, upstream_socket, etc.) so the rest of provisioning and the
+    # final ready state are consistent with the running proxy.
+    state = State.load(state.state_file)
+    return proxy_port, state
+
+
+def _wait_for_client_api(config: Config, state: State, proxy_port: int, api_scheme: str) -> Tuple[LlamaClient, str]:
+    """Build the client URL, write the env file, and wait for API health."""
+    client_scheme = "http" if config.proxy.tokenized_only else api_scheme
+    client_api_url = f"{client_scheme}://127.0.0.1:{proxy_port}"
+    client_base_url = f"{client_api_url}/v1"
+    _write_env_file(config, state, client_api_url, client_base_url)
+
+    # In tokenized mode the proxy is the endpoint and only speaks HTTP, so use a
+    # temporary client state with unsecure=True to avoid requiring TLS for the local hop.
+    if config.proxy.tokenized_only:
+        client_state = State.load(state.state_file)
+        client_state.local_port = proxy_port
+        client_state.unsecure = True
+        client = LlamaClient(config, client_state)
+        _wait_for_api(config, client_state, config.ssh.start_timeout, client, stage_label="end-to-end via proxy")
+        return client, client_base_url
+
+    client = LlamaClient(config, state)
+    _wait_for_api(config, state, config.ssh.start_timeout, client, stage_label="end-to-end")
+    return client, client_base_url
+
+
+def _restore_or_clear_slot_cache(config: Config, client: LlamaClient, state: State, cache_enabled: bool) -> None:
+    if not cache_enabled:
+        return
+    if client.slot_restore(config.cache.slot_id):
+        _log("[cache] slot restored")
+        state.data["slot_cache_restore"] = "restored"
+    else:
+        _log("[cache] WARNING: slot restore failed; continuing cold", err=True)
+        state.data["slot_cache_restore"] = "failed"
+    state.save()
+
+
 def _start_instance_runtime(
     config: Config,
     state: State,
@@ -1333,135 +1548,20 @@ def _start_instance_runtime(
 
     # TLS: deliver certificates as soon as SSH is ready, before the slower cache
     # and slot-cache steps, so the remote start.sh does not time out waiting.
-    if not state.unsecure:
-        tls_dir = tls.ensure_local_tls_dir(config.root_dir)
-        if not (tls_dir / "server.crt").exists():
-            tls.generate_cert(tls_dir)
-        _log("[tls] delivering certificates to container")
-        tls_deadline = time.monotonic() + min(120.0, float(config.ssh.start_timeout or 1200))
-        tls_delivered = False
-        while not tls_delivered:
-            if tls.deliver_cert(
-                state.ssh_url,
-                tls_dir,
-                known_hosts=known_hosts,
-                config=config,
-                state=state,
-                timeout=60,
-            ):
-                tls_delivered = True
-                break
-            if time.monotonic() >= tls_deadline:
-                raise click.ClickException("TLS certificate delivery failed")
-            _log("[tls] delivery attempt failed; retrying in 5s", err=True)
-            time.sleep(5)
-        state.tls_ca = tls_dir / "ca.crt"
-        state.save()
-        _log("[tls] certificates delivered")
-        api_scheme = "https"
-    else:
-        api_scheme = "http"
+    api_scheme = _deliver_tls_cert(config, state, known_hosts)
 
-    # cache setup
-    cache_enabled = state.slot_cache_enabled and not no_cache
-    if cache_enabled and not cache.validate_cache_config(config):
-        _log("[cache] WARNING: cache config invalid; continuing cold", err=True)
-        cache_enabled = False
-        state.slot_cache_enabled = False
-
-    if cache_enabled and not config.cache.rclone and not cache.install_cache_key_on_vast(state, config):
-        _log("[cache] WARNING: could not install cache key; continuing cold", err=True)
-        cache_enabled = False
-        state.slot_cache_enabled = False
-
-    # slot cache restore (best effort)
-    cache_remote = ""
-    if cache_enabled:
-        llama_commit = state.data.get("llama_cpp_commit") or cache.fetch_llama_commit(state.ssh_url, known_hosts)
-        state.data["llama_cpp_commit"] = llama_commit
-
-        if config.cache.use_shm:
-            shm_rc = _shm_preflight(
-                state.ssh_url,
-                config,
-                known_hosts,
-                config.cache.shm_min_gb or 30,
-            )
-            if shm_rc == 1:
-                if abort_if_shm_too_small or config.cache.shm_require:
-                    raise click.ClickException(
-                        "[cache] /dev/shm is too small and abort-if-shm-too-small/shm_require is set"
-                    )
-                _log(
-                    "[cache] /dev/shm is too small; falling back to disk slot cache",
-                    err=True,
-                )
-                state.slot_cache_use_shm = False
-                state.slot_cache_local_dir = "/var/lib/qwen38/slots"
-            elif shm_rc == 2:
-                raise click.ClickException("[cache] slot cache /dev/shm preflight failed")
-
-        signature = cache._signature_for_state(config, state, llama_commit)
-        cache_remote = cache.remote_cache_dir(config, signature, state.slot_cache_session)
-        state.data["slot_cache_signature"] = signature
-        state.data["slot_cache_remote_dir"] = cache_remote
-        state.data["slot_cache_restore"] = "pending"
-        state.save()
-
-        if _prefetch_slot_cache_to_vast(state.ssh_url, config, state.slot_cache_local_dir, cache_remote, known_hosts):
-            _log("[cache] prefetched slot from cache server")
-            state.data["slot_cache_prefetch"] = "ok"
-        else:
-            _log("[cache] no slot cache on server; will start cold", err=True)
-            state.data["slot_cache_prefetch"] = "empty"
-        state.save()
+    cache_enabled, cache_remote = _prepare_slot_cache(config, state, no_cache, abort_if_shm_too_small, known_hosts)
 
     # Start the local proxy if tokenized-only is enabled. The proxy owns the
     # SSH tunnel to the remote Unix socket and provides the client-facing
     # OpenAI endpoint on LOCAL_PORT (or [proxy].port).
-    if config.proxy.tokenized_only:
-        proxy_port = _start_proxy(config, state, client_api_scheme="http")
-        if not proxy_port:
-            raise click.ClickException("[proxy] failed to start")
-        _log(f"[tunnel] proxy on localhost:{proxy_port}")
-    else:
-        proxy_port = ssh.ensure_tunnel(config, state)
-        _log(f"[tunnel] localhost:{proxy_port}")
+    proxy_port, state = _start_client_endpoint(config, state)
 
-    # Reload state after the proxy/tunnel process has written its metadata
-    # (proxy_pid, upstream_socket, etc.) so the rest of provisioning and the
-    # final ready state are consistent with the running proxy.
-    state = State.load(state.state_file)
-
-    # Build client API URL. When the proxy is active it is local HTTP; in the
-    # non-tokenized legacy path we still speak directly to the remote TLS port.
-    client_scheme = "http" if config.proxy.tokenized_only else api_scheme
-    client_api_url = f"{client_scheme}://127.0.0.1:{proxy_port}"
-    client_base_url = f"{client_api_url}/v1"
-    _write_env_file(config, state, client_api_url, client_base_url)
-
-    # Wait for the API to be reachable. In tokenized mode the proxy is the
-    # endpoint and only speaks HTTP, so use a temporary client state with
-    # unsecure=True to avoid requiring TLS for the local hop.
-    if config.proxy.tokenized_only:
-        client_state = State.load(state.state_file)
-        client_state.local_port = proxy_port
-        client_state.unsecure = True
-        client = LlamaClient(config, client_state)
-        _wait_for_api(config, client_state, config.ssh.start_timeout, client, stage_label="end-to-end via proxy")
-    else:
-        client = LlamaClient(config, state)
-        _wait_for_api(config, state, config.ssh.start_timeout, client, stage_label="end-to-end")
+    # Build client API URL and wait for the API to be reachable.
+    client, client_base_url = _wait_for_client_api(config, state, proxy_port, api_scheme)
 
     # restore slot cache
-    if cache_enabled:
-        if client.slot_restore(config.cache.slot_id):
-            _log("[cache] slot restored")
-            state.data["slot_cache_restore"] = "restored"
-        else:
-            _log("[cache] WARNING: slot restore failed; continuing cold", err=True)
-            state.data["slot_cache_restore"] = "failed"
-        state.save()
+    _restore_or_clear_slot_cache(config, client, state, cache_enabled)
 
     state.status = "running"
     state.data["ready_at"] = _now_rfc()

@@ -1094,6 +1094,112 @@ def upload_slot_cache_from_vast(
     return ok, transferred
 
 
+def _guard_cache_save(config: Config, state: State, no_cache: bool) -> Optional[str]:
+    """Return the SSH URL when a save may proceed, ``None`` to skip."""
+    cache_configured = config.cache.host or config.cache.rclone_url or config.cache.rclone_remote
+    if no_cache or not state.slot_cache_enabled or not cache_configured:
+        return None
+
+    ssh_url = state.ssh_url
+    if not ssh_url:
+        click.echo("[slot-cache] WARNING: no SSH endpoint; cannot save slot", err=True)
+        if config.cache.require_save:
+            raise click.ClickException("slot cache save failed and require_save is set")
+        return None
+
+    if not config.cache.rclone and not install_cache_key_on_vast(state, config):
+        click.echo("[slot-cache] WARNING: could not install cache key on Vast", err=True)
+        if config.cache.require_save:
+            raise click.ClickException("slot cache key install failed and require_save is set")
+        return None
+
+    return ssh_url
+
+
+def _build_cache_metadata(
+    config: Config,
+    state: State,
+    signature: str,
+    llama_commit: str,
+    slot_id: Optional[int],
+    n_saved: int,
+    n_written: int,
+    save_ms: float,
+) -> Dict[str, Any]:
+    use_fastmtp = 1 if state.data.get("use_fastmtp", config.model.use_fastmtp) else 0
+    return {
+        "schema_version": 1,
+        "saved_at": utils.now_rfc3339(),
+        "signature": signature,
+        "session": state.slot_cache_session,
+        "model": state.data.get("model", config.model.model),
+        "hf_revision": state.data.get("hf_revision", config.model.hf_revision),
+        "ctx_size": state.ctx_size,
+        "use_fastmtp": use_fastmtp,
+        "llama_cpp_commit": llama_commit,
+        "profile": state.profile,
+        "source_instance_id": state.instance_id,
+        "slot_id": slot_id if slot_id is not None else config.cache.slot_id,
+        "n_saved": n_saved,
+        "n_written": n_written,
+        "save_ms": save_ms,
+    }
+
+
+def _send_cache_metadata(
+    ssh_url: str,
+    slot_dir: str,
+    meta_path: Path,
+    known_hosts: Path,
+) -> None:
+    ssh.run_remote(ssh_url, f"install -d -m 700 {slot_dir}", known_hosts=known_hosts, timeout=30)
+    res = ssh.scp_to(ssh_url, meta_path, f"{slot_dir}/current.json.tmp", known_hosts=known_hosts, timeout=60)
+    if res.returncode == 0:
+        ssh.run_remote(
+            ssh_url,
+            f"mv {slot_dir}/current.json.tmp {slot_dir}/current.json && chmod 600 {slot_dir}/current.json",
+            known_hosts=known_hosts,
+            timeout=30,
+        )
+
+
+def _report_upload_result(
+    config: Config,
+    state: State,
+    details: Dict[str, Any],
+    ok: bool,
+    transferred: Optional[int],
+    upload_duration_s: float,
+    n_saved: int,
+    n_written: int,
+    save_ms: float,
+    upload_log: Path,
+) -> None:
+    details["uploaded"] = ok
+    details["cache_bytes_transferred"] = transferred
+    details["upload_duration_s"] = upload_duration_s
+    details["n_saved"] = n_saved
+    details["n_written"] = n_written
+    details["save_ms"] = save_ms
+    if ok:
+        click.echo("[slot-cache] uploaded to cache server")
+        state.set("slot_cache_save", "uploaded")
+        state.set("slot_cache_n_saved", n_saved)
+        state.set("slot_cache_bytes_saved", n_written)
+    else:
+        click.echo("[slot-cache] WARNING: upload to cache server failed", err=True)
+        if upload_log.exists():
+            tail = "\n".join(upload_log.read_text().splitlines()[-30:])
+            if tail:
+                click.echo("[slot-cache] upload log tail:", err=True)
+                click.echo(tail, err=True)
+        state.set("slot_cache_save", "upload-failed")
+        if config.cache.require_save:
+            state.save()
+            raise click.ClickException("slot cache upload failed and require_save is set; instance not destroyed")
+    state.save()
+
+
 def save_and_upload_slot_cache(
     config: Config,
     state: State,
@@ -1109,25 +1215,13 @@ def save_and_upload_slot_cache(
     ``None`` when the slot is empty, cache is disabled, or the upload fails
     without ``require_save``.
     """
-    cache_configured = config.cache.host or config.cache.rclone_url or config.cache.rclone_remote
-    if no_cache or not state.slot_cache_enabled or not cache_configured:
-        return None
-
-    if not state.ssh_url:
-        click.echo("[slot-cache] WARNING: no SSH endpoint; cannot save slot", err=True)
-        if config.cache.require_save:
-            raise click.ClickException("slot cache save failed and require_save is set")
-        return None
-
-    if not config.cache.rclone and not install_cache_key_on_vast(state, config):
-        click.echo("[slot-cache] WARNING: could not install cache key on Vast", err=True)
-        if config.cache.require_save:
-            raise click.ClickException("slot cache key install failed and require_save is set")
+    ssh_url = _guard_cache_save(config, state, no_cache)
+    if not ssh_url:
         return None
 
     llama_commit = state.data.get("llama_cpp_commit")
     if not llama_commit or not re.match(r"^[a-f0-9]+$", str(llama_commit)):
-        llama_commit = fetch_llama_commit(state.ssh_url, known_hosts)
+        llama_commit = fetch_llama_commit(ssh_url, known_hosts)
 
     signature = _signature_for_state(config, state, llama_commit)
 
@@ -1156,65 +1250,21 @@ def save_and_upload_slot_cache(
     # Use the actual slot dir recorded by up.py (it may have fallen back to
     # disk after a /dev/shm preflight), falling back to the configured default.
     slot_dir = state.slot_cache_local_dir or _default_local_dir(config)
-    use_fastmtp = 1 if state.data.get("use_fastmtp", config.model.use_fastmtp) else 0
-    metadata = {
-        "schema_version": 1,
-        "saved_at": utils.now_rfc3339(),
-        "signature": signature,
-        "session": state.slot_cache_session,
-        "model": state.data.get("model", config.model.model),
-        "hf_revision": state.data.get("hf_revision", config.model.hf_revision),
-        "ctx_size": state.ctx_size,
-        "use_fastmtp": use_fastmtp,
-        "llama_cpp_commit": llama_commit,
-        "profile": state.profile,
-        "source_instance_id": state.instance_id,
-        "slot_id": slot_id if slot_id is not None else config.cache.slot_id,
-        "n_saved": n_saved,
-        "n_written": n_written,
-        "save_ms": save_ms,
-    }
+    metadata = _build_cache_metadata(config, state, signature, llama_commit, slot_id, n_saved, n_written, save_ms)
 
     meta_path = run_dir / "current.json"
     meta_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False) + "\n")
     meta_path.chmod(0o600)
 
-    ssh.run_remote(state.ssh_url, f"install -d -m 700 {slot_dir}", known_hosts=known_hosts, timeout=30)
-    res = ssh.scp_to(state.ssh_url, meta_path, f"{slot_dir}/current.json.tmp", known_hosts=known_hosts, timeout=60)
-    if res.returncode == 0:
-        ssh.run_remote(
-            state.ssh_url,
-            f"mv {slot_dir}/current.json.tmp {slot_dir}/current.json && chmod 600 {slot_dir}/current.json",
-            known_hosts=known_hosts,
-            timeout=30,
-        )
+    _send_cache_metadata(ssh_url, slot_dir, meta_path, known_hosts)
 
     remote_dir = remote_cache_dir(config, signature, state.slot_cache_session)
 
     upload_log = run_dir / "cache-upload.log"
     upload_start = time.monotonic()
-    ok, transferred = upload_slot_cache_from_vast(state.ssh_url, config, slot_dir, remote_dir, known_hosts, upload_log)
-    details["uploaded"] = ok
-    details["cache_bytes_transferred"] = transferred
-    details["upload_duration_s"] = time.monotonic() - upload_start
-    details["n_saved"] = n_saved
-    details["n_written"] = n_written
-    details["save_ms"] = save_ms
-    if ok:
-        click.echo("[slot-cache] uploaded to cache server")
-        state.set("slot_cache_save", "uploaded")
-        state.set("slot_cache_n_saved", n_saved)
-        state.set("slot_cache_bytes_saved", n_written)
-    else:
-        click.echo("[slot-cache] WARNING: upload to cache server failed", err=True)
-        if upload_log.exists():
-            tail = "\n".join(upload_log.read_text().splitlines()[-30:])
-            if tail:
-                click.echo("[slot-cache] upload log tail:", err=True)
-                click.echo(tail, err=True)
-        state.set("slot_cache_save", "upload-failed")
-        if config.cache.require_save:
-            state.save()
-            raise click.ClickException("slot cache upload failed and require_save is set; instance not destroyed")
-    state.save()
+    ok, transferred = upload_slot_cache_from_vast(ssh_url, config, slot_dir, remote_dir, known_hosts, upload_log)
+    upload_duration_s = time.monotonic() - upload_start
+    _report_upload_result(
+        config, state, details, ok, transferred, upload_duration_s, n_saved, n_written, save_ms, upload_log
+    )
     return details

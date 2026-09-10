@@ -172,6 +172,88 @@ def _github_keys(user: str) -> str:
     return text
 
 
+def _resolve_public_key(
+    env: Dict[str, Optional[str]],
+    root_dir: Path,
+    from_github: bool,
+    strict: bool,
+    raw_keys: List[str],
+) -> None:
+    """Resolve a public key from env, GitHub, or the committed authorized_keys file."""
+    public_key = env.get(SSH_PUBLIC_KEY_ENV)
+    if public_key:
+        raw_keys.append(public_key)
+        return
+
+    github_user = env.get(GITHUB_SSH_KEY_USER_ENV)
+    if not github_user and from_github:
+        github_user = _github_user_from_git_config(root_dir)
+
+    if github_user:
+        print(
+            f"[ssh-keys] fetching public SSH keys for GitHub user: {github_user}",
+            file=sys.stderr,
+        )
+        try:
+            raw_keys.append(_github_keys(github_user))
+        except RuntimeError as exc:
+            if strict:
+                raise
+            print(f"[ssh-keys] {exc}", file=sys.stderr)
+
+
+def _warn_or_raise_if_empty(lines: List[str], strict: bool) -> None:
+    if lines:
+        return
+    msg = (
+        "no SSH public key is available for the runtime image.\n"
+        "Set one of:\n"
+        f"  - {SSH_PUBLIC_KEY_ENV}\n"
+        f"  - {GITHUB_SSH_KEY_USER_ENV}\n"
+        "  - ssh/authorized_keys in the repository\n"
+        "For GitHub Actions, set the repository owner as the GitHub user."
+    )
+    if strict:
+        raise RuntimeError(msg)
+    print(f"[ssh-keys] WARNING: {msg}", file=sys.stderr)
+
+
+def _write_authorized_keys(ssh_dir: Path, lines: List[str]) -> Path:
+    out = ssh_dir / "authorized_keys.generated"
+    content = "\n".join(lines) + ("\n" if lines else "")
+    tmp = out.with_suffix(".generated.tmp")
+    tmp.write_text(content)
+    tmp.chmod(0o600)
+    tmp.replace(out)
+    out.chmod(0o600)
+    if lines:
+        print(
+            f"[ssh-keys] prepared {len(lines)} public key(s) for image build",
+            file=sys.stderr,
+        )
+    return out
+
+
+def _fingerprint_keys(lines: List[str]) -> None:
+    if not shutil.which("ssh-keygen") or not lines:
+        return
+    for key in lines:
+        try:
+            proc = subprocess.run(
+                ["ssh-keygen", "-lf", "-"],
+                input=key,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            if proc.returncode == 0 and proc.stdout:
+                for line in proc.stdout.strip().splitlines():
+                    print(f"[ssh-keys] {line}", file=sys.stderr)
+        except (subprocess.SubprocessError, OSError):
+            pass
+
+
 def prepare_authorized_keys(
     *,
     root_dir: Path,
@@ -214,78 +296,16 @@ def prepare_authorized_keys(
     ssh_dir.chmod(0o700)
 
     raw_keys: List[str] = []
-
-    public_key = env.get(SSH_PUBLIC_KEY_ENV)
-    if public_key:
-        raw_keys.append(public_key)
-    else:
-        github_user = env.get(GITHUB_SSH_KEY_USER_ENV)
-        if not github_user and from_github:
-            github_user = _github_user_from_git_config(root_dir)
-
-        if github_user:
-            print(
-                f"[ssh-keys] fetching public SSH keys for GitHub user: {github_user}",
-                file=sys.stderr,
-            )
-            try:
-                raw_keys.append(_github_keys(github_user))
-            except RuntimeError as exc:
-                if strict:
-                    raise
-                print(f"[ssh-keys] {exc}", file=sys.stderr)
+    _resolve_public_key(env, root_dir, from_github, strict, raw_keys)
 
     # Also append any committed/explicit authorized_keys file.
     committed = ssh_dir / "authorized_keys"
     if committed.exists():
         raw_keys.append(committed.read_text())
 
-    all_keys = "\n".join(raw_keys)
-    out = ssh_dir / "authorized_keys.generated"
+    lines = _public_key_lines("\n".join(raw_keys))
+    _warn_or_raise_if_empty(lines, strict)
 
-    lines = _public_key_lines(all_keys)
-
-    if not lines:
-        msg = (
-            "no SSH public key is available for the runtime image.\n"
-            "Set one of:\n"
-            f"  - {SSH_PUBLIC_KEY_ENV}\n"
-            f"  - {GITHUB_SSH_KEY_USER_ENV}\n"
-            "  - ssh/authorized_keys in the repository\n"
-            "For GitHub Actions, set the repository owner as the GitHub user."
-        )
-        if strict:
-            raise RuntimeError(msg)
-        print(f"[ssh-keys] WARNING: {msg}", file=sys.stderr)
-
-    content = "\n".join(lines) + ("\n" if lines else "")
-    tmp = out.with_suffix(".generated.tmp")
-    tmp.write_text(content)
-    tmp.chmod(0o600)
-    tmp.replace(out)
-    out.chmod(0o600)
-
-    if lines:
-        print(
-            f"[ssh-keys] prepared {len(lines)} public key(s) for image build",
-            file=sys.stderr,
-        )
-
-    if shutil.which("ssh-keygen") and lines:
-        for key in lines:
-            try:
-                proc = subprocess.run(
-                    ["ssh-keygen", "-lf", "-"],
-                    input=key,
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                    timeout=5,
-                )
-                if proc.returncode == 0 and proc.stdout:
-                    for line in proc.stdout.strip().splitlines():
-                        print(f"[ssh-keys] {line}", file=sys.stderr)
-            except (subprocess.SubprocessError, OSError):
-                pass
-
+    out = _write_authorized_keys(ssh_dir, lines)
+    _fingerprint_keys(lines)
     return out

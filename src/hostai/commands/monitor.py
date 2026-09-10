@@ -58,6 +58,27 @@ def cmd_monitor(config: Config):
     pass
 
 
+def _targets_for_running_instance(profiles: Profiles, current: State) -> Optional[List[Profile]]:
+    """Return compatible monitor targets for the running workload, or None."""
+    if not (current.exists and current.instance_id and current.profile):
+        return None
+    active = profiles.resolve_profile(current.profile)
+    if not active:
+        return None
+    ctx = current.ctx_size or active.ctx_size
+    active = dataclasses.replace(active, ctx_size=ctx)
+    if active.monitor_group:
+        targets = [p for p in profiles.all_monitor_profiles(ctx) if p.monitor_group == active.monitor_group]
+        # The exact active profile is always a candidate even when it has
+        # monitor_search=false, because we need to compare against the same
+        # hardware class.
+        if active not in targets:
+            targets.insert(0, active)
+    else:
+        targets = [active]
+    return targets or None
+
+
 def _resolve_monitor_targets(
     config: Config,
     profiles: Profiles,
@@ -69,22 +90,9 @@ def _resolve_monitor_targets(
     # Use all monitor-searchable profiles that are compatible with the running
     # workload (same context and monitor group) so the monitor does not fall
     # back to the default profile silently.
-    if current.exists and current.instance_id and current.profile:
-        active = profiles.resolve_profile(current.profile)
-        if active:
-            ctx = current.ctx_size or active.ctx_size
-            active = dataclasses.replace(active, ctx_size=ctx)
-            if active.monitor_group:
-                targets = [p for p in profiles.all_monitor_profiles(ctx) if p.monitor_group == active.monitor_group]
-                # The exact active profile is always a candidate even when it
-                # has monitor_search=false, because we need to compare against
-                # the same hardware class.
-                if active not in targets:
-                    targets.insert(0, active)
-            else:
-                targets = [active]
-            if targets:
-                return targets
+    targets = _targets_for_running_instance(profiles, current)
+    if targets:
+        return targets
 
     if profile:
         p = profiles.resolve_profile(profile)
