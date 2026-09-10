@@ -1215,11 +1215,68 @@ def _do_fresh_core(
     if result.returncode != 0:
         raise click.ClickException(f"remote llama-server preflight failed: {result.stderr}")
 
+    state.data["cuda_arch"] = image.cuda_arch
+    client_base_url, cache_remote, cache_enabled = _start_instance_runtime(
+        config,
+        state,
+        no_cache=no_cache,
+        abort_if_shm_too_small=abort_if_shm_too_small,
+    )
+
+    state = State.load(state.state_file)
+    state.data["startup_seconds"] = state.data["ready_epoch"] - (state.started_epoch or 0)
+    state.save()
+    run_dir = state.run_dir
+    if run_dir:
+        state.save_metadata(run_dir, status="ready")
+
+    if run_dir and state.ssh_url:
+        telemetry = _capture_disk_telemetry(config, state, known_hosts)
+        if telemetry:
+            _log(
+                f"[disk] telemetry: {len(telemetry['records'])} stages, free={telemetry['records'][-1]['free_bytes'] / 1e9:.2f}GB"
+            )
+
+    _log("\nREADY")
+    _log(f"  Profile:   {state.profile} (sm_{image.cuda_arch})")
+    _log(f"  Image:     {state.image}")
+    _log(f"  GPU:       {state.gpu}")
+    _log(f"  Cost:      ${float(state.dph):.4f}/h")
+    _log(f"  Context:   {state.ctx_size}")
+    _log(f"  API:       {client_base_url}")
+    _log(f"  Instance:  {state.instance_id}")
+    _log(f"  Run log:   {run_dir}")
+    if cache_enabled:
+        _log(f"  Slot cache: session={state.slot_cache_session} remote={cache_remote}")
+    _log("\nRun: source .hostai-vast/env")
+    _log("Stop: hostai down")
+
+    maybe_start_watchdog(config, state)
+    maybe_start_monitor(config, state)
+
+
+def _start_instance_runtime(
+    config: Config,
+    state: State,
+    *,
+    no_cache: bool,
+    abort_if_shm_too_small: bool,
+) -> Tuple[str, str, bool]:
+    """Finish booting an SSH-reachable instance.
+
+    Shared by ``_do_fresh_core`` and ``_do_restart``: TLS delivery, slot-cache
+    prefetch, tunnel/proxy startup, API health wait, and slot restore.  Marks
+    the state ``running`` and returns ``(client_base_url, cache_remote,
+    cache_enabled)``.
+    """
+    known_hosts = state.state_file.parent / "known_hosts"
+
     # TLS: deliver certificates as soon as SSH is ready, before the slower cache
     # and slot-cache steps, so the remote start.sh does not time out waiting.
     if not state.unsecure:
         tls_dir = tls.ensure_local_tls_dir(config.root_dir)
-        tls.generate_cert(tls_dir)
+        if not (tls_dir / "server.crt").exists():
+            tls.generate_cert(tls_dir)
         _log("[tls] delivering certificates to container")
         tls_deadline = time.monotonic() + min(120.0, float(config.ssh.start_timeout or 1200))
         tls_delivered = False
@@ -1246,23 +1303,21 @@ def _do_fresh_core(
         api_scheme = "http"
 
     # cache setup
-    cache_enabled = state.slot_cache_enabled
+    cache_enabled = state.slot_cache_enabled and not no_cache
     if cache_enabled and not cache.validate_cache_config(config):
         _log("[cache] WARNING: cache config invalid; continuing cold", err=True)
         cache_enabled = False
         state.slot_cache_enabled = False
 
     if cache_enabled and not config.cache.rclone and not cache.install_cache_key_on_vast(state, config):
-        _log("[cache] WARNING: could not install cache private key; continuing cold", err=True)
+        _log("[cache] WARNING: could not install cache key; continuing cold", err=True)
         cache_enabled = False
         state.slot_cache_enabled = False
 
     # slot cache restore (best effort)
     cache_remote = ""
-    session = state.slot_cache_session
-    llama_commit = "unknown"
     if cache_enabled:
-        llama_commit = _common.fetch_llama_commit(state.ssh_url, known_hosts)
+        llama_commit = state.data.get("llama_cpp_commit") or _common.fetch_llama_commit(state.ssh_url, known_hosts)
         state.data["llama_cpp_commit"] = llama_commit
 
         if config.cache.use_shm:
@@ -1274,7 +1329,9 @@ def _do_fresh_core(
             )
             if shm_rc == 1:
                 if abort_if_shm_too_small or config.cache.shm_require:
-                    raise click.ClickException("[cache] /dev/shm is too small and abort-if-shm-too-small is set")
+                    raise click.ClickException(
+                        "[cache] /dev/shm is too small and abort-if-shm-too-small/shm_require is set"
+                    )
                 _log(
                     "[cache] /dev/shm is too small; falling back to disk slot cache",
                     err=True,
@@ -1284,17 +1341,14 @@ def _do_fresh_core(
             elif shm_rc == 2:
                 raise click.ClickException("[cache] slot cache /dev/shm preflight failed")
 
-    if cache_enabled:
-        remote_local_dir = state.slot_cache_local_dir
         signature = cache._signature_for_state(config, state, llama_commit)
-        cache_remote = cache.remote_cache_dir(config, signature, session)
-        state.data["cuda_arch"] = image.cuda_arch
+        cache_remote = cache.remote_cache_dir(config, signature, state.slot_cache_session)
         state.data["slot_cache_signature"] = signature
         state.data["slot_cache_remote_dir"] = cache_remote
         state.data["slot_cache_restore"] = "pending"
         state.save()
 
-        if _prefetch_slot_cache_to_vast(state.ssh_url, config, remote_local_dir, cache_remote, known_hosts):
+        if _prefetch_slot_cache_to_vast(state.ssh_url, config, state.slot_cache_local_dir, cache_remote, known_hosts):
             _log("[cache] prefetched slot from cache server")
             state.data["slot_cache_prefetch"] = "ok"
         else:
@@ -1342,47 +1396,19 @@ def _do_fresh_core(
     # restore slot cache
     if cache_enabled:
         if client.slot_restore(config.cache.slot_id):
-            _log("[cache] slot restore requested")
+            _log("[cache] slot restored")
             state.data["slot_cache_restore"] = "restored"
         else:
             _log("[cache] WARNING: slot restore failed; continuing cold", err=True)
             state.data["slot_cache_restore"] = "failed"
         state.save()
 
-    ready_at = _now_rfc()
-    ready_epoch = _now_epoch()
     state.status = "running"
-    state.data["ready_at"] = ready_at
-    state.data["ready_epoch"] = ready_epoch
-    state.data["startup_seconds"] = ready_epoch - (state.started_epoch or 0)
+    state.data["ready_at"] = _now_rfc()
+    state.data["ready_epoch"] = _now_epoch()
     state.save()
-    run_dir = state.run_dir
-    if run_dir:
-        state.save_metadata(run_dir, status="ready")
 
-    if run_dir and state.ssh_url:
-        telemetry = _capture_disk_telemetry(config, state, known_hosts)
-        if telemetry:
-            _log(
-                f"[disk] telemetry: {len(telemetry['records'])} stages, free={telemetry['records'][-1]['free_bytes'] / 1e9:.2f}GB"
-            )
-
-    _log("\nREADY")
-    _log(f"  Profile:   {state.profile} (sm_{image.cuda_arch})")
-    _log(f"  Image:     {state.image}")
-    _log(f"  GPU:       {state.gpu}")
-    _log(f"  Cost:      ${float(state.dph):.4f}/h")
-    _log(f"  Context:   {state.ctx_size}")
-    _log(f"  API:       {client_base_url}")
-    _log(f"  Instance:  {state.instance_id}")
-    _log(f"  Run log:   {run_dir}")
-    if cache_enabled:
-        _log(f"  Slot cache: session={session} remote={cache_remote}")
-    _log("\nRun: source .hostai-vast/env")
-    _log("Stop: hostai down")
-
-    maybe_start_watchdog(config, state)
-    maybe_start_monitor(config, state)
+    return client_base_url, cache_remote, cache_enabled
 
 
 def _do_restart(
@@ -1440,128 +1466,14 @@ def _do_restart(
 
     _cpu_arch_preflight(state.ssh_url, known_hosts, config, state=state)
 
-    # TLS: deliver certificates as soon as SSH is ready, before slower cache setup.
-    if not state.unsecure:
-        tls_dir = tls.ensure_local_tls_dir(config.root_dir)
-        if not (tls_dir / "server.crt").exists():
-            tls.generate_cert(tls_dir)
-        _log("[tls] delivering certificates to container")
-        tls_deadline = time.monotonic() + min(120.0, float(config.ssh.start_timeout or 1200))
-        tls_delivered = False
-        while not tls_delivered:
-            if tls.deliver_cert(
-                state.ssh_url,
-                tls_dir,
-                known_hosts=known_hosts,
-                config=config,
-                state=state,
-                timeout=60,
-            ):
-                tls_delivered = True
-                break
-            if time.monotonic() >= tls_deadline:
-                raise click.ClickException("TLS certificate delivery failed")
-            _log("[tls] delivery attempt failed; retrying in 5s", err=True)
-            time.sleep(5)
-        state.tls_ca = tls_dir / "ca.crt"
-        state.save()
-        _log("[tls] certificates delivered")
-        api_scheme = "https"
-    else:
-        api_scheme = "http"
+    client_base_url, _cache_remote, _cache_enabled = _start_instance_runtime(
+        config,
+        state,
+        no_cache=no_cache,
+        abort_if_shm_too_small=False,
+    )
 
-    # cache setup for restart
-    cache_enabled = state.slot_cache_enabled and not no_cache
-    if cache_enabled and not cache.validate_cache_config(config):
-        _log("[cache] WARNING: cache config invalid; continuing cold", err=True)
-        cache_enabled = False
-        state.slot_cache_enabled = False
-
-    if cache_enabled:
-        if not config.cache.rclone and not cache.install_cache_key_on_vast(state, config):
-            _log("[cache] WARNING: could not install cache key; continuing cold", err=True)
-            cache_enabled = False
-            state.slot_cache_enabled = False
-        else:
-            if config.cache.use_shm:
-                shm_rc = _shm_preflight(
-                    state.ssh_url,
-                    config,
-                    known_hosts,
-                    config.cache.shm_min_gb or 30,
-                )
-                if shm_rc == 1:
-                    if config.cache.shm_require:
-                        raise click.ClickException("[cache] /dev/shm is too small and [cache].shm_require is set")
-                    _log(
-                        "[cache] /dev/shm is too small; falling back to disk slot cache",
-                        err=True,
-                    )
-                    state.slot_cache_use_shm = False
-                    state.slot_cache_local_dir = "/var/lib/qwen38/slots"
-                elif shm_rc == 2:
-                    raise click.ClickException("[cache] slot cache /dev/shm preflight failed")
-
-            llama_commit = state.data.get("llama_cpp_commit") or _common.fetch_llama_commit(state.ssh_url, known_hosts)
-            state.data["llama_cpp_commit"] = llama_commit
-            signature = cache._signature_for_state(config, state, llama_commit)
-            remote_local_dir = state.slot_cache_local_dir
-            cache_remote = cache.remote_cache_dir(config, signature, state.slot_cache_session)
-            state.data["slot_cache_signature"] = signature
-            state.data["slot_cache_remote_dir"] = cache_remote
-            state.data["slot_cache_restore"] = "pending"
-            if _prefetch_slot_cache_to_vast(state.ssh_url, config, remote_local_dir, cache_remote, known_hosts):
-                _log("[cache] prefetched slot from cache server")
-                state.data["slot_cache_prefetch"] = "ok"
-            else:
-                _log("[cache] no slot cache on server; will start cold", err=True)
-                state.data["slot_cache_prefetch"] = "empty"
-            state.save()
-
-    # Start the local proxy if tokenized-only is enabled; otherwise open a
-    # direct SSH tunnel to the remote.
-    if config.proxy.tokenized_only:
-        proxy_port = _start_proxy(config, state, client_api_scheme="http")
-        if not proxy_port:
-            raise click.ClickException("[proxy] failed to start")
-        _log(f"[tunnel] proxy on localhost:{proxy_port}")
-    else:
-        proxy_port = ssh.ensure_tunnel(config, state)
-        _log(f"[tunnel] localhost:{proxy_port}")
-
-    # Reload state after the proxy/tunnel process has updated its metadata.
     state = State.load(state.state_file)
-
-    state.save()
-    client_scheme = "http" if config.proxy.tokenized_only else api_scheme
-    client_api_url = f"{client_scheme}://127.0.0.1:{proxy_port}"
-    client_base_url = f"{client_api_url}/v1"
-    _write_env_file(config, state, client_api_url, client_base_url)
-
-    if config.proxy.tokenized_only:
-        client_state = State.load(state.state_file)
-        client_state.local_port = proxy_port
-        client_state.unsecure = True
-        client = LlamaClient(config, client_state)
-        _wait_for_api(config, client_state, config.ssh.start_timeout, client, stage_label="end-to-end via proxy")
-    else:
-        client = LlamaClient(config, state)
-        _wait_for_api(config, state, config.ssh.start_timeout, client, stage_label="end-to-end")
-
-    # restore slot cache on restart
-    if cache_enabled:
-        if client.slot_restore(config.cache.slot_id):
-            _log("[cache] slot restored")
-            state.data["slot_cache_restore"] = "restored"
-        else:
-            _log("[cache] WARNING: slot restore failed; continuing cold", err=True)
-            state.data["slot_cache_restore"] = "failed"
-        state.save()
-
-    state.status = "running"
-    state.data["ready_at"] = _now_rfc()
-    state.data["ready_epoch"] = _now_epoch()
-    state.save()
     if state.run_dir:
         state.save_metadata(state.run_dir, status="restarted")
 
