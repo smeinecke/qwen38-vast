@@ -311,6 +311,7 @@ class UnixTLSConnector(aiohttp.UnixConnector):
         traces: List[Any],
         timeout: Any,
     ) -> Any:
+        _ = traces
         from aiohttp.client_exceptions import UnixClientConnectorError
         from aiohttp.helpers import ceil_timeout
 
@@ -563,6 +564,103 @@ class TokenizedProxy:
         }
         return web.json_response(output)
 
+    def _build_sse_chunk(
+        self,
+        completion_id: str,
+        created: int,
+        model: str,
+        delta: Dict[str, Any],
+        finish_reason: Optional[str],
+    ) -> bytes:
+        chunk: Dict[str, Any] = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": finish_reason,
+                }
+            ],
+        }
+        return f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
+
+    def _detect_token_mode(
+        self,
+        obj: Dict[str, Any],
+        token_mode: Optional[bool],
+        stop: bool,
+    ) -> Optional[bool]:
+        if token_mode is not None or stop:
+            return token_mode
+        if obj.get("tokens"):
+            return True
+        if obj.get("content") or obj.get("reasoning_content"):
+            return False
+        return None
+
+    def _process_stream_chunk(
+        self,
+        obj: Dict[str, Any],
+        detok: _TokenDetokenizer,
+        token_mode: Optional[bool],
+        sent_reasoning: bool,
+    ) -> Tuple[Dict[str, Any], Optional[str], Optional[bool], bool]:
+        stop = obj.get("stop", False)
+        token_mode = self._detect_token_mode(obj, token_mode, stop)
+
+        if token_mode:
+            delta_payload = detok.finish() if stop else detok.add(obj.get("tokens") or [])
+            finish = "stop" if detok.stopped else (self._map_finish_reason(obj) if stop else None)
+        # The final chunk carries the full content/reasoning_content,
+        # not deltas. Its content was already streamed, so only the
+        # reasoning blob is forwarded, and only when no deltas were sent.
+        elif stop:
+            delta_payload = {}
+            reasoning = (obj.get("reasoning_content") or "") if not sent_reasoning else ""
+            if reasoning:
+                delta_payload["reasoning_content"] = reasoning
+            finish = self._map_finish_reason(obj)
+        else:
+            delta_payload = {}
+            delta = obj.get("content", "")
+            if delta:
+                delta_payload["content"] = delta
+            reasoning_delta = obj.get("reasoning_content", "")
+            if reasoning_delta:
+                delta_payload["reasoning_content"] = reasoning_delta
+                sent_reasoning = True
+            finish = None
+
+        return delta_payload, finish, token_mode, sent_reasoning
+
+    async def _stream_end(
+        self,
+        stream: web.StreamResponse,
+        response: aiohttp.ClientResponse,
+        detok: _TokenDetokenizer,
+        token_mode: Optional[bool],
+        stop: bool,
+        finish: Optional[str],
+    ) -> web.StreamResponse:
+        await stream.write(b"data: [DONE]\n\n")
+        if token_mode and detok.stopped and not stop:
+            # Cancel upstream generation; the server stops the task
+            # when the client connection closes.
+            response.close()
+            _logger.warning(
+                "stop string matched client-side; aborted upstream stream at %d tokens",
+                detok.token_count,
+            )
+        _logger.info(
+            "stream finished: %d tokens, finish=%s",
+            detok.token_count,
+            finish,
+        )
+        return stream
+
     async def _stream_chat(
         self,
         request: web.Request,
@@ -604,79 +702,19 @@ class TokenizedProxy:
                 except json.JSONDecodeError:
                     continue
 
+                delta_payload, finish, token_mode, sent_reasoning = self._process_stream_chunk(
+                    obj, detok, token_mode, sent_reasoning
+                )
+                await stream.write(self._build_sse_chunk(completion_id, created, model, delta_payload, finish))
+
                 stop = obj.get("stop", False)
-                if token_mode is None and not stop:
-                    if obj.get("tokens"):
-                        token_mode = True
-                    elif obj.get("content") or obj.get("reasoning_content"):
-                        token_mode = False
-
-                if token_mode:
-                    delta_payload = detok.finish() if stop else detok.add(obj.get("tokens") or [])
-                    finish = "stop" if detok.stopped else (self._map_finish_reason(obj) if stop else None)
-                # The final chunk carries the full content/reasoning_content,
-                # not deltas. Its content was already streamed, so only the
-                # reasoning blob is forwarded, and only when no deltas were sent.
-                elif stop:
-                    delta_payload = {}
-                    reasoning = (obj.get("reasoning_content") or "") if not sent_reasoning else ""
-                    if reasoning:
-                        delta_payload["reasoning_content"] = reasoning
-                    finish = self._map_finish_reason(obj)
-                else:
-                    delta_payload = {}
-                    delta = obj.get("content", "")
-                    if delta:
-                        delta_payload["content"] = delta
-                    reasoning_delta = obj.get("reasoning_content", "")
-                    if reasoning_delta:
-                        delta_payload["reasoning_content"] = reasoning_delta
-                        sent_reasoning = True
-                    finish = None
-
-                chunk: Dict[str, Any] = {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": delta_payload,
-                            "finish_reason": finish,
-                        }
-                    ],
-                }
-
-                await stream.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
                 if stop or (token_mode and detok.stopped):
-                    await stream.write(b"data: [DONE]\n\n")
-                    if token_mode and detok.stopped and not stop:
-                        # Cancel upstream generation; the server stops the task
-                        # when the client connection closes.
-                        response.close()
-                        _logger.warning(
-                            "stop string matched client-side; aborted upstream stream at %d tokens",
-                            detok.token_count,
-                        )
-                    _logger.info(
-                        "stream finished: %d tokens, finish=%s",
-                        detok.token_count,
-                        finish,
-                    )
-                    return stream
+                    return await self._stream_end(stream, response, detok, token_mode, stop, finish)
 
         if token_mode:
             tail = detok.finish()
             if tail:
-                chunk = {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [{"index": 0, "delta": tail, "finish_reason": None}],
-                }
-                await stream.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
+                await stream.write(self._build_sse_chunk(completion_id, created, model, tail, None))
         await stream.write(b"data: [DONE]\n\n")
         return stream
 
