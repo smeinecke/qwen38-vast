@@ -394,6 +394,90 @@ def find_project_root(start: Optional[Path] = None) -> Path:
     return path
 
 
+def _load_toml_into_config(config: Config) -> None:
+    """Apply every TOML section to the matching dataclass field."""
+    if not config.config_file.exists():
+        return
+    with config.config_file.open("rb") as f:
+        data = tomllib.load(f)
+    if not data:
+        return
+    for section_name in data:
+        if not hasattr(config, section_name):
+            continue
+        section = getattr(config, section_name)
+        if not dataclasses.is_dataclass(section) or isinstance(section, type):
+            continue
+        for f in dataclasses.fields(section):
+            if f.name not in data[section_name]:
+                continue
+            value = data[section_name][f.name]
+            if dataclasses.is_dataclass(f.type) and isinstance(value, dict):
+                setattr(section, f.name, _from_dict(cast(Type[Any], f.type), value))
+            else:
+                setattr(section, f.name, _coerce(value, f.type))
+
+
+def _load_dotenv(env_file: Path) -> Dict[str, Optional[str]]:
+    if env_file.exists():
+        return dotenv_values(env_file)
+    return {}
+
+
+def _migrate_env_to_toml(config: Config, env: Dict[str, Optional[str]]) -> None:
+    """On first run, import non-secret .env settings into hostai.toml."""
+    if config.config_file.exists() or not env:
+        return
+    warnings.warn(
+        f"{config.config_file.name} not found; importing non-secret settings from {config.env_file.name}. "
+        "Please move non-secret settings into hostai.toml and keep .env only for secrets.",
+        stacklevel=2,
+    )
+    _apply_env_to_config(config, env)
+    _write_hostai_toml(config)
+    print(f"[config] created {config.config_file}", file=sys.stderr)
+
+
+def _warn_ignored_env_keys(config: Config, env: Dict[str, Optional[str]]) -> None:
+    """Warn about non-secret .env keys that hostai.toml overrides."""
+    if not env or not config.config_file.exists():
+        return
+    for key, raw in env.items():
+        if not raw or key in SECRETS or key not in ENV_MAP:
+            continue
+        section_name, attr, _ = ENV_MAP[key]
+        section = getattr(config, section_name)
+        current = getattr(section, attr)
+        if _coerce(raw, type(current)) != current:
+            warnings.warn(
+                f"{config.env_file.name} contains non-secret '{key}'; "
+                f"ignoring it because {config.config_file.name} takes precedence.",
+                stacklevel=2,
+            )
+
+
+def _collect_secrets(config: Config, env: Dict[str, Optional[str]]) -> None:
+    for key in SECRETS:
+        value = os.environ.get(key) or env.get(key) or ""
+        if value:
+            config.secrets[key] = value
+
+
+def _normalize_zero_optionals(config: Config) -> None:
+    """Treat 0 for optional ints/floats from env as unset (None)."""
+    for section_name, field_names in (
+        ("model", ("cache_ram", "ctx_checkpoints")),
+        (
+            "vast",
+            ("shm_size_gb", "idle_timeout_seconds", "max_runtime_seconds", "expected_session_seconds", "bid_price"),
+        ),
+    ):
+        section = getattr(config, section_name)
+        for field_name in field_names:
+            if getattr(section, field_name) == 0:
+                setattr(section, field_name, None)
+
+
 def load_config(project_root: Optional[Path] = None) -> Config:
     root = project_root or find_project_root()
     config_file = root / "hostai.toml"
@@ -401,76 +485,21 @@ def load_config(project_root: Optional[Path] = None) -> Config:
 
     config = Config(root_dir=root, config_file=config_file, env_file=env_file)
 
-    if config_file.exists():
-        with config_file.open("rb") as f:
-            data = tomllib.load(f)
-        if data:
-            for section_name in data:
-                if hasattr(config, section_name):
-                    section = getattr(config, section_name)
-                    if dataclasses.is_dataclass(section) and not isinstance(section, type):
-                        for f in dataclasses.fields(section):
-                            if f.name in data[section_name]:
-                                value = data[section_name][f.name]
-                                if dataclasses.is_dataclass(f.type) and isinstance(value, dict):
-                                    setattr(section, f.name, _from_dict(cast(Type[Any], f.type), value))
-                                else:
-                                    setattr(section, f.name, _coerce(value, f.type))
+    _load_toml_into_config(config)
 
-    # Handle .env: secrets and (on first run) migration to hostai.toml
-    env: Dict[str, Optional[str]] = {}
-    if env_file.exists():
-        env = dotenv_values(env_file)
-
-    if not config_file.exists() and env:
-        warnings.warn(
-            f"{config_file.name} not found; importing non-secret settings from {env_file.name}. "
-            "Please move non-secret settings into hostai.toml and keep .env only for secrets.",
-            stacklevel=2,
-        )
-        _apply_env_to_config(config, env)
-        _write_hostai_toml(config)
-        print(f"[config] created {config_file}", file=sys.stderr)
+    env = _load_dotenv(env_file)
+    _migrate_env_to_toml(config, env)
 
     if env:
-        # Always make secrets available in the environment for subprocesses/SKDs.
+        # Always make secrets available in the environment for subprocesses/SDKs.
         _set_secret_env(env)
-        # If hostai.toml exists, collect only secret values; warn about ignored non-secrets.
-        if config_file.exists():
-            for key, raw in env.items():
-                if not raw or key in SECRETS or key not in ENV_MAP:
-                    continue
-                section_name, attr, _ = ENV_MAP[key]
-                section = getattr(config, section_name)
-                current = getattr(section, attr)
-                if _coerce(raw, type(current)) != current:
-                    warnings.warn(
-                        f"{env_file.name} contains non-secret '{key}'; "
-                        f"ignoring it because {config_file.name} takes precedence.",
-                        stacklevel=2,
-                    )
+        # If hostai.toml exists, non-secret .env keys are ignored.
+        _warn_ignored_env_keys(config, env)
 
     # Apply current environment overrides (CLI one-offs take precedence).
     _apply_os_env_overrides(config)
-
-    # Expose secrets in the config object without printing them.
-    for key in SECRETS:
-        value = os.environ.get(key) or env.get(key) or ""
-        if value:
-            config.secrets[key] = value
-
-    # Empty optional ints/floats from env can become 0; treat 0 as None where empty means unset.
-    for field_name in ("cache_ram", "ctx_checkpoints", "shm_size_gb"):
-        section = getattr(config, "model" if field_name in ("cache_ram", "ctx_checkpoints") else "vast")
-        current = getattr(section, field_name)
-        if current == 0:
-            setattr(section, field_name, None)
-
-    for field_name in ("idle_timeout_seconds", "max_runtime_seconds", "expected_session_seconds", "bid_price"):
-        section = getattr(config, "vast")
-        current = getattr(section, field_name)
-        if current == 0:
-            setattr(section, field_name, None)
+    _collect_secrets(config, env)
+    _normalize_zero_optionals(config)
 
     return config
 
