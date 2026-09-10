@@ -7,7 +7,7 @@ import os
 import signal
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import click
 import requests
@@ -180,6 +180,61 @@ def _pause_or_destroy(config: Config, state: State, pause: bool, run_dir: Path) 
     return f"{destroy_outcome}. Session duration: {duration}s | estimated compute: ${cost:.4f}"
 
 
+def _resolve_run_dir(config: Config, state: State) -> Path:
+    """Ensure the run directory exists, creating one if the state is legacy."""
+    run_dir = state.run_dir
+    if run_dir is None:
+        run_dir = init_run_dir(
+            runs_dir(config.root_dir),
+            state.profile or "unknown",
+            f"{utils.now_epoch()}-recovered-{state.instance_id}",
+        )
+        state.run_dir = run_dir
+        state.save()
+    return Path(run_dir)
+
+
+def _build_shutdown_tail(
+    slot_details: Optional[Dict[str, Any]],
+    down_start_epoch: int,
+    archive_duration: float,
+    pause_or_destroy_duration: float,
+    reason: Optional[str],
+    dph: float,
+) -> Dict[str, Any]:
+    """Build the shutdown-tail metrics dict written with the run archive."""
+    shutdown_tail_seconds = max(0, utils.now_epoch() - down_start_epoch)
+    shutdown_cost = (dph or 0.0) * shutdown_tail_seconds / 3600.0
+
+    snapshot_bytes = int(slot_details.get("n_written", 0)) if slot_details else 0
+    transferred = slot_details.get("cache_bytes_transferred") if slot_details else None
+    cache_upload_failed = bool(slot_details and not slot_details.get("uploaded"))
+    cache_delta_seed_used = False
+    if transferred is not None and snapshot_bytes and snapshot_bytes > 0 and transferred < snapshot_bytes * 0.95:
+        cache_delta_seed_used = True
+
+    tail: Dict[str, Any] = {
+        "down_started_epoch": down_start_epoch,
+        "down_ended_epoch": utils.now_epoch(),
+        "shutdown_tail_seconds": shutdown_tail_seconds,
+        "estimated_shutdown_tail_cost_usd": round(shutdown_cost, 6),
+        "cache_save_ms": slot_details.get("save_ms", 0) if slot_details else 0,
+        "cache_snapshot_bytes": snapshot_bytes,
+        "cache_transfer_bytes": transferred if transferred is not None else 0,
+        "cache_transfer_duration_seconds": round(slot_details["upload_duration_s"], 3)
+        if slot_details and "upload_duration_s" in slot_details
+        else 0,
+        "cache_delta_seed_used": cache_delta_seed_used,
+        "cache_upload_failed": cache_upload_failed,
+        "telemetry_archive_duration_seconds": round(archive_duration, 3),
+        "pause_or_destroy_duration_seconds": round(pause_or_destroy_duration, 3),
+        "reason": reason or "manual",
+    }
+    if transferred and snapshot_bytes and snapshot_bytes > 0:
+        tail["cache_delta_ratio"] = round(transferred / snapshot_bytes, 6)
+    return tail
+
+
 def down_instance(
     config: Config,
     state: State,
@@ -206,18 +261,7 @@ def down_instance(
             click.echo("Cancelled.")
             return "cancelled"
 
-    # Ensure a run directory exists (legacy states may be missing it).
-    run_dir = state.run_dir
-    if run_dir is None:
-        run_dir = init_run_dir(
-            runs_dir(config.root_dir),
-            state.profile or "unknown",
-            f"{utils.now_epoch()}-recovered-{state.instance_id}",
-        )
-        state.run_dir = run_dir
-        state.save()
-
-    run_dir = Path(run_dir)
+    run_dir = _resolve_run_dir(config, state)
     down_start_epoch = utils.now_epoch()
     state.set("down_reason", reason or "manual")
     state.set("down_started_epoch", down_start_epoch)
@@ -251,35 +295,14 @@ def down_instance(
     outcome = _pause_or_destroy(config, state, pause, run_dir)
     pause_or_destroy_duration = time.monotonic() - pause_or_destroy_start
 
-    shutdown_tail_seconds = max(0, utils.now_epoch() - down_start_epoch)
-    shutdown_cost = (state.dph or 0.0) * shutdown_tail_seconds / 3600.0
-
-    snapshot_bytes = int(slot_details.get("n_written", 0)) if slot_details else 0
-    transferred = slot_details.get("cache_bytes_transferred") if slot_details else None
-    cache_upload_failed = bool(slot_details and not slot_details.get("uploaded"))
-    cache_delta_seed_used = False
-    if transferred is not None and snapshot_bytes and snapshot_bytes > 0 and transferred < snapshot_bytes * 0.95:
-        cache_delta_seed_used = True
-
-    tail = {
-        "down_started_epoch": down_start_epoch,
-        "down_ended_epoch": utils.now_epoch(),
-        "shutdown_tail_seconds": shutdown_tail_seconds,
-        "estimated_shutdown_tail_cost_usd": round(shutdown_cost, 6),
-        "cache_save_ms": slot_details.get("save_ms", 0) if slot_details else 0,
-        "cache_snapshot_bytes": snapshot_bytes,
-        "cache_transfer_bytes": transferred if transferred is not None else 0,
-        "cache_transfer_duration_seconds": round(slot_details["upload_duration_s"], 3)
-        if slot_details and "upload_duration_s" in slot_details
-        else 0,
-        "cache_delta_seed_used": cache_delta_seed_used,
-        "cache_upload_failed": cache_upload_failed,
-        "telemetry_archive_duration_seconds": round(archive_duration, 3),
-        "pause_or_destroy_duration_seconds": round(pause_or_destroy_duration, 3),
-        "reason": reason or "manual",
-    }
-    if transferred and snapshot_bytes and snapshot_bytes > 0:
-        tail["cache_delta_ratio"] = round(transferred / snapshot_bytes, 6)
+    tail = _build_shutdown_tail(
+        slot_details,
+        down_start_epoch,
+        archive_duration,
+        pause_or_destroy_duration,
+        reason,
+        state.dph,
+    )
 
     (run_dir / "shutdown-tail.json").write_text(json.dumps(tail, indent=2, ensure_ascii=False) + "\n")
     state.set("shutdown_tail", tail)
@@ -290,7 +313,8 @@ def down_instance(
         state.save()
 
     _client_log(
-        run_dir, f"{outcome} | tail={shutdown_tail_seconds}s cost=${shutdown_cost:.6f} reason={reason or 'manual'}"
+        run_dir,
+        f"{outcome} | tail={tail['shutdown_tail_seconds']}s cost=${tail['estimated_shutdown_tail_cost_usd']:.6f} reason={reason or 'manual'}",
     )
 
     click.echo(outcome)
