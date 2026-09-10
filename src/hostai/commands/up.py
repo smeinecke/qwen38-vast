@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple
 
 import click
 
@@ -21,7 +21,7 @@ from hostai.commands import _common
 from hostai.commands.monitor import maybe_start_monitor
 from hostai.commands.watchdog import maybe_start_watchdog
 from hostai.config import Config, image_for_profile
-from hostai.profiles import Profiles
+from hostai.profiles import Image, Profile, Profiles
 from hostai.providers import get_provider
 from hostai.state import State, init_run_dir, runs_dir, state_dir
 from hostai.validate import ValidationRecord, _image_info, compare_validations, load_last_validation
@@ -920,43 +920,59 @@ def _prefetch_slot_cache_to_vast(
     return res.returncode == 0 and "ok" in (res.stdout or "")
 
 
-def _do_fresh(
+class _FreshOffer(NamedTuple):
+    """Resolved provisioning inputs before an instance is created."""
+
+    local_port: int
+    profile: Profile
+    image: Image
+    ctx_size: int
+    model: str
+    selected_image: str
+    disk_gb: int
+    interruptible: bool
+    query: str
+    max_dph: float
+    offer_type: str
+    offer_data: Dict[str, Any]
+    offer_id: int
+    gpu_name: str
+    dph: float
+    bid_price: Optional[float]
+    session_seconds: Optional[int]
+
+
+def _check_for_live_instance(config: Config) -> None:
+    """Refuse to proceed if a previous state still references a live instance."""
+    sdir = state_dir(config.root_dir)
+    existing = sdir / "state.json"
+    if not existing.exists():
+        return
+    old = State.load(existing)
+    if not old.instance_id:
+        return
+    try:
+        inst = _provider(config).get_instance(old.instance_id)
+    except Exception:
+        # Could not reach provider to verify; proceed rather than hard-block.
+        inst = None
+    if inst and (inst.get("actual_status") or inst.get("status")) not in ("exited", "offline"):
+        raise click.ClickException(f"state file already references instance {old.instance_id}; run hostai down first")
+
+
+def _resolve_fresh_offer(
     config: Config,
     profile_name: str,
-    cache_session: Optional[str],
     local_port: Optional[int],
     max_price: Optional[float],
     unverified: bool,
-    unsecure: bool,
-    no_cache: bool,
-    abort_if_shm_too_small: bool,
     offer: Optional[int],
-    *,
-    bid_price: Optional[float] = None,
-    session_seconds: Optional[int] = None,
-    dry_run: bool = False,
-    allow_unvalidated: bool = False,
-) -> None:
-    sdir = state_dir(config.root_dir)
-    existing = sdir / "state.json"
-    if existing.exists():
-        old = State.load(existing)
-        if old.instance_id:
-            try:
-                inst = _provider(config).get_instance(old.instance_id)
-            except Exception:
-                # Could not reach provider to verify; proceed rather than hard-block.
-                inst = None
-            if inst and (inst.get("actual_status") or inst.get("status")) not in ("exited", "offline"):
-                raise click.ClickException(
-                    f"state file already references instance {old.instance_id}; run hostai down first"
-                )
-
-    # Resolve the client-side port before spending money on a rental.  Fail early
-    # when the user explicitly asked for a port that is already in use; otherwise
-    # search for a free port near the configured default.
+    bid_price: Optional[float],
+    session_seconds: Optional[int],
+    allow_unvalidated: bool,
+) -> _FreshOffer:
+    """Resolve profile, search query and select a market offer."""
     local_port = _resolve_client_port(config, user_port=local_port)
-
     profiles, profile, image = _resolve_profile(config, profile_name)
     ctx_size = config.hostai.ctx_size_override if config.hostai.ctx_size_override else profile.ctx_size
     model = config.model.model
@@ -1011,20 +1027,45 @@ def _do_fresh(
     gpu_name = offer_data.get("gpu_name", "unknown")
     dph = offer_data.get("dph_total", 0.0)
     _log(f"[rent] {market.offer_summary(offer_data)}")
+    return _FreshOffer(
+        local_port=local_port,
+        profile=profile,
+        image=image,
+        ctx_size=ctx_size,
+        model=model,
+        selected_image=selected_image,
+        disk_gb=disk_gb,
+        interruptible=interruptible,
+        query=query,
+        max_dph=max_dph,
+        offer_type=offer_type,
+        offer_data=offer_data,
+        offer_id=offer_id,
+        gpu_name=gpu_name,
+        dph=dph,
+        bid_price=bid_price,
+        session_seconds=session_seconds,
+    )
 
-    if dry_run:
-        _log("\nDRY RUN: not creating an instance")
-        return
 
+def _create_fresh_instance(
+    config: Config,
+    offer: _FreshOffer,
+    cache_session: Optional[str],
+    no_cache: bool,
+    unsecure: bool,
+) -> State:
+    """Create the provider instance and initialize a fresh ``State``."""
+    sdir = state_dir(config.root_dir)
+    profile = offer.profile
+    image = offer.image
     run_id = utils.make_run_id(profile.name)
     run_dir = init_run_dir(runs_dir(config.root_dir), profile.name, run_id)
     run_started = _now_rfc()
     run_epoch = _now_epoch()
-
     api_key = config.secrets.get("MODEL_API_KEY") or utils.make_api_key()
     session = cache_session or config.cache.session
 
-    # metadata
     metadata = {
         "schema_version": 1,
         "run_id": run_id,
@@ -1032,16 +1073,16 @@ def _do_fresh(
         "started_at": _now_rfc(),
         "profile": profile.name,
         "monitor_group": profile.monitor_group or "",
-        "gpu_query": query,
-        "disk_gb": disk_gb,
-        "interruptible": interruptible,
-        "bid_price": bid_price if interruptible else None,
-        "expected_session_seconds": session_seconds,
+        "gpu_query": offer.query,
+        "disk_gb": offer.disk_gb,
+        "interruptible": offer.interruptible,
+        "bid_price": offer.bid_price if offer.interruptible else None,
+        "expected_session_seconds": offer.session_seconds,
         "scoring_mode": config.market.scoring_mode,
         "cuda_arch": image.cuda_arch,
-        "image": selected_image,
-        "ctx_size": ctx_size,
-        "model": model,
+        "image": offer.selected_image,
+        "ctx_size": offer.ctx_size,
+        "model": offer.model,
         "hf_revision": config.model.hf_revision,
         "use_fastmtp": config.model.use_fastmtp,
         "cache_type_k": config.model.cache_type_k or "default",
@@ -1060,31 +1101,31 @@ def _do_fresh(
     (run_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, default=str))
     (run_dir / "metadata.json").chmod(0o600)
 
-    env = _env_dict(config, profile, image, model, ctx_size, api_key, unsecure, no_cache, session)
+    env = _env_dict(config, profile, image, offer.model, offer.ctx_size, api_key, unsecure, no_cache, session)
     extra = _extra_args(config, no_cache=no_cache)
     label = f"hostai-{profile.name}-{_now_epoch()}"
 
-    volume_info = None
+    volume_info: Optional[Dict[str, Any]] = None
     if config.vast.volume_id and config.vast.volume_mount_path:
         try:
             volume_info = {"volume_id": int(config.vast.volume_id), "mount_path": config.vast.volume_mount_path}
         except ValueError:
             volume_info = None
 
+    create_kwargs: Dict[str, Any] = {
+        "image": offer.selected_image,
+        "disk": offer.disk_gb,
+        "env": env,
+        "label": label,
+        "extra": extra,
+        "runtype": "args",
+        "args": None,
+        "volume_info": volume_info,
+    }
+    if offer.interruptible:
+        create_kwargs["bid_price"] = offer.bid_price
     try:
-        create_kwargs: Dict[str, Any] = {
-            "image": selected_image,
-            "disk": disk_gb,
-            "env": env,
-            "label": label,
-            "extra": extra,
-            "runtype": "args",
-            "args": None,
-            "volume_info": volume_info,
-        }
-        if interruptible:
-            create_kwargs["bid_price"] = bid_price
-        create_raw = _provider(config).create_instance(offer_id, **create_kwargs)
+        create_raw = _provider(config).create_instance(offer.offer_id, **create_kwargs)
     except Exception as exc:
         raise click.ClickException(f"create instance failed: {exc}")
 
@@ -1092,41 +1133,38 @@ def _do_fresh(
     if not instance_id:
         raise click.ClickException(f"create response did not contain an instance ID: {create_raw}")
 
-    started_at = _now_rfc()
-    started_epoch = _now_epoch()
-
     state = State.load(sdir / "state.json")
     state.instance_id = int(instance_id)
     state.status = "provisioning"
-    state.offer_id = offer_id
-    state.gpu = gpu_name
-    state.dph = float(dph)
-    state.local_port = local_port if local_port is not None else config.ssh.local_port
-    state.location = offer_data.get("geolocation", "") or offer_data.get("location", "")
-    state.inet_down = offer_data.get("inet_down", 0.0)
-    state.inet_down_cost = offer_data.get("inet_down_cost", 0.0)
-    state.inet_up = offer_data.get("inet_up", 0.0)
-    state.inet_up_cost = offer_data.get("inet_up_cost", 0.0)
-    state.disk_bw = offer_data.get("disk_bw", 0.0)
-    state.reliability = offer_data.get("reliability", 0.0)
-    state.model = model
+    state.offer_id = offer.offer_id
+    state.gpu = offer.gpu_name
+    state.dph = float(offer.dph)
+    state.local_port = offer.local_port if offer.local_port is not None else config.ssh.local_port
+    state.location = offer.offer_data.get("geolocation", "") or offer.offer_data.get("location", "")
+    state.inet_down = offer.offer_data.get("inet_down", 0.0)
+    state.inet_down_cost = offer.offer_data.get("inet_down_cost", 0.0)
+    state.inet_up = offer.offer_data.get("inet_up", 0.0)
+    state.inet_up_cost = offer.offer_data.get("inet_up_cost", 0.0)
+    state.disk_bw = offer.offer_data.get("disk_bw", 0.0)
+    state.reliability = offer.offer_data.get("reliability", 0.0)
+    state.model = offer.model
     state.hf_revision = config.model.hf_revision
-    state.ctx_size = ctx_size
+    state.ctx_size = offer.ctx_size
     state.api_key = api_key
-    state.image = selected_image
+    state.image = offer.selected_image
     state.label = label
     state.profile = profile.name
     state.data["min_gpu_vram_mb"] = profile.min_gpu_vram_mb
     state.data["profile_name"] = profile.name
     state.monitor_group = profile.monitor_group or ""
-    state.disk_gb = disk_gb
-    state.interruptible = interruptible
-    state.bid_price = bid_price if interruptible else None
-    state.expected_session_seconds = session_seconds
+    state.disk_gb = offer.disk_gb
+    state.interruptible = offer.interruptible
+    state.bid_price = offer.bid_price if offer.interruptible else None
+    state.expected_session_seconds = offer.session_seconds
     state.run_id = run_id
     state.run_dir = run_dir
-    state.started_at = started_at
-    state.started_epoch = started_epoch
+    state.started_at = _now_rfc()
+    state.started_epoch = _now_epoch()
     state.run_started_at = run_started
     state.run_started_epoch = run_epoch
     state.unsecure = unsecure
@@ -1140,7 +1178,6 @@ def _do_fresh(
     state.slot_cache_local_dir = cache._default_local_dir(config)
     state.slot_cache_use_shm = config.cache.use_shm
 
-    # LocalProvider generates an SSH key pair for the container.
     provider = _provider(config)
     private_key: Optional[Path] = getattr(provider, "ssh_private_key", None)
     if private_key:
@@ -1148,9 +1185,39 @@ def _do_fresh(
 
     state.save()
     state.save_metadata(run_dir, status="provisioning")
+    return state
+
+
+def _do_fresh(
+    config: Config,
+    profile_name: str,
+    cache_session: Optional[str],
+    local_port: Optional[int],
+    max_price: Optional[float],
+    unverified: bool,
+    unsecure: bool,
+    no_cache: bool,
+    abort_if_shm_too_small: bool,
+    offer: Optional[int],
+    *,
+    bid_price: Optional[float] = None,
+    session_seconds: Optional[int] = None,
+    dry_run: bool = False,
+    allow_unvalidated: bool = False,
+) -> None:
+    _check_for_live_instance(config)
+    plan = _resolve_fresh_offer(
+        config, profile_name, local_port, max_price, unverified, offer, bid_price, session_seconds, allow_unvalidated
+    )
+
+    if dry_run:
+        _log("\nDRY RUN: not creating an instance")
+        return
+
+    state = _create_fresh_instance(config, plan, cache_session, no_cache, unsecure)
 
     try:
-        _do_fresh_core(config, state, image, no_cache, abort_if_shm_too_small)
+        _do_fresh_core(config, state, plan.image, no_cache, abort_if_shm_too_small)
     except click.ClickException:
         _cleanup_instance(config, state, "provisioning failed")
         raise

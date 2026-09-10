@@ -20,32 +20,24 @@ from hostai.config import Config
 from hostai.state import State, runs_dir, state_dir
 
 
-@click.command("setup", help="One-time setup for the slot cache server.")
-@click.argument("target", required=False)
-@click.pass_obj
-def cmd_cache_setup(config: Config, target: Optional[str]):
-    """Prepare a dedicated cache key and install it on the cache server."""
-    if target:
-        if "@" not in target:
-            raise click.ClickException("expected user@host")
-        config.cache.user, config.cache.host = target.split("@", 1)
-
+def _setup_rclone_cache(config: Config) -> None:
     cfg = cache_config(config)
-    if rclone_enabled(config):
-        cache_configured = cfg.rclone_remote or cfg.rclone_url or cfg.host
-        if not cache_configured:
-            raise click.ClickException("rclone cache is not configured; set rclone_url or rclone_remote")
-        if not cache.validate_cache_config(config):
-            raise click.ClickException("rclone cache configuration is invalid")
-        click.echo(f"[cache] using rclone backend {rclone_remote_name(config)} for cache storage")
-        click.echo("READY")
-        click.echo(f"  remote root:  {config.cache.root}")
-        click.echo(f"  max cache:    {config.cache.max_gb} GiB")
-        click.echo()
-        click.echo("hostai up will now automatically prefetch a matching slot snapshot via rclone")
-        click.echo("and hostai down will save/upload slot 0 before destroying the Vast host.")
-        return
+    cache_configured = cfg.rclone_remote or cfg.rclone_url or cfg.host
+    if not cache_configured:
+        raise click.ClickException("rclone cache is not configured; set rclone_url or rclone_remote")
+    if not cache.validate_cache_config(config):
+        raise click.ClickException("rclone cache configuration is invalid")
+    click.echo(f"[cache] using rclone backend {rclone_remote_name(config)} for cache storage")
+    click.echo("READY")
+    click.echo(f"  remote root:  {config.cache.root}")
+    click.echo(f"  max cache:    {config.cache.max_gb} GiB")
+    click.echo()
+    click.echo("hostai up will now automatically prefetch a matching slot snapshot via rclone")
+    click.echo("and hostai down will save/upload slot 0 before destroying the Vast host.")
 
+
+def _setup_ssh_cache(config: Config) -> None:
+    cfg = cache_config(config)
     if not cfg.host:
         raise click.ClickException("cache.host is not configured; set it in hostai.toml or pass user@host")
 
@@ -73,6 +65,64 @@ def cmd_cache_setup(config: Config, target: Optional[str]):
     click.echo()
     click.echo("hostai up will now automatically prefetch a matching slot snapshot from this")
     click.echo("server, and hostai down will save/upload slot 0 before destroying the Vast host.")
+
+
+@click.command("setup", help="One-time setup for the slot cache server.")
+@click.argument("target", required=False)
+@click.pass_obj
+def cmd_cache_setup(config: Config, target: Optional[str]):
+    """Prepare a dedicated cache key and install it on the cache server."""
+    if target:
+        if "@" not in target:
+            raise click.ClickException("expected user@host")
+        config.cache.user, config.cache.host = target.split("@", 1)
+
+    if rclone_enabled(config):
+        _setup_rclone_cache(config)
+    else:
+        _setup_ssh_cache(config)
+
+
+def _verify_remote_size_ssh(config: Config, remote_dir: str, n_written: int) -> int:
+    """SSH to the cache server and confirm current.bin size matches ``n_written``."""
+    key_path = ensure_cache_key(config, config.root_dir)
+    cache_known_hosts = cache._known_hosts_path(config.root_dir)
+    verify = utils.run(
+        [
+            "ssh",
+            "-i",
+            str(key_path),
+            "-p",
+            str(config.cache.port),
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=8",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            f"UserKnownHostsFile={cache_known_hosts}",
+            f"{config.cache.user}@{config.cache.host}",
+            f"stat -c %s '{remote_dir}/current.bin'",
+        ],
+        check=False,
+        timeout=30,
+    )
+    if verify.returncode != 0 or not verify.stdout.strip().isdigit():
+        raise click.ClickException("could not verify uploaded cache size on cache server")
+    remote_size = int(verify.stdout.strip())
+    if remote_size != n_written:
+        raise click.ClickException(f"remote cache size {remote_size} does not match expected {n_written}")
+    return remote_size
+
+
+def _persist_copy_result(state: State, remote_dir: str, n_written: int, run_dir: Path, run_id: str) -> None:
+    state.set("slot_cache_save", "uploaded")
+    state.set("slot_cache_remote_dir", str(remote_dir))
+    state.set("slot_cache_bytes_saved", n_written)
+    state.set("last_cache_copy_run", str(run_dir))
+    state.set("last_cache_copy_run_id", run_id)
+    state.save()
 
 
 @click.command("copy", help="Save the current slot and upload it to the cache server.")
@@ -124,46 +174,12 @@ def cmd_cache_copy(config: Config, slot: Optional[int]):
     if rclone_enabled(config):
         remote_size = n_written
         click.echo("[cache] rclone upload complete; skipping remote size verification")
-    else:
-        key_path = ensure_cache_key(config, config.root_dir)
-        cache_known_hosts = cache._known_hosts_path(config.root_dir)
-        verify = utils.run(
-            [
-                "ssh",
-                "-i",
-                str(key_path),
-                "-p",
-                str(config.cache.port),
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=8",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                "-o",
-                f"UserKnownHostsFile={cache_known_hosts}",
-                f"{config.cache.user}@{config.cache.host}",
-                f"stat -c %s '{remote_dir}/current.bin'",
-            ],
-            check=False,
-            timeout=30,
-        )
-        if verify.returncode != 0 or not verify.stdout.strip().isdigit():
-            raise click.ClickException("could not verify uploaded cache size on cache server")
-        remote_size = int(verify.stdout.strip())
-        if remote_size != n_written:
-            raise click.ClickException(f"remote cache size {remote_size} does not match expected {n_written}")
-
-    state.set("slot_cache_save", "uploaded")
-    state.set("slot_cache_remote_dir", remote_dir)
-    state.set("slot_cache_bytes_saved", n_written)
-    state.set("last_cache_copy_run", str(run_dir))
-    state.set("last_cache_copy_run_id", run_id)
-    state.save()
-
-    if rclone_enabled(config):
         click.echo(f"[cache] persisted: {rclone_remote_name(config)}:{remote_dir}/current.bin")
     else:
+        remote_size = _verify_remote_size_ssh(config, remote_dir, n_written)
         click.echo(f"[cache] persisted: {config.cache.user}@{config.cache.host}:{remote_dir}/current.bin")
+
+    _persist_copy_result(state, remote_dir, n_written, run_dir, run_id)
+
     click.echo(f"[cache] verified: remote current.bin is {remote_size} bytes")
     click.echo(f"[cache] run log: {run_dir}")
