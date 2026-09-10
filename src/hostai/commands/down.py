@@ -598,7 +598,9 @@ def down_instance(
 @click.option("--pause", is_flag=True, help="Pause the instance instead of destroying it.")
 @click.option("--reason", help="Shutdown reason (used by watchdog).")
 @click.pass_obj
-def cmd_down(config: Config, yes: bool, no_archive: bool, cache: bool, no_cache: bool, pause: bool, reason: Optional[str]) -> None:
+def cmd_down(
+    config: Config, yes: bool, no_archive: bool, cache: bool, no_cache: bool, pause: bool, reason: Optional[str]
+) -> None:
     sd = state_dir(config.root_dir)
     state_file = sd / "state.json"
 

@@ -363,7 +363,9 @@ class TokenizedProxy:
 
     async def _on_startup(self, app: web.Application) -> None:
         if self.upstream_socket:
-            connector: aiohttp.BaseConnector = UnixTLSConnector(path=self.upstream_socket, ssl=self.ssl_ctx, limit=20, force_close=True)
+            connector: aiohttp.BaseConnector = UnixTLSConnector(
+                path=self.upstream_socket, ssl=self.ssl_ctx, limit=20, force_close=True
+            )
         else:
             connector = aiohttp.TCPConnector(ssl=self.ssl_ctx, limit=20, force_close=True)
         headers: Dict[str, str] = {"Content-Type": "application/json"}
