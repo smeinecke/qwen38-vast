@@ -29,6 +29,34 @@ def test_generate_cert_writes_key_and_cert(project_dir):
     assert key.name == "server.key"
 
 
+def test_cert_needs_regeneration_missing_files(project_dir):
+    tls_dir = project_dir / "tls"
+    assert tls.cert_needs_regeneration(tls_dir) is True
+    tls_dir.mkdir()
+    (tls_dir / "server.crt").write_text("CERT")
+    # Key still missing.
+    assert tls.cert_needs_regeneration(tls_dir) is True
+
+
+def test_cert_needs_regeneration_expiring(project_dir):
+    tls_dir = project_dir / "tls"
+    tls_dir.mkdir()
+    (tls_dir / "server.crt").write_text("CERT")
+    (tls_dir / "server.key").write_text("KEY")
+    with mock.patch("hostai.tls.utils.run", return_value=mock.Mock(returncode=1)) as run:
+        assert tls.cert_needs_regeneration(tls_dir) is True
+    assert "-checkend" in run.call_args.args[0]
+
+
+def test_cert_needs_regeneration_valid(project_dir):
+    tls_dir = project_dir / "tls"
+    tls_dir.mkdir()
+    (tls_dir / "server.crt").write_text("CERT")
+    (tls_dir / "server.key").write_text("KEY")
+    with mock.patch("hostai.tls.utils.run", return_value=mock.Mock(returncode=0)):
+        assert tls.cert_needs_regeneration(tls_dir) is False
+
+
 def test_load_cert_pair_returns_text(project_dir):
     tls_dir = project_dir / "tls"
     tls_dir.mkdir(parents=True)

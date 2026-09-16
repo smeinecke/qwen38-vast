@@ -1447,7 +1447,9 @@ def _deliver_tls_cert(config: Config, state: State, known_hosts: Path) -> str:
     if state.unsecure:
         return "http"
     tls_dir = tls.ensure_local_tls_dir(config.root_dir)
-    if not (tls_dir / "server.crt").exists():
+    if tls.cert_needs_regeneration(tls_dir):
+        if (tls_dir / "server.crt").exists():
+            _log("[tls] certificate expired or near expiry; regenerating")
         tls.generate_cert(tls_dir)
     _log("[tls] delivering certificates to container")
     tls_deadline = time.monotonic() + min(120.0, float(config.ssh.start_timeout or 1200))

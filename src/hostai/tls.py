@@ -20,7 +20,7 @@ def ensure_local_tls_dir(root_dir: Path) -> Path:
 
 
 def generate_cert(tls_dir: Path, common_name: str = "localhost") -> Tuple[Path, Path]:
-    """Generate a 2048-bit RSA self-signed cert/key pair.
+    """Generate a 2048-bit RSA self-signed cert/key pair valid for 7 days.
 
     Returns (server.crt, server.key).  Also writes ca.crt as a copy of
     server.crt and chmods the private key to 0600.
@@ -44,7 +44,7 @@ def generate_cert(tls_dir: Path, common_name: str = "localhost") -> Tuple[Path, 
         "-out",
         str(cert_path),
         "-days",
-        "1",
+        "7",
         "-nodes",
         "-subj",
         f"/CN={common_name}",
@@ -59,6 +59,26 @@ def generate_cert(tls_dir: Path, common_name: str = "localhost") -> Tuple[Path, 
     ca_path.chmod(0o644)
 
     return cert_path, key_path
+
+
+def cert_needs_regeneration(tls_dir: Path, min_valid_seconds: int = 86400) -> bool:
+    """Return True when the cert/key pair is missing or expires within *min_valid_seconds*.
+
+    Certs are minted with a short lifetime, so reusing a stale pair would make
+    the remote guard serve an expired certificate.  ``openssl x509 -checkend``
+    exits non-zero when the cert expires sooner than the given threshold.
+    """
+    tls_dir = Path(tls_dir)
+    cert_path = tls_dir / "server.crt"
+    key_path = tls_dir / "server.key"
+    if not cert_path.exists() or not key_path.exists():
+        return True
+    result = utils.run(
+        ["openssl", "x509", "-checkend", str(min_valid_seconds), "-noout", "-in", str(cert_path)],
+        check=False,
+        capture=True,
+    )
+    return result.returncode != 0
 
 
 def _ts() -> str:
