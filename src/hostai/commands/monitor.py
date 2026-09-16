@@ -221,7 +221,7 @@ def cmd_monitor_once(config: Config, profile: Optional[str], group: Optional[str
     best_dph = best.get("dph_total", 0)
     click.echo(
         f"[monitor] best {best.get('gpu_name')} at ${best_dph:.4f}/h "
-        f"(id={best.get('id') or best.get('ask_contract_id')})"
+        f"(id={best.get('id') or best.get('ask_contract_id')} machine={best.get('machine_id', '?')})"
     )
     if current_dph and current_dph > 0:
         saving = (current_dph - best_dph) / current_dph * 100
@@ -252,16 +252,18 @@ def cmd_monitor_watch(
             best = _ranked_best_for_monitor(config, profiles, current, all_offers)
             if best:
                 best_dph = best.get("dph_total", 0)
+                machine = best.get("machine_id", "?")
                 if current_dph and current_dph > 0 and current_dph > best_dph:
                     saving = (current_dph - best_dph) / current_dph * 100
                     if saving >= pct:
                         click.echo(
-                            f"[monitor] ALERT: {best.get('gpu_name')} ${best_dph:.4f}/h is {saving:.1f}% cheaper"
+                            f"[monitor] ALERT: {best.get('gpu_name')} ${best_dph:.4f}/h "
+                            f"is {saving:.1f}% cheaper (machine={machine})"
                         )
                     else:
-                        click.echo(f"[monitor] best ${best_dph:.4f}/h (saving {saving:.1f}%)")
+                        click.echo(f"[monitor] best ${best_dph:.4f}/h (saving {saving:.1f}%, machine={machine})")
                 else:
-                    click.echo(f"[monitor] best ${best_dph:.4f}/h")
+                    click.echo(f"[monitor] best ${best_dph:.4f}/h (machine={machine})")
             else:
                 click.echo("[monitor] no cheaper equivalent offer")
             time.sleep(sec)
