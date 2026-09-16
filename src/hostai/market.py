@@ -13,7 +13,7 @@ import statistics
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import click
 import pycountry
@@ -506,10 +506,18 @@ def filter_eligible_offers(
     current_gpu: Optional[str] = None,
     profiles: Optional[Profiles] = None,
     ctx_size: Optional[int] = None,
+    skip_machines: Optional[Iterable[int]] = None,
 ) -> List[Dict[str, Any]]:
-    """Filter search results by price, specific id, hardware rank, and context."""
+    """Filter search results by price, specific id, hardware rank, and context.
+
+    ``skip_machines`` excludes every offer hosted on the given Vast machine
+    IDs (``machine_id``), e.g. a dedicated host that failed a previous boot.
+    """
+    skipped = {str(m) for m in skip_machines} if skip_machines else set()
     matches: List[Dict[str, Any]] = []
     for o in offers:
+        if skipped and str(o.get("machine_id")) in skipped:
+            continue
         if offer is not None:
             if str(o.get("id")) != str(offer) and str(o.get("ask_contract_id")) != str(offer):
                 continue
@@ -574,6 +582,7 @@ def select_offer(
     ctx_size: Optional[int] = None,
     session_seconds: Optional[int] = None,
     cache_state: Optional[str] = None,
+    skip_machines: Optional[Iterable[int]] = None,
     verbose: bool = False,
 ) -> Dict[str, Any]:
     """Search, filter, and select the best offer for ``up`` or ``monitor``.
@@ -609,12 +618,14 @@ def select_offer(
         current_gpu=current_gpu,
         profiles=profiles,
         ctx_size=ctx_size,
+        skip_machines=skip_machines,
     )
 
     if not matches:
         if offer is not None:
             raise click.ClickException(f"no matching offer for id {offer}")
-        raise click.ClickException(f"no matching offer at or below ${max_dph:.2f}/h")
+        suffix = f" (excluding machines {sorted(skip_machines)})" if skip_machines else ""
+        raise click.ClickException(f"no matching offer at or below ${max_dph:.2f}/h{suffix}")
 
     if cache_state is None:
         cache_state = _resolve_cache_state(config)
@@ -661,6 +672,8 @@ def offer_summary(offer: Dict[str, Any]) -> str:
     down_cost = offer.get("inet_down_cost", 0)
     up_cost = offer.get("inet_up_cost", 0)
     offer_id = offer.get("id") or offer.get("ask_contract_id")
+    machine_id = offer.get("machine_id")
+    machine = machine_id if machine_id is not None else "?"
     scoring = offer.get("_hostai_score")
     extras = []
     if scoring:
@@ -672,7 +685,7 @@ def offer_summary(offer: Dict[str, Any]) -> str:
         f"{gpu} | ${dph:.4f}/h | "
         f"down={down} ({_format_transfer_cost(down_cost)}) | "
         f"up={up} ({_format_transfer_cost(up_cost)}) | "
-        f"{loc} | offer={offer_id}"
+        f"{loc} | offer={offer_id} machine={machine}"
     )
     if extras:
         summary += f" | {' '.join(extras)}"

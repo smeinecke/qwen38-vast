@@ -274,6 +274,33 @@ def test_cmd_up_scoring_and_keep_flags(config, project_dir):
     assert config.vast.keep_on_failure is True
 
 
+def test_cmd_up_skip_machine(config, project_dir):
+    config.hostai.default_profile = "test"
+    runner = CliRunner()
+    with mock.patch("hostai.commands.up._resolve_client_port", return_value=18080):
+        with mock.patch(
+            "hostai.commands.up._resolve_profile", return_value=(mock.Mock(), _make_profile_mock(), _make_image_mock())
+        ):
+            with mock.patch("hostai.commands.up.image_for_profile", return_value="ghcr.io/test"):
+                with mock.patch("hostai.commands.up.market.resolved_disk_gb", return_value=35):
+                    with mock.patch("hostai.commands.up.market.build_search_query", return_value=("query", 1.0)):
+                        with mock.patch(
+                            "hostai.commands.up.market.select_offer",
+                            return_value={"id": 1, "dph_total": 0.5, "gpu_name": "A100", "machine_id": 99},
+                        ) as select:
+                            with mock.patch("hostai.commands.up.market.offer_summary", return_value="summary"):
+                                provider = mock.Mock()
+                                provider.name = "vast"
+                                with mock.patch("hostai.commands.up._provider", return_value=provider):
+                                    result = runner.invoke(
+                                        up.cmd_up,
+                                        ["--skip-machine", "42", "--skip-machine", "43", "--dry-run"],
+                                        obj=config,
+                                    )
+    assert result.exit_code == 0
+    assert select.call_args.kwargs["skip_machines"] == (42, 43)
+
+
 def test_cmd_up_restart(config, project_dir):
     config.hostai.default_profile = "test"
     runner = CliRunner()

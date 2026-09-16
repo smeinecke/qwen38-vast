@@ -134,6 +134,28 @@ def test_filter_eligible_offers_respects_max_dph_and_gpu_rank(config):
     assert [o["id"] for o in matches] == [2]
 
 
+def test_filter_eligible_offers_skip_machines():
+    """Skipped machine IDs must remove all offers hosted on those machines."""
+    offers = [
+        {"id": 1, "gpu_name": "RTX 4090", "dph_total": 0.3, "machine_id": 111},
+        {"id": 2, "gpu_name": "RTX 4090", "dph_total": 0.4, "machine_id": 222},
+        {"id": 3, "gpu_name": "RTX 4090", "dph_total": 0.5, "machine_id": 333},
+        {"id": 4, "gpu_name": "RTX 4090", "dph_total": 0.6},
+    ]
+    matches = market.filter_eligible_offers(offers, max_dph=1.0, skip_machines=[111, 333])
+    assert [o["id"] for o in matches] == [2, 4]
+
+
+def test_filter_eligible_offers_skip_machines_str_id():
+    """A string machine_id in the offer still matches an int skip entry."""
+    offers = [
+        {"id": 1, "gpu_name": "RTX 4090", "dph_total": 0.3, "machine_id": "111"},
+        {"id": 2, "gpu_name": "RTX 4090", "dph_total": 0.4, "machine_id": 222},
+    ]
+    matches = market.filter_eligible_offers(offers, max_dph=1.0, skip_machines={111})
+    assert [o["id"] for o in matches] == [2]
+
+
 def test_filter_eligible_offers_zero_max_dph():
     """max_dph=0 must still filter out positive prices."""
     offers = [
@@ -359,6 +381,13 @@ def test_offer_summary_includes_country_name_and_flag():
     assert "Germany 🇩🇪" in summary
 
 
+def test_offer_summary_includes_machine_id():
+    offer = {"id": 1, "gpu_name": "RTX 4090", "dph_total": 0.5, "machine_id": 4242}
+    assert "machine=4242" in market.offer_summary(offer)
+    offer_no_machine = {"id": 1, "gpu_name": "RTX 4090", "dph_total": 0.5}
+    assert "machine=?" in market.offer_summary(offer_no_machine)
+
+
 def test_historical_per_gpu_stats(tmp_path):
     runs = tmp_path / "runs"
     run_dir = runs / "r1"
@@ -409,6 +438,42 @@ def test_select_offer_specific_id_not_found(config):
     with mock.patch("hostai.market.search_offers", return_value=[{"id": 2, "dph_total": 0.3}]):
         with pytest.raises(click.ClickException, match="no matching offer for id 1"):
             market.select_offer(config, profiles, "query", max_dph=0.5, unverified=False, offer=1, storage=35)
+
+
+def test_select_offer_skip_machines(config):
+    """Offers on skipped machines are excluded before the best offer is picked."""
+    profiles = Profiles(
+        schema_version=1,
+        images=[],
+        profiles=[make_profile()],
+        monitor_hardware=MonitorHardware(),
+        market_policy=MarketPolicy(),
+    )
+    offers = [
+        {"id": 1, "gpu_name": "RTX 4090", "dph_total": 0.3, "machine_id": 111},
+        {"id": 2, "gpu_name": "RTX 4090", "dph_total": 0.4, "machine_id": 222},
+    ]
+    with mock.patch("hostai.market.search_offers", return_value=offers):
+        best = market.select_offer(
+            config, profiles, "query", max_dph=0.5, unverified=False, offer=None, storage=35, skip_machines=[111]
+        )
+    assert best["id"] == 2
+
+
+def test_select_offer_skip_machines_no_match(config):
+    profiles = Profiles(
+        schema_version=1,
+        images=[],
+        profiles=[make_profile()],
+        monitor_hardware=MonitorHardware(),
+        market_policy=MarketPolicy(),
+    )
+    offers = [{"id": 1, "gpu_name": "RTX 4090", "dph_total": 0.3, "machine_id": 111}]
+    with mock.patch("hostai.market.search_offers", return_value=offers):
+        with pytest.raises(click.ClickException, match="excluding machines"):
+            market.select_offer(
+                config, profiles, "query", max_dph=0.5, unverified=False, offer=None, storage=35, skip_machines=[111]
+            )
 
 
 def test_offer_summary_country_falls_back_to_raw_value():

@@ -97,6 +97,13 @@ def _resolve_session_seconds(config: Config, expected_session: Optional[str]) ->
 @click.option("--keep-on-failure", is_flag=True, help="Do not destroy the instance if provisioning fails.")
 @click.option("--abort-if-shm-too-small", is_flag=True, help="Fail if /dev/shm is too small.")
 @click.option("--offer", type=int, help="Use a specific offer ID.")
+@click.option(
+    "--skip-machine",
+    "skip_machines",
+    type=int,
+    multiple=True,
+    help="Exclude offers hosted on this Vast machine ID (repeatable).",
+)
 @click.option("--restart", is_flag=True, help="Restart an existing paused instance.")
 @click.option("--interruptible", is_flag=True, help="Use an interruptible/bid instance.")
 @click.option("--bid", type=float, help="Bid price (max $/h) for interruptible instances.")
@@ -123,6 +130,7 @@ def cmd_up(
     keep_on_failure: bool,
     abort_if_shm_too_small: bool,
     offer: Optional[int],
+    skip_machines: Tuple[int, ...],
     restart: bool,
     interruptible: bool,
     bid: Optional[float],
@@ -149,6 +157,8 @@ def cmd_up(
     session_seconds = _resolve_session_seconds(config, expected_session)
 
     if restart:
+        if skip_machines:
+            _log("[up] --skip-machine is ignored for --restart (existing instance)", err=True)
         _do_restart(config, chosen_profile, local_port, unsecure, no_cache, allow_unvalidated=allow_unvalidated)
     else:
         _do_fresh(
@@ -162,6 +172,7 @@ def cmd_up(
             no_cache,
             abort_if_shm_too_small,
             offer,
+            skip_machines=skip_machines,
             bid_price=bid_price,
             session_seconds=session_seconds,
             dry_run=dry_run,
@@ -238,13 +249,17 @@ def _cleanup_instance(config: Config, state: State, reason: str) -> None:
     """Destroy the instance if something went wrong during provisioning."""
     if not state.instance_id:
         return
+    machine_id = state.data.get("machine_id")
+    hint = f"; re-run with --skip-machine {machine_id} to avoid this host" if machine_id is not None else ""
     if config.vast.keep_on_failure:
-        _log(f"[cleanup] {reason}; keep_on_failure is set, not destroying {state.instance_id}", err=True)
+        _log(
+            f"[cleanup] {reason}; keep_on_failure is set, not destroying {state.instance_id}{hint}", err=True
+        )
         state.status = "failed"
         state.set("failure_reason", reason)
         state.save()
         return
-    _log(f"[cleanup] {reason}; destroying instance {state.instance_id}...", err=True)
+    _log(f"[cleanup] {reason}; destroying instance {state.instance_id}...{hint}", err=True)
     try:
         _provider(config).destroy_instance(state.instance_id)
         _log(f"[cleanup] instance {state.instance_id} destroyed", err=True)
@@ -963,6 +978,7 @@ class _FreshOffer(NamedTuple):
     offer_type: str
     offer_data: Dict[str, Any]
     offer_id: int
+    machine_id: Optional[int]
     gpu_name: str
     dph: float
     bid_price: Optional[float]
@@ -994,6 +1010,7 @@ def _resolve_fresh_offer(
     max_price: Optional[float],
     unverified: bool,
     offer: Optional[int],
+    skip_machines: Tuple[int, ...],
     bid_price: Optional[float],
     session_seconds: Optional[int],
     allow_unvalidated: bool,
@@ -1025,6 +1042,8 @@ def _resolve_fresh_offer(
         )
     else:
         _log(f"[search]  mode={offer_type} max_dph=${configured_max_dph:.4f}/h")
+    if skip_machines:
+        _log(f"[search]  skipping machine ids: {', '.join(str(m) for m in skip_machines)}")
     provider = _provider(config)
     _log(f"[provider] {provider.name}")
     previous = _check_production_validation(config, allow_unvalidated)
@@ -1045,12 +1064,18 @@ def _resolve_fresh_offer(
         storage=disk_gb,
         offer_type=offer_type,
         session_seconds=session_seconds,
+        skip_machines=skip_machines,
         verbose=True,
     )
     offer_id_raw = offer_data.get("id") or offer_data.get("ask_contract_id")
     if offer_id_raw is None:
         raise click.ClickException("selected offer has no id")
     offer_id = int(offer_id_raw)
+    machine_id_raw = offer_data.get("machine_id")
+    try:
+        machine_id = int(machine_id_raw) if machine_id_raw is not None else None
+    except (TypeError, ValueError):
+        machine_id = None
     gpu_name = offer_data.get("gpu_name", "unknown")
     dph = offer_data.get("dph_total", 0.0)
     _log(f"[rent] {market.offer_summary(offer_data)}")
@@ -1068,6 +1093,7 @@ def _resolve_fresh_offer(
         offer_type=offer_type,
         offer_data=offer_data,
         offer_id=offer_id,
+        machine_id=machine_id,
         gpu_name=gpu_name,
         dph=dph,
         bid_price=bid_price,
@@ -1093,6 +1119,7 @@ def _fresh_metadata(
         "profile": profile.name,
         "monitor_group": profile.monitor_group or "",
         "gpu_query": offer.query,
+        "machine_id": offer.machine_id,
         "disk_gb": offer.disk_gb,
         "interruptible": offer.interruptible,
         "bid_price": offer.bid_price if offer.interruptible else None,
@@ -1138,6 +1165,7 @@ def _fill_fresh_state(
     state.instance_id = int(instance_id)
     state.status = "provisioning"
     state.offer_id = offer.offer_id
+    state.data["machine_id"] = offer.machine_id
     state.gpu = offer.gpu_name
     state.dph = float(offer.dph)
     state.local_port = offer.local_port if offer.local_port is not None else config.ssh.local_port
@@ -1273,6 +1301,7 @@ def _do_fresh(
     abort_if_shm_too_small: bool,
     offer: Optional[int],
     *,
+    skip_machines: Tuple[int, ...] = (),
     bid_price: Optional[float] = None,
     session_seconds: Optional[int] = None,
     dry_run: bool = False,
@@ -1280,7 +1309,16 @@ def _do_fresh(
 ) -> None:
     _check_for_live_instance(config)
     plan = _resolve_fresh_offer(
-        config, profile_name, local_port, max_price, unverified, offer, bid_price, session_seconds, allow_unvalidated
+        config,
+        profile_name,
+        local_port,
+        max_price,
+        unverified,
+        offer,
+        skip_machines,
+        bid_price,
+        session_seconds,
+        allow_unvalidated,
     )
 
     if dry_run:
@@ -1392,6 +1430,8 @@ def _do_fresh_core(
     _log(f"  Context:   {state.ctx_size}")
     _log(f"  API:       {client_base_url}")
     _log(f"  Instance:  {state.instance_id}")
+    if state.data.get("machine_id") is not None:
+        _log(f"  Machine:   {state.data['machine_id']}")
     _log(f"  Run log:   {run_dir}")
     if cache_enabled:
         _log(f"  Slot cache: session={state.slot_cache_session} remote={cache_remote}")
@@ -1644,6 +1684,8 @@ def _do_restart(
     _log(f"  Profile:   {state.profile}")
     _log(f"  API:       {client_base_url}")
     _log(f"  Instance:  {state.instance_id}")
+    if state.data.get("machine_id") is not None:
+        _log(f"  Machine:   {state.data['machine_id']}")
 
     maybe_start_watchdog(config, state)
     maybe_start_monitor(config, state)
