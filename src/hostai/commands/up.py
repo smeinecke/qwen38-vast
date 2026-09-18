@@ -678,9 +678,19 @@ def _wait_for_api(
         if client.health():
             _log(f"[boot:{stage_label}] /health OK after {now - start:.1f}s")
             return
+        # In the direct-tunnel path a dead SSH connection kills the tunnel
+        # worker (registry entry removed, local port closed); re-establish
+        # it instead of waiting for a port that will never open.
+        if not config.proxy.tokenized_only and state.local_port and not ssh._tunnel_is_running(state):
+            try:
+                ssh.ensure_tunnel(config, state)
+                _log("[tunnel] re-established dead tunnel")
+            except Exception as exc:
+                _log(f"[tunnel] reconnect failed: {exc}", err=True)
         if now - last_log >= 15:
             last_log = now
-            _log(f"[api] waiting for llama-server ({now - start}s / {timeout}s)")
+            detail = f" | last: {client.last_health_error}" if client.last_health_error else ""
+            _log(f"[api] waiting for llama-server ({now - start}s / {timeout}s){detail}")
             if state.instance_id:
                 _emit_instance_logs(config, state.instance_id, seen_logs)
             # best-effort server log tail from inside the container

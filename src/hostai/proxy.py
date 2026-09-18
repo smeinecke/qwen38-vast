@@ -215,6 +215,11 @@ class _TokenDetokenizer:
         return _split_delta(text, start, limit, self._expect_reasoning)
 
 
+def _one_line(exc: BaseException) -> str:
+    """Flatten an exception to a single line safe for an HTTP reason phrase."""
+    return " ".join(str(exc).split())[:200] or type(exc).__name__
+
+
 class ProxyError(Exception):
     """The tokenized proxy cannot handle a request."""
 
@@ -435,7 +440,9 @@ class TokenizedProxy:
 
         if upstream_response.status != 200:
             text = await upstream_response.text()
-            raise web.HTTPInternalServerError(reason=f"upstream returned {upstream_response.status}: {text[:200]}")
+            raise web.HTTPInternalServerError(
+                reason=f"upstream returned {upstream_response.status}: {' '.join(text.split())[:200]}"
+            )
 
         _logger.info(
             "chat request: %d prompt tokens, stream=%s, stops=%d",
@@ -746,14 +753,27 @@ class TokenizedProxy:
                 data=body,
             ) as upstream_response:
                 response = web.StreamResponse(status=upstream_response.status)
-                response.headers.update(upstream_response.headers)
+                # aiohttp auto-decompresses the body, so hop-by-hop framing
+                # and Content-Encoding headers must not be forwarded — the
+                # bytes we write are already decoded.
+                for k, v in upstream_response.headers.items():
+                    if k.lower() in {
+                        "content-encoding",
+                        "content-length",
+                        "transfer-encoding",
+                        "connection",
+                    }:
+                        continue
+                    response.headers[k] = v
                 await response.prepare(request)
                 async for chunk in upstream_response.content.iter_any():
                     await response.write(chunk)
                 await response.write_eof()
                 return response
         except aiohttp.ClientError as exc:
-            raise web.HTTPBadGateway(reason=f"upstream request failed: {exc}") from exc
+            raise web.HTTPBadGateway(
+                reason=f"upstream request failed: {_one_line(exc)}"
+            ) from exc
 
     async def _generic(self, request: web.Request) -> web.StreamResponse:
         """Catch-all reverse proxy for any endpoint not handled above."""
@@ -785,7 +805,9 @@ class TokenizedProxy:
                 text = await response.text()
                 return web.Response(text=text, status=response.status)
         except aiohttp.ClientError as exc:
-            raise web.HTTPBadGateway(reason=f"upstream health failed: {exc}") from exc
+            raise web.HTTPBadGateway(
+                reason=f"upstream health failed: {_one_line(exc)}"
+            ) from exc
 
     async def run(self) -> None:
         runner = web.AppRunner(self.app)
@@ -864,16 +886,40 @@ async def _wait_for_upstream_health(
     server_task: asyncio.Task,
     interval: float = 2.0,
 ) -> bool:
-    """Poll upstream /health until the model is ready to serve requests."""
+    """Poll upstream /health until the model is ready to serve requests.
+
+    Logs the failure reason periodically and re-establishes the SSH unix
+    tunnel when it dies (the local socket path is removed by the tunnel
+    worker on connection loss).
+    """
     if proxy.session is None:
         return False
+    last_log = 0.0
+    last_err = ""
     while not server_task.done():
+        err = ""
         try:
             async with proxy.session.get(f"{proxy.upstream}/health") as response:
                 if response.status == 200:
                     return True
-        except aiohttp.ClientError:
-            pass
+                err = f"upstream /health status {response.status}"
+        except aiohttp.ClientError as exc:
+            err = str(exc) or type(exc).__name__
+
+        now = time.monotonic()
+        if err != last_err or now - last_log >= 60:
+            last_log = now
+            last_err = err
+            _logger.info("waiting for upstream /health: %s", err)
+
+        if proxy.upstream_socket and not Path(proxy.upstream_socket).exists():
+            _logger.warning("upstream socket %s gone; restarting SSH unix tunnel", proxy.upstream_socket)
+            try:
+                local_path = await asyncio.to_thread(ssh.ensure_unix_tunnel, proxy.config, proxy.state)
+                _logger.info("SSH unix tunnel re-established on %s", local_path)
+            except Exception as exc:
+                _logger.error("SSH unix tunnel restart failed: %s", exc)
+
         await asyncio.sleep(interval)
     # The server task died (likely a startup failure); re-raise its exception.
     await server_task

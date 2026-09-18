@@ -57,12 +57,21 @@ def test_health_ok_json(client):
 def test_health_not_ok(client):
     responses.add(responses.GET, "http://127.0.0.1:18080/health", body="loading", status=200)
     assert client.health() is False
+    assert "unexpected /health body" in (client.last_health_error or "")
 
 
 @responses.activate
 def test_health_connection_error(client):
     responses.add(responses.GET, "http://127.0.0.1:18080/health", body=requests.ConnectionError("Connection refused"))
     assert client.health() is False
+    assert "ConnectionError" in (client.last_health_error or "")
+
+
+@responses.activate
+def test_health_status_error(client):
+    responses.add(responses.GET, "http://127.0.0.1:18080/health", body="proxy not ready", status=503)
+    assert client.health() is False
+    assert "HTTP 503" in (client.last_health_error or "")
 
 
 @responses.activate

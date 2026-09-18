@@ -68,6 +68,8 @@ class LlamaClient:
         else:
             self._verify = str(state.tls_ca)
 
+        self.last_health_error: Optional[str] = None
+
     @property
     def _headers(self) -> Dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -79,7 +81,11 @@ class LlamaClient:
         return f"{self.base_url}{path}"
 
     def health(self) -> bool:
-        """Return True when /health reports ok."""
+        """Return True when /health reports ok.
+
+        Records ``last_health_error`` so wait loops can show *why* health is
+        failing (connection refused vs HTTP status vs unexpected body).
+        """
         try:
             response = requests.get(
                 self._url("/health"),
@@ -87,24 +93,30 @@ class LlamaClient:
                 verify=self._verify,
                 timeout=(2, 5),
             )
-        except requests.RequestException:
+        except requests.RequestException as exc:
+            self.last_health_error = f"{type(exc).__name__}: {exc}"
             return False
 
         if response.status_code != 200:
+            self.last_health_error = f"HTTP {response.status_code}: {response.text.strip()[:120]}"
             return False
 
         text = response.text.strip()
         if text.lower() == "ok":
+            self.last_health_error = None
             return True
 
         try:
             payload = response.json()
             if isinstance(payload, dict) and payload.get("status") == "ok":
+                self.last_health_error = None
                 return True
         except (json.JSONDecodeError, ValueError):
             pass
 
-        return "ok" in text.lower()
+        ok = "ok" in text.lower()
+        self.last_health_error = None if ok else f"unexpected /health body: {text[:120]}"
+        return ok
 
     def wait_for_health(self, timeout: float = 1200, quiet: bool = False, stage_label: str = "api") -> bool:
         """Poll health with 1s initial interval and exponential backoff up to 5s."""
@@ -130,8 +142,9 @@ class LlamaClient:
                 now = time.monotonic()
                 if now - last_log >= 15:
                     last_log = now
+                    detail = f" | last: {self.last_health_error}" if self.last_health_error else ""
                     print(
-                        f"[api] waiting for llama-server health ({int(elapsed)}s / {int(timeout)}s)",
+                        f"[api] waiting for llama-server health ({int(elapsed)}s / {int(timeout)}s){detail}",
                         flush=True,
                     )
 

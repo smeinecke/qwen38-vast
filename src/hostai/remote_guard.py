@@ -115,6 +115,10 @@ class TokenOnlyGuard:
                     for k, v in response.headers.items()
                     if k.lower()
                     not in {
+                        # The session auto-decompresses the body, so the
+                        # framing and encoding headers no longer describe
+                        # the bytes forwarded to the client.
+                        "content-encoding",
                         "transfer-encoding",
                         "content-length",
                         "connection",
@@ -135,7 +139,9 @@ class TokenOnlyGuard:
                 return proxy
         except aiohttp.ClientError as exc:
             _logger.error("backend request failed: %s", exc)
-            raise web.HTTPBadGateway(reason=f"backend unreachable: {exc}") from exc
+            raise web.HTTPBadGateway(
+                reason=f"backend unreachable: {' '.join(str(exc).split())[:200] or type(exc).__name__}"
+            ) from exc
 
     async def _handler(self, request: web.Request) -> web.StreamResponse:
         if request.method not in ALLOWED_METHODS:

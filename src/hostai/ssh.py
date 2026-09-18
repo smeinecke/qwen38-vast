@@ -35,6 +35,13 @@ TUNNEL_MIN_CONNECT_TIMEOUT = 10.0
 TUNNEL_MAX_CONNECT_TIMEOUT = 120.0
 _TUNNEL_START_TIMEOUT = 45
 
+# Long-lived forwarding connections can sit completely idle for many minutes
+# while the remote model loads.  Without client-side keepalives a NAT or SSH
+# gateway can silently drop the TCP connection and asyncssh never notices.
+# Sending keepalives keeps the mapping warm and makes a dead peer detectable.
+SSH_KEEPALIVE_INTERVAL = 15.0
+SSH_KEEPALIVE_COUNT_MAX = 3
+
 
 def resolve_ssh_endpoint(instance: dict) -> Optional[Dict[str, Any]]:
     """Extract an SSH endpoint from a Vast instance dict.
@@ -116,6 +123,8 @@ def _connect_kwargs(known_hosts: Optional[Path] = None, identity: Optional[Path]
         # can disconnect with "Too many authentication failures" before the
         # correct one is tried.
         kwargs["agent_path"] = None
+    kwargs["keepalive_interval"] = SSH_KEEPALIVE_INTERVAL
+    kwargs["keepalive_count_max"] = SSH_KEEPALIVE_COUNT_MAX
     return kwargs
 
 
@@ -454,14 +463,27 @@ async def _start_tunnel_worker(
                     "stop": stop,
                     "remote_dest": remote_dest,
                 }
+                outcome["live"] = True
                 ready.set()
                 while not stop.is_set():
                     await asyncio.sleep(0.5)
     except Exception as exc:
         outcome["error"] = exc
+        # The caller consumes "error" only before ready is set; a drop after
+        # the tunnel went live must still be visible in the process log.
+        if outcome.get("live"):
+            _tunnel_log(f"tunnel :{local_port} SSH connection lost: {exc}")
         ready.set()
     finally:
         _TUNNELS.pop(local_port, None)
+        if outcome.get("live") and not stop.is_set():
+            _tunnel_log(f"tunnel :{local_port} forwarder stopped unexpectedly")
+
+
+def _tunnel_log(message: str) -> None:
+    """Emit a timestamped tunnel lifecycle line (visible in proxy/up logs)."""
+    ts = time.strftime("%H:%M:%S", time.localtime())
+    print(f"[{ts}] [tunnel] {message}", flush=True)
 
 
 def _tunnel_thread_runner(
@@ -742,14 +764,19 @@ async def _start_unix_tunnel_worker(
                     "stop": stop,
                     "remote_dest": remote_dest,
                 }
+                outcome["live"] = True
                 ready.set()
                 while not stop.is_set():
                     await asyncio.sleep(0.5)
     except Exception as exc:
         outcome["error"] = exc
+        if outcome.get("live"):
+            _tunnel_log(f"unix tunnel {local_path} SSH connection lost: {exc}")
         ready.set()
     finally:
         _UNI_TUNNELS.pop(local_path, None)
+        if outcome.get("live") and not stop.is_set():
+            _tunnel_log(f"unix tunnel {local_path} forwarder stopped unexpectedly")
         try:
             Path(local_path).unlink(missing_ok=True)
         except OSError:
