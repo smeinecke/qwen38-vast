@@ -252,9 +252,7 @@ def _cleanup_instance(config: Config, state: State, reason: str) -> None:
     machine_id = state.data.get("machine_id")
     hint = f"; re-run with --skip-machine {machine_id} to avoid this host" if machine_id is not None else ""
     if config.vast.keep_on_failure:
-        _log(
-            f"[cleanup] {reason}; keep_on_failure is set, not destroying {state.instance_id}{hint}", err=True
-        )
+        _log(f"[cleanup] {reason}; keep_on_failure is set, not destroying {state.instance_id}{hint}", err=True)
         state.status = "failed"
         state.set("failure_reason", reason)
         state.save()

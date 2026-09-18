@@ -771,9 +771,7 @@ class TokenizedProxy:
                 await response.write_eof()
                 return response
         except aiohttp.ClientError as exc:
-            raise web.HTTPBadGateway(
-                reason=f"upstream request failed: {_one_line(exc)}"
-            ) from exc
+            raise web.HTTPBadGateway(reason=f"upstream request failed: {_one_line(exc)}") from exc
 
     async def _generic(self, request: web.Request) -> web.StreamResponse:
         """Catch-all reverse proxy for any endpoint not handled above."""
@@ -805,9 +803,7 @@ class TokenizedProxy:
                 text = await response.text()
                 return web.Response(text=text, status=response.status)
         except aiohttp.ClientError as exc:
-            raise web.HTTPBadGateway(
-                reason=f"upstream health failed: {_one_line(exc)}"
-            ) from exc
+            raise web.HTTPBadGateway(reason=f"upstream health failed: {_one_line(exc)}") from exc
 
     async def run(self) -> None:
         runner = web.AppRunner(self.app)
