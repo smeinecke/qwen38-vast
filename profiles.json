@@ -55,7 +55,7 @@
       "image": "a6000",
       "ctx_size": 65536,
       "monitor_group": "q4-64k",
-      "gpu_query": "num_gpus>=1 gpu_name=RTX_A6000 gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
+      "gpu_query": "num_gpus>=1 gpu_name=RTX_A6000 gpu_ram>=48 cpu_ram>=32 reliability>0.95 inet_down>=300 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
       "monitor_search": false,
       "disk_gb": 35
     },
@@ -69,7 +69,7 @@
       "image": "a6000",
       "ctx_size": 65536,
       "monitor_group": "q4-64k",
-      "gpu_query": "num_gpus>=1 gpu_name in [\"RTX_A6000\",\"A40\"] gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
+      "gpu_query": "num_gpus>=1 gpu_name in [\"RTX_A6000\",\"A40\"] gpu_ram>=48 cpu_ram>=32 reliability>0.95 inet_down>=300 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
       "monitor_search": true,
       "disk_gb": 35
     },
@@ -84,7 +84,7 @@
       "cache_ram": 24576,
       "ctx_checkpoints": 0,
       "monitor_group": "q4-128k",
-      "gpu_query": "num_gpus>=1 gpu_name=RTX_A6000 gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
+      "gpu_query": "num_gpus>=1 gpu_name=RTX_A6000 gpu_ram>=48 cpu_ram>=32 reliability>0.95 inet_down>=300 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
       "monitor_search": false,
       "disk_gb": 35
     },
@@ -98,7 +98,7 @@
       "cache_ram": 24576,
       "ctx_checkpoints": 0,
       "monitor_group": "q4-128k",
-      "gpu_query": "num_gpus>=1 gpu_name in [\"RTX_A6000\",\"A40\"] gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
+      "gpu_query": "num_gpus>=1 gpu_name in [\"RTX_A6000\",\"A40\"] gpu_ram>=48 cpu_ram>=32 reliability>0.95 inet_down>=300 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
       "monitor_search": true,
       "disk_gb": 35
     },
@@ -113,7 +113,7 @@
       "cache_ram": 32768,
       "ctx_checkpoints": 0,
       "monitor_group": "q4-256k",
-      "gpu_query": "num_gpus>=1 gpu_name=RTX_A6000 gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
+      "gpu_query": "num_gpus>=1 gpu_name=RTX_A6000 gpu_ram>=48 cpu_ram>=32 reliability>0.95 inet_down>=300 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
       "monitor_search": false,
       "disk_gb": 35
     },
@@ -127,7 +127,7 @@
       "cache_ram": 32768,
       "ctx_checkpoints": 0,
       "monitor_group": "q4-256k",
-      "gpu_query": "num_gpus>=1 gpu_name in [\"RTX_A6000\",\"A40\"] gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
+      "gpu_query": "num_gpus>=1 gpu_name in [\"RTX_A6000\",\"A40\"] gpu_ram>=48 cpu_ram>=32 reliability>0.95 inet_down>=300 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
       "monitor_search": true,
       "disk_gb": 35
     },
@@ -140,7 +140,7 @@
       "image": "ada",
       "ctx_size": 32768,
       "monitor_group": "q4-32k",
-      "gpu_query": "num_gpus>=1 gpu_name=RTX_4090 gpu_ram>=24 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
+      "gpu_query": "num_gpus>=1 gpu_name=RTX_4090 gpu_ram>=24 cpu_ram>=32 reliability>0.95 inet_down>=300 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
       "monitor_search": true,
       "disk_gb": 35
     },
@@ -152,7 +152,7 @@
       "image": "ada",
       "ctx_size": 65536,
       "monitor_group": "q4-64k",
-      "gpu_query": "num_gpus>=1 gpu_name in [\"RTX_6000Ada\",\"L40S\",\"L40\",\"RTX_5880Ada\"] gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
+      "gpu_query": "num_gpus>=1 gpu_name in [\"RTX_6000Ada\",\"L40S\",\"L40\",\"RTX_5880Ada\"] gpu_ram>=48 cpu_ram>=32 reliability>0.95 inet_down>=300 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
       "monitor_search": true,
       "disk_gb": 35
     },
@@ -167,7 +167,7 @@
       "cache_ram": 24576,
       "ctx_checkpoints": 0,
       "monitor_group": "q4-128k",
-      "gpu_query": "num_gpus>=1 gpu_name in [\"RTX_6000Ada\",\"L40S\",\"L40\",\"RTX_5880Ada\"] gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
+      "gpu_query": "num_gpus>=1 gpu_name in [\"RTX_6000Ada\",\"L40S\",\"L40\",\"RTX_5880Ada\"] gpu_ram>=48 cpu_ram>=32 reliability>0.95 inet_down>=300 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
       "monitor_search": true,
       "disk_gb": 35
     },
@@ -181,7 +181,7 @@
       "cache_ram": 32768,
       "ctx_checkpoints": 0,
       "monitor_group": "q4-256k",
-      "gpu_query": "num_gpus>=1 gpu_name in [\"RTX_6000Ada\",\"L40S\",\"L40\",\"RTX_5880Ada\"] gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
+      "gpu_query": "num_gpus>=1 gpu_name in [\"RTX_6000Ada\",\"L40S\",\"L40\",\"RTX_5880Ada\"] gpu_ram>=48 cpu_ram>=32 reliability>0.95 inet_down>=300 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
       "monitor_search": true,
       "disk_gb": 35
     },
@@ -193,7 +193,7 @@
       "image": "blackwell",
       "ctx_size": 65536,
       "monitor_group": "q4-64k",
-      "gpu_query": "num_gpus>=1 gpu_name=RTX_5090 gpu_ram>=32 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
+      "gpu_query": "num_gpus>=1 gpu_name=RTX_5090 gpu_ram>=32 cpu_ram>=32 reliability>0.95 inet_down>=300 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
       "monitor_search": true,
       "disk_gb": 35
     },
@@ -207,7 +207,7 @@
       "cache_ram": 24576,
       "ctx_checkpoints": 0,
       "monitor_group": "q4-128k",
-      "gpu_query": "num_gpus>=1 gpu_name=RTX_5090 gpu_ram>=32 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
+      "gpu_query": "num_gpus>=1 gpu_name=RTX_5090 gpu_ram>=32 cpu_ram>=32 reliability>0.95 inet_down>=300 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
       "monitor_search": false,
       "disk_gb": 35
     },
@@ -222,7 +222,7 @@
       "cache_ram": 24576,
       "ctx_checkpoints": 0,
       "monitor_group": "q4-128k",
-      "gpu_query": "num_gpus>=1 gpu_name in [\"RTX_5090\",\"RTX_PRO_6000\"] gpu_ram>=32 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
+      "gpu_query": "num_gpus>=1 gpu_name in [\"RTX_5090\",\"RTX_PRO_6000\"] gpu_ram>=32 cpu_ram>=32 reliability>0.95 inet_down>=300 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
       "monitor_search": true,
       "disk_gb": 35
     },
@@ -236,7 +236,7 @@
       "cache_ram": 32768,
       "ctx_checkpoints": 0,
       "monitor_group": "q4-256k",
-      "gpu_query": "num_gpus>=1 gpu_name=RTX_PRO_6000 gpu_ram>=90 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
+      "gpu_query": "num_gpus>=1 gpu_name=RTX_PRO_6000 gpu_ram>=90 cpu_ram>=32 reliability>0.95 inet_down>=300 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
       "monitor_search": true,
       "disk_gb": 35
     },
@@ -250,7 +250,7 @@
       "ctx_size": 262144,
       "cache_ram": 32768,
       "ctx_checkpoints": 0,
-      "gpu_query": "num_gpus>=1 gpu_name in [\"RTX_PRO_6000\",\"RTX_PRO_6000_WS\",\"RTX_PRO_6000_S\"] gpu_ram>=90 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
+      "gpu_query": "num_gpus>=1 gpu_name in [\"RTX_PRO_6000\",\"RTX_PRO_6000_WS\",\"RTX_PRO_6000_S\"] gpu_ram>=90 cpu_ram>=32 reliability>0.95 inet_down>=300 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
       "disk_gb": 35
     },
     {
@@ -266,7 +266,7 @@
       "cache_ram": 24576,
       "ctx_checkpoints": 0,
       "monitor_group": "q4-128k",
-      "gpu_query": "num_gpus=1 gpu_name=A100_SXM4 gpu_ram>=40 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
+      "gpu_query": "num_gpus=1 gpu_name=A100_SXM4 gpu_ram>=40 cpu_ram>=32 reliability>0.95 inet_down>=300 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
       "monitor_search": false,
       "disk_gb": 35,
       "min_gpu_vram_mb": 39000
@@ -284,7 +284,7 @@
       "cache_ram": 32768,
       "ctx_checkpoints": 0,
       "monitor_group": "q4-256k",
-      "gpu_query": "num_gpus=1 gpu_name=CMP_170HX gpu_ram>=60 cpu_ram>=32 reliability>0.98 inet_down>=500 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
+      "gpu_query": "num_gpus=1 gpu_name=CMP_170HX gpu_ram>=60 cpu_ram>=32 reliability>0.95 inet_down>=300 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
       "monitor_search": false,
       "disk_gb": 35,
       "min_gpu_vram_mb": 60000
@@ -303,7 +303,7 @@
       "cache_ram": 24576,
       "ctx_checkpoints": 0,
       "monitor_group": "q4-128k",
-      "gpu_query": "num_gpus=1 gpu_name=GB10 cpu_arch=arm64 gpu_ram>=115 cpu_ram>=32 reliability>0.90 inet_down>=500 disk_bw>=200 cuda_max_good>=13.0 rented=False rentable=True direct_port_count>=1",
+      "gpu_query": "num_gpus=1 gpu_name=GB10 cpu_arch=arm64 gpu_ram>=115 cpu_ram>=32 reliability>0.90 inet_down>=300 disk_bw>=200 cuda_max_good>=13.0 rented=False rentable=True direct_port_count>=1",
       "monitor_search": false,
       "disk_gb": 35,
       "min_gpu_vram_mb": 115000
@@ -321,7 +321,7 @@
       "cache_ram": 32768,
       "ctx_checkpoints": 0,
       "monitor_group": "q4-256k",
-      "gpu_query": "num_gpus=1 gpu_name=GB10 cpu_arch=arm64 gpu_ram>=115 cpu_ram>=32 reliability>0.90 inet_down>=500 disk_bw>=200 cuda_max_good>=13.0 rented=False rentable=True direct_port_count>=1",
+      "gpu_query": "num_gpus=1 gpu_name=GB10 cpu_arch=arm64 gpu_ram>=115 cpu_ram>=32 reliability>0.90 inet_down>=300 disk_bw>=200 cuda_max_good>=13.0 rented=False rentable=True direct_port_count>=1",
       "monitor_search": false,
       "disk_gb": 35,
       "min_gpu_vram_mb": 115000
@@ -337,7 +337,7 @@
       "cache_ram": 24576,
       "ctx_checkpoints": 0,
       "monitor_group": "q4-128k",
-      "gpu_query": "num_gpus>=1 gpu_name in [\"Tesla V100\"] gpu_ram>=32 cpu_ram>=32 reliability>0.98 inet_down>=300 disk_bw>=200 cuda_vers>=12.2 rented=False rentable=True direct_port_count>=1",
+      "gpu_query": "num_gpus>=1 gpu_name in [\"Tesla V100\"] gpu_ram>=32 cpu_ram>=32 reliability>0.95 inet_down>=300 disk_bw>=200 cuda_vers>=12.2 rented=False rentable=True direct_port_count>=1",
       "monitor_search": true,
       "disk_gb": 35
     }
