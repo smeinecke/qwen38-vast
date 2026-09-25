@@ -7,7 +7,12 @@ from unittest import mock
 import pytest
 
 from hostai.config import ProxySection
-from hostai.tokenize import Tokenizer, TokenizerError, default_reasoning_kwargs
+from hostai.tokenize import (
+    Tokenizer,
+    TokenizerError,
+    _normalize_tool_call_arguments,
+    default_reasoning_kwargs,
+)
 
 
 def _fixture() -> dict:
@@ -103,6 +108,76 @@ def test_tokenizer_reasoning_effort_changes_length(tokenizer):
     medium = tokenizer.apply_chat_template(messages, add_generation_prompt=True, reasoning_effort="medium")
     xhigh = tokenizer.apply_chat_template(messages, add_generation_prompt=True, reasoning_effort="xhigh")
     assert len({len(low), len(medium), len(xhigh)}) == 3
+
+
+def test_normalize_tool_call_arguments_parses_json_strings():
+    """OpenAI string-encoded arguments must become mappings for |items."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": '{"command": "ls"}'},
+                },
+                {
+                    "id": "2",
+                    "type": "function",
+                    "function": {"name": "noop", "arguments": "not json"},
+                },
+                "weird",
+            ],
+        },
+        {"role": "user", "content": "next"},
+    ]
+    out = _normalize_tool_call_arguments(messages)
+    assert out[0]["tool_calls"][0]["function"]["arguments"] == {"command": "ls"}
+    # Invalid JSON and non-dict calls are left untouched.
+    assert out[0]["tool_calls"][1]["function"]["arguments"] == "not json"
+    assert out[0]["tool_calls"][2] == "weird"
+    # The caller's messages are not mutated.
+    assert messages[0]["tool_calls"][0]["function"]["arguments"] == '{"command": "ls"}'
+    # Messages without tool_calls keep their identity.
+    assert out[1] is messages[1]
+
+
+def test_normalize_tool_call_arguments_top_level():
+    """Templates without a function wrapper read arguments at top level."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"name": "bash", "arguments": '{"command": "ls"}'}],
+        }
+    ]
+    out = _normalize_tool_call_arguments(messages)
+    assert out[0]["tool_calls"][0]["arguments"] == {"command": "ls"}
+
+
+@pytest.mark.skipif(_skip_if_no_transformers(), reason="transformers not available")
+@pytest.mark.slow(reason="loads Qwen/Qwen3.8-27B tokenizer from Hugging Face cache")
+def test_tokenizer_tool_calls_with_string_arguments(tokenizer):
+    """OpenAI-style string arguments must not fail the chat template."""
+    messages = [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "x",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": '{"command": "ls"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "x", "content": "out"},
+        {"role": "user", "content": "next"},
+    ]
+    encoded = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+    assert encoded
 
 
 def test_default_reasoning_kwargs_validates_effort(config):

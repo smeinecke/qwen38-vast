@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from hostai.config import Config
 from hostai.state import cache_dir
@@ -67,6 +68,51 @@ def _has_multimodal_input(
         if multimodal:
             return multimodal
     return None
+
+
+def _parse_arguments(raw: str) -> Tuple[bool, Any]:
+    try:
+        return True, json.loads(raw)
+    except json.JSONDecodeError:
+        return False, raw
+
+
+def _normalize_tool_call(call: Any) -> Any:
+    """Return a copy of ``call`` with JSON-string arguments parsed."""
+    if not isinstance(call, dict):
+        return call
+    fn = call.get("function")
+    if not isinstance(fn, dict):
+        fn = None
+    target = fn if fn is not None else call
+    args = target.get("arguments")
+    if not isinstance(args, str):
+        return call
+    ok, parsed = _parse_arguments(args)
+    if not ok:
+        return call
+    if fn is not None:
+        return {**call, "function": {**fn, "arguments": parsed}}
+    return {**call, "arguments": parsed}
+
+
+def _normalize_tool_call_arguments(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return ``messages`` with JSON-string tool_call arguments parsed.
+
+    The OpenAI API encodes ``tool_calls[].function.arguments`` as a JSON
+    string; chat templates that iterate ``arguments|items`` expect a mapping.
+    llama.cpp performs the same parse server-side before rendering, so the
+    proxy must do it locally. Unparseable strings are left untouched.
+    """
+    normalized = list(messages)
+    for i, message in enumerate(normalized):
+        tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
+        if not isinstance(tool_calls, list):
+            continue
+        calls = [_normalize_tool_call(c) for c in tool_calls]
+        if any(new is not old for new, old in zip(calls, tool_calls)):
+            normalized[i] = {**message, "tool_calls": calls}
+    return normalized
 
 
 class Tokenizer:
@@ -133,7 +179,7 @@ class Tokenizer:
 
         try:
             encoded = tokenizer.apply_chat_template(
-                messages,
+                _normalize_tool_call_arguments(messages),
                 tools=tools,
                 add_generation_prompt=add_generation_prompt,
                 tokenize=True,
