@@ -58,7 +58,7 @@ def _fmt_num(value, fmt=".4f") -> str:
     return str(value) if value is not None else "?"
 
 
-def _render_table(offers: List[Dict[str, Any]], max_results: int) -> None:
+def _render_table(offers: List[Dict[str, Any]], max_results: int, show_profiles: bool = False) -> None:
     console = Console()
     table = Table(
         title=f"Vast offers ({min(max_results, len(offers))} of {len(offers)})",
@@ -75,8 +75,10 @@ def _render_table(offers: List[Dict[str, Any]], max_results: int) -> None:
     table.add_column("loc", overflow="fold", no_wrap=False)
     table.add_column("down", justify="right", no_wrap=True)
     table.add_column("up", justify="right", no_wrap=True)
+    if show_profiles:
+        table.add_column("profiles", overflow="fold", no_wrap=False)
     for o in offers[:max_results]:
-        table.add_row(
+        row = [
             str(o.get("id") or o.get("ask_contract_id") or "?"),
             str(o.get("gpu_name") or "?"),
             _fmt_num(o.get("num_gpus"), ".0f"),
@@ -86,7 +88,10 @@ def _render_table(offers: List[Dict[str, Any]], max_results: int) -> None:
             market._format_country(o.get("geolocation")),
             _fmt_num(o.get("inet_down_cost"), ".6f"),
             _fmt_num(o.get("inet_up_cost"), ".6f"),
-        )
+        ]
+        if show_profiles:
+            row.append(",".join(o.get("_profiles") or []))
+        table.add_row(*row)
     console.print(table)
 
 
@@ -98,7 +103,11 @@ def _render_csv(offers: List[Dict[str, Any]]) -> str:
     writer = csv.DictWriter(buf, fieldnames=keys)
     writer.writeheader()
     for o in offers:
-        writer.writerow({k: (o.get(k) or "") for k in keys})
+        row = {}
+        for k in keys:
+            v = o.get(k)
+            row[k] = ";".join(str(x) for x in v) if isinstance(v, list) else (v if v is not None else "")
+        writer.writerow(row)
     return buf.getvalue()
 
 
@@ -107,9 +116,46 @@ def _resolve_profile(config: Config, profiles: Profiles, name: Optional[str]):
     return profiles.resolve_profile(target)
 
 
-@click.command("lookup", help="Search Vast offers for a profile without renting.")
+def _search_profile(
+    config: Config,
+    profiles: Profiles,
+    provider: Any,
+    profile: Any,
+    max_price: Optional[float],
+    unverified: bool,
+) -> List[Dict[str, Any]]:
+    """Search and filter offers for one profile, tagging matches with its name."""
+    image = profiles.image_by_name(profile.image)
+    if not image:
+        raise click.ClickException(f"profile '{profile.name}' references unknown image '{profile.image}'")
+
+    query, max_dph, ctx_size = _resolve_query(config, profiles, profile, max_price, unverified)
+    click.echo(f"[profile] {profile.name} | sm_{image.cuda_arch} | ctx={ctx_size} | image={profile.image}")
+    click.echo(f"[search]  {query}")
+
+    offers = provider.search_offers(
+        query,
+        limit=50,
+        order="dph_total",
+        storage=market.resolved_disk_gb(profile, config),
+    )
+    matches = _filter_offers(
+        offers,
+        max_dph,
+        profiles.market_policy.require_free_traffic,
+        config.market.max_inet_down_cost,
+        config.market.max_inet_up_cost,
+    )
+    for o in matches:
+        o["_profiles"] = [profile.name]
+    return matches
+
+
+@click.command(
+    "lookup", help="Search Vast offers for a profile without renting. Use '*' as the profile to search all profiles."
+)
 @click.argument("profile", required=False)
-@click.option("-p", "--profile", "profile_opt", help="Profile to look up (alias for the positional argument).")
+@click.option("-p", "--profile", "profile_opt", help="Profile to look up, or '*' for all profiles.")
 @click.option("--max-price", type=float, default=None, help="Maximum all-in $/h.")
 @click.option("--unverified", is_flag=True, default=None, help="Also consider unverified/unknown hosts.")
 @click.option("--max-results", type=int, default=10, show_default=True, help="Number of results to show.")
@@ -119,48 +165,55 @@ def _resolve_profile(config: Config, profiles: Profiles, name: Optional[str]):
 def cmd_lookup(config: Config, profile, profile_opt, max_price, unverified, max_results, output_format):
     if max_results <= 0:
         raise click.ClickException("--max-results must be a positive integer")
+    if max_price is not None and max_price < 0:
+        raise click.ClickException("--max-price must be non-negative")
 
     profile_name = profile or profile_opt
     profiles = Profiles.from_file(config.root_dir / config.hostai.profiles_file)
 
-    selected = _resolve_profile(config, profiles, profile_name)
-    if not selected:
-        raise click.ClickException(f"unknown profile '{profile_name or config.hostai.default_profile}'")
-
-    image = profiles.image_by_name(selected.image)
-    if not image:
-        raise click.ClickException(f"profile '{selected.name}' references unknown image '{selected.image}'")
+    star = profile_name == "*"
+    if star:
+        selected_profiles = list(profiles.profiles)
+        if not selected_profiles:
+            raise click.ClickException("profiles.json defines no profiles")
+    else:
+        selected = _resolve_profile(config, profiles, profile_name)
+        if not selected:
+            raise click.ClickException(f"unknown profile '{profile_name or config.hostai.default_profile}'")
+        selected_profiles = [selected]
 
     unverified = unverified if unverified is not None else config.market.allow_unverified
-
-    query, max_dph, ctx_size = _resolve_query(config, profiles, selected, max_price, unverified)
-
-    click.echo(f"[profile] {selected.name} | sm_{image.cuda_arch} | ctx={ctx_size} | image={selected.image}")
-    click.echo(f"[search]  {query}")
-
-    disk_gb = market.resolved_disk_gb(selected, config)
+    # max_dph is identical for every profile; track it for the summary line.
+    display_max_dph = max_price if max_price is not None else config.market.max_dph
 
     try:
         provider = get_provider(config)
-        offers = provider.search_offers(
-            query,
-            limit=50,
-            order="dph_total",
-            storage=disk_gb,
-        )
     except Exception as e:
         raise click.ClickException(f"search failed: {e}")
 
-    matches = _filter_offers(
-        offers,
-        max_dph,
-        profiles.market_policy.require_free_traffic,
-        config.market.max_inet_down_cost,
-        config.market.max_inet_up_cost,
-    )
+    merged: Dict[Any, Dict[str, Any]] = {}
+    for p in selected_profiles:
+        try:
+            matches = _search_profile(config, profiles, provider, p, max_price, unverified)
+        except Exception as e:
+            if not star:
+                raise click.ClickException(f"search failed: {e}")
+            click.echo(f"[warn] {p.name}: {e}")
+            continue
+        for o in matches:
+            key = o.get("id") or o.get("ask_contract_id")
+            if key is None:
+                key = ("no-id", len(merged))
+            if key in merged:
+                merged[key]["_profiles"] = sorted(set(merged[key]["_profiles"]) | set(o["_profiles"]))
+            else:
+                merged[key] = o
+
+    matches = sorted(merged.values(), key=lambda x: x["_effective_dph"])
 
     if not matches:
-        click.echo(f"No matching offers below ${max_dph:.2f}/h.")
+        scope = " across all profiles" if star else ""
+        click.echo(f"No matching offers below ${display_max_dph:.2f}/h{scope}.")
         return
 
     if output_format == "json":
@@ -168,4 +221,4 @@ def cmd_lookup(config: Config, profile, profile_opt, max_price, unverified, max_
     elif output_format == "csv":
         click.echo(_render_csv(matches[:max_results]))
     else:
-        _render_table(matches, max_results)
+        _render_table(matches, max_results, show_profiles=star)

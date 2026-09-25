@@ -1,5 +1,6 @@
 """Tests for hostai.commands.lookup with mocked Vast search."""
 
+import json
 from unittest import mock
 
 import click
@@ -170,3 +171,75 @@ def test_cmd_lookup_invalid_max_results(config):
     result = runner.invoke(cmd_lookup, ["--max-results", "0"], obj=config)
     assert result.exit_code != 0
     assert "positive" in result.output
+
+
+def _mock_profile(name, gpu_query="gpu_name == RTX 4090"):
+    profile = mock.Mock()
+    profile.name = name
+    profile.gpu_query = gpu_query
+    profile.ctx_size = 32768
+    profile.image = "test-image"
+    profile.disk_gb = None
+    return profile
+
+
+def test_cmd_lookup_star_searches_all_profiles(config, project_dir):
+    p1, p2 = _mock_profile("p1"), _mock_profile("p2", "gpu_name == A40")
+    # The same offer id matches both profiles; p2 additionally has its own.
+    shared = make_offer({"id": 10, "dph_total": 0.4})
+    extra = make_offer({"id": 11, "gpu_name": "A40", "dph_total": 0.3})
+
+    provider = mock.Mock()
+    provider.search_offers.side_effect = lambda q, **kw: (
+        [dict(shared)] if "RTX 4090" in q else [dict(shared), dict(extra)]
+    )
+
+    with (
+        mock.patch("hostai.commands.lookup.Profiles.from_file") as from_file,
+        mock.patch("hostai.commands.lookup.get_provider", return_value=provider),
+    ):
+        image = mock.Mock()
+        image.cuda_arch = "89"
+        profiles = mock.Mock()
+        profiles.profiles = [p1, p2]
+        profiles.image_by_name.return_value = image
+        profiles.market_policy.require_free_traffic = False
+        from_file.return_value = profiles
+
+        runner = CliRunner(env={"COLUMNS": "200"})
+        result = runner.invoke(cmd_lookup, ["*", "--json"], obj=config)
+
+    assert result.exit_code == 0, result.output
+    assert provider.search_offers.call_count == 2
+    lines = result.output.splitlines()
+    offers = json.loads("\n".join(lines[lines.index("["):]))
+    by_id = {o["id"]: o for o in offers}
+    # Cheapest first; shared offer deduped with both profile names.
+    assert [o["id"] for o in offers] == [11, 10]
+    assert by_id[10]["_profiles"] == ["p1", "p2"]
+    assert by_id[11]["_profiles"] == ["p2"]
+
+
+def test_cmd_lookup_star_warns_and_continues(config, project_dir):
+    p1, p2 = _mock_profile("bad"), _mock_profile("good")
+    provider = mock.Mock()
+    provider.search_offers.side_effect = [RuntimeError("boom"), [make_offer()]]
+
+    with (
+        mock.patch("hostai.commands.lookup.Profiles.from_file") as from_file,
+        mock.patch("hostai.commands.lookup.get_provider", return_value=provider),
+    ):
+        image = mock.Mock()
+        image.cuda_arch = "89"
+        profiles = mock.Mock()
+        profiles.profiles = [p1, p2]
+        profiles.image_by_name.return_value = image
+        profiles.market_policy.require_free_traffic = False
+        from_file.return_value = profiles
+
+        runner = CliRunner(env={"COLUMNS": "200"})
+        result = runner.invoke(cmd_lookup, ["*"], obj=config)
+
+    assert result.exit_code == 0, result.output
+    assert "[warn] bad:" in result.output
+    assert "RTX 4090" in result.output
