@@ -24,10 +24,21 @@ from hostai.tokenize import Tokenizer, TokenizerError, default_reasoning_kwargs
 _logger = logging.getLogger(__name__)
 
 
-# Pattern for tool-call output produced by the Qwen tool-use template.  It
-# wraps JSON tool calls between <tool_call> and </tool_call> tags.
+# Patterns for tool-call output produced by the Qwen tool-use template.  It
+# wraps calls between <tool_call> and </tool_call> tags, each containing a
+# <function=name> block with <parameter=key>value</parameter> entries.
+_TOOL_OPEN = "<tool_call>"
+_TOOL_CLOSE = "</tool_call>"
 _TOOL_CALL_RE = re.compile(
     r"<tool_call>(.*?)</tool_call>",
+    re.DOTALL,
+)
+_TOOL_FUNCTION_RE = re.compile(
+    r"<function=(?P<name>[^>\n]+)>(?P<body>.*?)</function>",
+    re.DOTALL,
+)
+_TOOL_PARAM_RE = re.compile(
+    r"<parameter=(?P<name>[^>\n]+)>(?P<value>.*?)</parameter>",
     re.DOTALL,
 )
 
@@ -71,45 +82,134 @@ def _split_reasoning(content: str) -> Tuple[str, str]:
     return reasoning.strip(), answer.lstrip()
 
 
-def _parse_tool_calls(content: str) -> List[Dict[str, Any]]:
-    """Parse Qwen-style <tool_call>...</tool_call> output into OpenAI tool_calls.
+def _tool_param_types(tools: Optional[List[Dict[str, Any]]], name: str) -> Dict[str, str]:
+    """Return the declared parameter types for tool ``name``."""
+    for tool in tools or []:
+        fn = tool.get("function") if isinstance(tool, dict) else None
+        if not isinstance(fn, dict) or fn.get("name") != name:
+            continue
+        params = fn.get("parameters")
+        props = params.get("properties") if isinstance(params, dict) else None
+        if not isinstance(props, dict):
+            return {}
+        return {
+            key: value["type"]
+            for key, value in props.items()
+            if isinstance(value, dict) and isinstance(value.get("type"), str)
+        }
+    return {}
 
-    Returns an empty list when the content contains no tool-call tags or the
-    JSON cannot be parsed.
+
+def _coerce_arg(value: str, schema_type: Optional[str]) -> Any:
+    """Coerce a raw ``<parameter>`` string to the declared schema type.
+
+    The XML tool-call format carries only strings; llama.cpp converts them
+    back to JSON values using the tool schema, so the proxy does the same.
+    Without a declared type only JSON containers (``{``/``[``) are decoded —
+    scalars stay strings to avoid mangling text like ``"true"``.
+    """
+    text = value.strip()
+    if schema_type == "integer":
+        try:
+            return int(text)
+        except ValueError:
+            return text
+    if schema_type == "number":
+        try:
+            return float(text)
+        except ValueError:
+            return text
+    if schema_type == "boolean":
+        lowered = text.lower()
+        if lowered in ("true", "1"):
+            return True
+        if lowered in ("false", "0"):
+            return False
+        return text
+    if schema_type in ("array", "object") or (schema_type is None and text[:1] in ("{", "[")):
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return text
+    return text
+
+
+def _parse_tool_call_block(
+    block: str,
+    tools: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Parse a single ``<tool_call>...</tool_call>`` block into an OpenAI call.
+
+    Handles the Hermes-style ``<function=name><parameter=key>`` markup the
+    chat template emits, with a fallback for JSON-in-tags output. Returns
+    ``None`` when the block cannot be understood.
+    """
+    match = _TOOL_CALL_RE.search(block)
+    if not match:
+        return None
+    inner = match.group(1).strip()
+    if not inner:
+        return None
+
+    function = _TOOL_FUNCTION_RE.search(inner)
+    if function:
+        name = function.group("name").strip()
+        if not name:
+            return None
+        types = _tool_param_types(tools, name)
+        arguments = {
+            param.group("name").strip(): _coerce_arg(param.group("value"), types.get(param.group("name").strip()))
+            for param in _TOOL_PARAM_RE.finditer(function.group("body"))
+        }
+    else:
+        try:
+            parsed = json.loads(inner)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        name = parsed.get("name")
+        if not name:
+            return None
+        arguments = parsed.get("arguments", {})
+
+    if not isinstance(arguments, str):
+        arguments = json.dumps(arguments, ensure_ascii=False)
+
+    return {
+        "id": f"call_{os.urandom(8).hex()}",
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": arguments,
+        },
+    }
+
+
+def _parse_tool_calls(
+    content: str,
+    tools: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[List[Dict[str, Any]], str]:
+    """Parse ``<tool_call>...</tool_call>`` output into OpenAI tool_calls.
+
+    Returns ``(tool_calls, remainder)`` where ``remainder`` is the content
+    with every successfully parsed block removed (the template instructs the
+    model to put optional natural-language reasoning before the call).
+    Unparseable blocks stay in the remainder.
     """
     tool_calls: List[Dict[str, Any]] = []
+    spans: List[Tuple[int, int]] = []
     for match in _TOOL_CALL_RE.finditer(content):
-        raw = match.group(1).strip()
-        if not raw:
+        call = _parse_tool_call_block(match.group(0), tools)
+        if call is None:
             continue
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(parsed, dict):
-            continue
-
-        name = parsed.get("name")
-        arguments = parsed.get("arguments", {})
-        if not name:
-            continue
-
-        if isinstance(arguments, dict):
-            arguments = json.dumps(arguments, ensure_ascii=False)
-        else:
-            arguments = str(arguments)
-
-        tool_calls.append(
-            {
-                "id": f"call_{os.urandom(8).hex()}",
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": arguments,
-                },
-            }
-        )
-    return tool_calls
+        call["index"] = len(tool_calls)
+        tool_calls.append(call)
+        spans.append(match.span())
+    remainder = content
+    for start, end in reversed(spans):
+        remainder = remainder[:start] + remainder[end:]
+    return tool_calls, remainder.strip()
 
 
 def _find_stop(text: str, stops: List[str]) -> int:
@@ -160,8 +260,9 @@ class _TokenDetokenizer:
 
     With ``token_only`` upstream requests, the server emits raw token ids
     instead of text. The proxy decodes them locally, splits reasoning from
-    content on ``◀``, and applies ``stop`` strings itself since server-side
-    stop matching is text-based and cannot run without detokenization.
+    content on ``◀``, parses ``<tool_call>`` markup into OpenAI tool_calls
+    deltas, and applies ``stop`` strings itself since server-side stop
+    matching is text-based and cannot run without detokenization.
     """
 
     def __init__(
@@ -169,28 +270,37 @@ class _TokenDetokenizer:
         tokenizer: Tokenizer,
         stop_strings: Optional[List[str]] = None,
         expect_reasoning: bool = True,
+        tools: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         self._tokenizer = tokenizer
         self._stops = [s for s in stop_strings or [] if s]
         self._expect_reasoning = expect_reasoning
+        # Tool-call markup is only parsed when the request declared tools;
+        # without them the model has nothing to call and the tags stay text.
+        self._tools = tools
+        self._parse_tools = bool(tools)
         self._ids: List[int] = []
         self._emitted = 0
         self._cut = -1
         self.stopped = False
-        # Hold back trailing chars so a stop string or reasoning marker that
-        # straddles a decode boundary can still be detected before its prefix
-        # is emitted.
+        self.saw_tool_calls = False
+        self._tool_index = 0
+        # Hold back trailing chars so a stop string, reasoning marker, or
+        # <tool_call> opening tag that straddles a decode boundary can still
+        # be detected before its prefix is emitted as content.
         boundary_lengths = [len(s) for s in self._stops]
         if expect_reasoning:
             boundary_lengths += [len(m) for m in _THINK_END_MARKERS]
+        if self._parse_tools:
+            boundary_lengths.append(len(_TOOL_OPEN))
         self._holdback = max(0, max(boundary_lengths, default=0) - 1)
 
-    def add(self, token_ids: List[int]) -> Dict[str, str]:
-        """Append generated token ids and return the new delta text."""
+    def add(self, token_ids: List[int]) -> List[Dict[str, Any]]:
+        """Append generated token ids and return the new delta payloads."""
         self._ids.extend(token_ids)
         return self._drain(final=False)
 
-    def finish(self) -> Dict[str, str]:
+    def finish(self) -> List[Dict[str, Any]]:
         """Flush any held-back text at the end of the stream."""
         return self._drain(final=True)
 
@@ -198,7 +308,7 @@ class _TokenDetokenizer:
     def token_count(self) -> int:
         return len(self._ids)
 
-    def _drain(self, final: bool) -> Dict[str, str]:
+    def _drain(self, final: bool) -> List[Dict[str, Any]]:
         text = self._tokenizer.decode(self._ids, skip_special_tokens=True)
         if self._cut < 0:
             self._cut = _find_stop(text, self._stops)
@@ -209,10 +319,40 @@ class _TokenDetokenizer:
         limit = len(text)
         if not final and self._cut < 0:
             limit = max(0, limit - self._holdback)
-        limit = min(limit, len(text))
-        start = min(self._emitted, limit)
-        self._emitted = limit
-        return _split_delta(text, start, limit, self._expect_reasoning)
+
+        deltas: List[Dict[str, Any]] = []
+        while self._emitted < len(text):
+            open_pos = text.find(_TOOL_OPEN, self._emitted) if self._parse_tools else -1
+            seg_end = open_pos if open_pos >= 0 else len(text)
+            seg_end = min(seg_end, limit)
+            if seg_end > self._emitted:
+                delta = _split_delta(text, self._emitted, seg_end, self._expect_reasoning)
+                if delta:
+                    deltas.append(delta)
+                self._emitted = seg_end
+            if open_pos < 0 or self._emitted != open_pos:
+                break
+            close = text.find(_TOOL_CLOSE, open_pos)
+            if close < 0:
+                # Incomplete block: wait for more tokens, or emit the markup
+                # verbatim at end of stream.
+                if final:
+                    delta = _split_delta(text, self._emitted, len(text), self._expect_reasoning)
+                    if delta:
+                        deltas.append(delta)
+                    self._emitted = len(text)
+                break
+            end = close + len(_TOOL_CLOSE)
+            call = _parse_tool_call_block(text[open_pos:end], self._tools)
+            if call is None:
+                deltas.append({"content": text[open_pos:end]})
+            else:
+                call["index"] = self._tool_index
+                self._tool_index += 1
+                self.saw_tool_calls = True
+                deltas.append({"tool_calls": [call]})
+            self._emitted = end
+        return deltas
 
 
 def _one_line(exc: BaseException) -> str:
@@ -332,6 +472,39 @@ class UnixTLSConnector(aiohttp.UnixConnector):
         return proto
 
 
+def _content_log_path(config: Config) -> Path:
+    return config.root_dir / ".hostai-cache" / "proxy-content.jsonl"
+
+
+class _ContentLog:
+    """Opt-in JSON-lines log of prompts and responses.
+
+    Each record is flushed immediately so ``tail -f`` shows live traffic.
+    Kept separate from proxy.log, which only ever carries operational
+    metadata — this file contains full prompt and output content.
+    """
+
+    def __init__(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        self._file = os.fdopen(fd, "a", encoding="utf-8", buffering=1)
+        self.path = path
+
+    def write(self, event: str, request_id: str = "", **fields: Any) -> None:
+        record: Dict[str, Any] = {"ts": round(time.time(), 3), "event": event}
+        if request_id:
+            record["id"] = request_id
+        record.update(fields)
+        self._file.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self._file.flush()
+
+    def close(self) -> None:
+        try:
+            self._file.close()
+        except OSError:
+            pass
+
+
 class TokenizedProxy:
     """An OpenAI-compatible proxy that tokenizes prompts client-side."""
 
@@ -361,6 +534,21 @@ class TokenizedProxy:
         self.app.router.add_route("*", "/{path:.*}", self._generic)
         self.app.on_startup.append(self._on_startup)
         self.app.on_cleanup.append(self._on_cleanup)
+        self.content_log: Optional[_ContentLog] = None
+        if config.proxy.log_content:
+            self.content_log = _ContentLog(_content_log_path(config))
+            _logger.warning(
+                "content logging enabled; prompts and responses are written to %s",
+                self.content_log.path,
+            )
+
+    def _log_content(self, event: str, request_id: str = "", **fields: Any) -> None:
+        if not self.content_log:
+            return
+        try:
+            self.content_log.write(event, request_id, **fields)
+        except OSError as exc:
+            _logger.warning("content log write failed: %s", exc)
 
     async def _on_startup(self, app: web.Application) -> None:
         if self.upstream_socket:
@@ -381,10 +569,14 @@ class TokenizedProxy:
     async def _on_cleanup(self, app: web.Application) -> None:
         if self.session:
             await self.session.close()
+        if self.content_log:
+            self.content_log.close()
 
     async def _chat(self, request: web.Request) -> web.StreamResponse:
         if not self.ready or self.session is None:
             raise web.HTTPServiceUnavailable(reason="proxy not ready")
+
+        req_id = f"req-{os.urandom(8).hex()}"
 
         try:
             body = await request.json()
@@ -393,7 +585,8 @@ class TokenizedProxy:
 
         if not self.config.proxy.tokenized_only:
             # In non-tokenized mode pass the OpenAI request through as-is.
-            return await self._forward_to_upstream(request, "/v1/chat/completions")
+            self._log_content("request", req_id, passthrough=True, body=body)
+            return await self._forward_to_upstream(request, "/v1/chat/completions", log_id=req_id)
 
         messages = body.get("messages")
         if not messages or not isinstance(messages, list):
@@ -429,7 +622,20 @@ class TokenizedProxy:
                 **reasoning_kwargs,
             )
         except TokenizerError as exc:
+            self._log_content("error", req_id, error=f"tokenization failed: {exc}", messages=messages)
             raise web.HTTPBadRequest(reason=f"tokenization failed: {exc}") from exc
+
+        self._log_content(
+            "request",
+            req_id,
+            messages=messages,
+            tools=tools,
+            stream=stream,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stop=stop_strings,
+            prompt_tokens=len(token_ids),
+        )
 
         payload = self.build_completion_payload(token_ids, max_tokens, temperature, stream, body)
 
@@ -440,6 +646,7 @@ class TokenizedProxy:
 
         if upstream_response.status != 200:
             text = await upstream_response.text()
+            self._log_content("error", req_id, status=upstream_response.status, error=" ".join(text.split())[:500])
             raise web.HTTPInternalServerError(
                 reason=f"upstream returned {upstream_response.status}: {' '.join(text.split())[:200]}"
             )
@@ -451,8 +658,8 @@ class TokenizedProxy:
             len(stop_strings),
         )
         if stream:
-            return await self._stream_chat(request, upstream_response, stop_strings, expect_reasoning)
-        return await self._complete_chat(upstream_response, len(token_ids), stop_strings)
+            return await self._stream_chat(request, upstream_response, stop_strings, expect_reasoning, tools, req_id)
+        return await self._complete_chat(upstream_response, len(token_ids), stop_strings, tools, req_id)
 
     @staticmethod
     def build_completion_payload(
@@ -508,6 +715,8 @@ class TokenizedProxy:
         response: aiohttp.ClientResponse,
         prompt_tokens: int,
         stop_strings: Optional[List[str]] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        req_id: str = "",
     ) -> web.Response:
         try:
             data = await response.json()
@@ -536,9 +745,13 @@ class TokenizedProxy:
             if not reasoning:
                 reasoning, content = _split_reasoning(content)
 
-        tool_calls = _parse_tool_calls(content)
+        tool_calls, remainder = _parse_tool_calls(content, tools) if tools else ([], content)
         if tool_calls:
-            message: Dict[str, Any] = {"role": "assistant", "content": None, "tool_calls": tool_calls}
+            message: Dict[str, Any] = {
+                "role": "assistant",
+                "content": remainder or None,
+                "tool_calls": tool_calls,
+            }
             if finish_reason != "length":
                 finish_reason = "tool_calls"
         else:
@@ -564,6 +777,13 @@ class TokenizedProxy:
                 "total_tokens": prompt_tokens + completion_tokens,
             },
         }
+        self._log_content(
+            "response",
+            req_id,
+            message=message,
+            finish_reason=finish_reason,
+            usage=output["usage"],
+        )
         return web.json_response(output)
 
     def _build_sse_chunk(
@@ -609,34 +829,52 @@ class TokenizedProxy:
         detok: _TokenDetokenizer,
         token_mode: Optional[bool],
         sent_reasoning: bool,
-    ) -> Tuple[Dict[str, Any], Optional[str], Optional[bool], bool]:
+        sent_content: bool,
+        tools: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[List[Dict[str, Any]], Optional[str], Optional[bool], bool, bool]:
         stop = obj.get("stop", False)
         token_mode = self._detect_token_mode(obj, token_mode, stop)
+        deltas: List[Dict[str, Any]] = []
+        finish: Optional[str] = None
 
         if token_mode:
-            delta_payload = detok.finish() if stop else detok.add(obj.get("tokens") or [])
-            finish = "stop" if detok.stopped else (self._map_finish_reason(obj) if stop else None)
+            deltas = detok.add(obj.get("tokens") or [])
+            if stop:
+                deltas += detok.finish()
+            if detok.stopped:
+                finish = "stop"
+            elif stop:
+                finish = self._map_finish_reason(obj)
+            if finish == "stop" and detok.saw_tool_calls:
+                finish = "tool_calls"
+            sent_content = sent_content or any("content" in d for d in deltas)
         # The final chunk carries the full content/reasoning_content,
         # not deltas. Its content was already streamed, so only the
         # reasoning blob is forwarded, and only when no deltas were sent.
         elif stop:
-            delta_payload = {}
             reasoning = (obj.get("reasoning_content") or "") if not sent_reasoning else ""
             if reasoning:
-                delta_payload["reasoning_content"] = reasoning
-            finish = self._map_finish_reason(obj)
+                deltas.append({"reasoning_content": reasoning})
+            tool_calls, _ = _parse_tool_calls(obj.get("content") or "", tools) if tools else ([], "")
+            if tool_calls and not sent_content:
+                deltas.append({"tool_calls": tool_calls})
+                finish = "tool_calls"
+            else:
+                finish = self._map_finish_reason(obj)
         else:
-            delta_payload = {}
+            delta_payload: Dict[str, Any] = {}
             delta = obj.get("content", "")
             if delta:
                 delta_payload["content"] = delta
+                sent_content = True
             reasoning_delta = obj.get("reasoning_content", "")
             if reasoning_delta:
                 delta_payload["reasoning_content"] = reasoning_delta
                 sent_reasoning = True
-            finish = None
+            if delta_payload:
+                deltas.append(delta_payload)
 
-        return delta_payload, finish, token_mode, sent_reasoning
+        return deltas, finish, token_mode, sent_reasoning, sent_content
 
     async def _stream_end(
         self,
@@ -646,8 +884,16 @@ class TokenizedProxy:
         token_mode: Optional[bool],
         stop: bool,
         finish: Optional[str],
+        req_id: str = "",
     ) -> web.StreamResponse:
         await stream.write(b"data: [DONE]\n\n")
+        self._log_content(
+            "done",
+            req_id,
+            finish_reason=finish,
+            completion_tokens=detok.token_count,
+            tool_calls=detok.saw_tool_calls,
+        )
         if token_mode and detok.stopped and not stop:
             # Cancel upstream generation; the server stops the task
             # when the client connection closes.
@@ -669,6 +915,8 @@ class TokenizedProxy:
         response: aiohttp.ClientResponse,
         stop_strings: Optional[List[str]] = None,
         expect_reasoning: bool = True,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        req_id: str = "",
     ) -> web.StreamResponse:
         stream = web.StreamResponse(
             status=200,
@@ -685,14 +933,20 @@ class TokenizedProxy:
         model = self.config.model.model or "local"
         created = int(time.time())
         sent_reasoning = False
-        detok = _TokenDetokenizer(self.tokenizer, stop_strings, expect_reasoning)
+        sent_content = False
+        detok = _TokenDetokenizer(self.tokenizer, stop_strings, expect_reasoning, tools)
         # Decided by the first chunk carrying data: upstream partials always
         # populate `tokens`, so the detokenize path is used whenever ids are
         # present; upstream text deltas are ignored in that case.
         token_mode: Optional[bool] = None
+        # SSE data: lines can be split across TCP chunks; buffer between
+        # reads so a partial line is never parsed as JSON and dropped.
+        buffer = ""
 
         async for raw in response.content:
-            for line in raw.decode("utf-8", errors="replace").splitlines():
+            buffer += raw.decode("utf-8", errors="replace")
+            *lines, buffer = buffer.split("\n")
+            for line in lines:
                 line = line.strip()
                 if not line.startswith("data:"):
                     continue
@@ -704,20 +958,35 @@ class TokenizedProxy:
                 except json.JSONDecodeError:
                     continue
 
-                delta_payload, finish, token_mode, sent_reasoning = self._process_stream_chunk(
-                    obj, detok, token_mode, sent_reasoning
+                deltas, finish, token_mode, sent_reasoning, sent_content = self._process_stream_chunk(
+                    obj, detok, token_mode, sent_reasoning, sent_content, tools
                 )
-                await stream.write(self._build_sse_chunk(completion_id, created, model, delta_payload, finish))
+                if deltas:
+                    for i, delta_payload in enumerate(deltas):
+                        self._log_content("delta", req_id, **delta_payload)
+                        chunk_finish = finish if i == len(deltas) - 1 else None
+                        await stream.write(
+                            self._build_sse_chunk(completion_id, created, model, delta_payload, chunk_finish)
+                        )
+                elif finish:
+                    await stream.write(self._build_sse_chunk(completion_id, created, model, {}, finish))
 
                 stop = obj.get("stop", False)
                 if stop or (token_mode and detok.stopped):
-                    return await self._stream_end(stream, response, detok, token_mode, stop, finish)
+                    return await self._stream_end(stream, response, detok, token_mode, stop, finish, req_id)
 
         if token_mode:
-            tail = detok.finish()
-            if tail:
+            for tail in detok.finish():
+                self._log_content("delta", req_id, **tail)
                 await stream.write(self._build_sse_chunk(completion_id, created, model, tail, None))
         await stream.write(b"data: [DONE]\n\n")
+        self._log_content(
+            "done",
+            req_id,
+            finish_reason=None,
+            completion_tokens=detok.token_count,
+            tool_calls=detok.saw_tool_calls,
+        )
         return stream
 
     @staticmethod
@@ -732,6 +1001,7 @@ class TokenizedProxy:
         self,
         request: web.Request,
         upstream_path: str,
+        log_id: str = "",
     ) -> web.StreamResponse:
         """Pass an arbitrary request through to the upstream server."""
         if not self.ready or self.session is None:
@@ -752,6 +1022,7 @@ class TokenizedProxy:
                 headers=headers,
                 data=body,
             ) as upstream_response:
+                self._log_content("upstream_response", log_id, status=upstream_response.status)
                 response = web.StreamResponse(status=upstream_response.status)
                 # aiohttp auto-decompresses the body, so hop-by-hop framing
                 # and Content-Encoding headers must not be forwarded — the
@@ -767,10 +1038,13 @@ class TokenizedProxy:
                     response.headers[k] = v
                 await response.prepare(request)
                 async for chunk in upstream_response.content.iter_any():
+                    if log_id:
+                        self._log_content("upstream_chunk", log_id, data=chunk.decode("utf-8", "replace"))
                     await response.write(chunk)
                 await response.write_eof()
                 return response
         except aiohttp.ClientError as exc:
+            self._log_content("error", log_id, error=_one_line(exc))
             raise web.HTTPBadGateway(reason=f"upstream request failed: {_one_line(exc)}") from exc
 
     async def _generic(self, request: web.Request) -> web.StreamResponse:
@@ -1006,6 +1280,8 @@ async def run_proxy(config: Config, state: State) -> None:
 
     tokenizer = Tokenizer(config)
     proxy = TokenizedProxy(config, state, tokenizer, socket_path, port)
+    if proxy.content_log:
+        print(f"content logging enabled -> {proxy.content_log.path} (contains prompts and outputs)")
 
     # Start the client-facing web server immediately so `hostai up` can see the
     # port and move on to its own long `wait_for_api`. The upstream model load

@@ -16,7 +16,10 @@
 - Clients that cannot speak Unix sockets should set `HOSTAI_PROXY_PORT` to a local TCP port; `OPENAI_BASE_URL` in the generated `env` file will then point at the proxy.
 - The proxy tokenizer is pinned to a known-good Qwen3.8-27B commit (`tokenizer_revision` / `HOSTAI_PROXY_TOKENIZER_REVISION`).  Changing it should be followed by regenerating `tests/fixtures/tokenizer_golden.json` and running the tokenizer golden tests.
 - The proxy sends `return_tokens`/`token_only` so the remote returns generated token IDs only; the proxy detokenizes locally and applies `stop` strings client-side (truncating + warning, since server-side stop matching is text-based and cannot run without detokenization).
+- When the request declares `tools`, the proxy also parses the model's `<tool_call><function=name><parameter=key>` markup (the Hermes-style format the chat template emits, with a JSON-in-tags fallback) into OpenAI `tool_calls` — in both streaming (`delta.tool_calls`, `finish_reason="tool_calls"`) and non-streaming responses. Parameter values are coerced using the declared tool schema types.
 - The proxy logs operational metadata to `.hostai-cache/proxy.log` — never prompt or output content.
+- Opt-in content logging is available via `[proxy] log_content = true` (or `HOSTAI_PROXY_LOG_CONTENT=1`). It writes one JSON record per line (request, delta, response, done, error events) to `.hostai-cache/proxy-content.jsonl`, flushed per line so `tail -f` shows prompts and streaming responses live. It is off by default; `proxy.log` stays content-free either way.
+- `hostai log` renders that JSONL as a live chat-style transcript (follows by default; `-n` for backlog size, `--no-follow` to print once, `--ops` to tail the raw operational `proxy.log`).
 - The remote container image must be rebuilt/pushed when `Dockerfile`, `start.sh`, `patches/`, or `src/hostai/remote_guard.py` change because the guard runs inside the image.
 
 ## Lifecycle & Cost

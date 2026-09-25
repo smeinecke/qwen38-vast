@@ -47,14 +47,75 @@ def test_split_delta_without_reasoning():
 
 
 def test_parse_tool_calls():
-    content = '<tool_call>{"name": "function1", "arguments": {"x": 1}}</tool_call>'
-    calls = proxy._parse_tool_calls(content)
+    content = (
+        "<tool_call>\n<function=function1>\n"
+        "<parameter=x>\n1\n</parameter>\n"
+        "<parameter=y>\nhello\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    calls, rest = proxy._parse_tool_calls(content)
     assert len(calls) == 1
     assert calls[0]["function"]["name"] == "function1"
+    assert calls[0]["type"] == "function"
+    assert calls[0]["index"] == 0
+    assert json.loads(calls[0]["function"]["arguments"]) == {"x": "1", "y": "hello"}
+    assert rest == ""
+
+
+def test_parse_tool_calls_coerces_schema_types():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "f",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "count": {"type": "integer"},
+                    "ratio": {"type": "number"},
+                    "flag": {"type": "boolean"},
+                    "items": {"type": "array"},
+                },
+            },
+        },
+    }]
+    content = (
+        "<tool_call>\n<function=f>\n"
+        "<parameter=count>\n5\n</parameter>\n"
+        "<parameter=ratio>\n0.5\n</parameter>\n"
+        "<parameter=flag>\ntrue\n</parameter>\n"
+        "<parameter=items>\n[1, 2]\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    calls, _ = proxy._parse_tool_calls(content, tools)
+    assert json.loads(calls[0]["function"]["arguments"]) == {
+        "count": 5,
+        "ratio": 0.5,
+        "flag": True,
+        "items": [1, 2],
+    }
+
+
+def test_parse_tool_calls_json_fallback():
+    content = '<tool_call>{"name": "function1", "arguments": {"x": 1}}</tool_call>'
+    calls, rest = proxy._parse_tool_calls(content)
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "function1"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"x": 1}
+    assert rest == ""
+
+
+def test_parse_tool_calls_keeps_preamble_and_unparseable():
+    good = "<tool_call>\n<function=f>\n</function>\n</tool_call>"
+    bad = "<tool_call>not json</tool_call>"
+    calls, rest = proxy._parse_tool_calls(f"let me help{good}trailing{bad}")
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "f"
+    assert calls[0]["function"]["arguments"] == "{}"
+    assert rest == f"let me helptrailing{bad}"
 
 
 def test_parse_tool_calls_returns_empty():
-    assert proxy._parse_tool_calls("no tools") == []
+    assert proxy._parse_tool_calls("no tools") == ([], "no tools")
 
 
 def test_map_finish_reason():
@@ -143,6 +204,73 @@ def test_token_detokenizer_stops():
     assert detok.stopped is True
 
 
+def test_token_detokenizer_tool_calls():
+    tokenizer = mock.Mock()
+    parts = iter([
+        "run this<tool_call>\n<function=bash>\n<parameter=command>\nls",
+        "run this<tool_call>\n<function=bash>\n<parameter=command>\nls -la\n"
+        "</parameter>\n</function>\n</tool_call>",
+    ])
+    tokenizer.decode = mock.Mock(side_effect=lambda ids, **kw: next(parts))
+    detok = proxy._TokenDetokenizer(tokenizer, expect_reasoning=False, tools=[{"function": {"name": "bash"}}])
+
+    first = detok.add([1])
+    # The opening tag boundary is held back; only the preamble is emitted.
+    assert first == [{"content": "run this"}]
+
+    second = detok.add([2])
+    assert detok.saw_tool_calls is True
+    assert len(second) == 1
+    calls = second[0]["tool_calls"]
+    assert calls[0]["index"] == 0
+    assert calls[0]["function"]["name"] == "bash"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"command": "ls -la"}
+
+
+def test_token_detokenizer_tool_calls_multiple_and_suffix():
+    tokenizer = mock.Mock()
+    block = (
+        "<tool_call>\n<function=a>\n</function>\n</tool_call>"
+        "<tool_call>\n<function=b>\n</function>\n</tool_call>"
+    )
+    tokenizer.decode = mock.Mock(return_value=block + "done")
+    detok = proxy._TokenDetokenizer(
+        tokenizer, expect_reasoning=False, tools=[{"function": {"name": "a"}}]
+    )
+    deltas = detok.add([1]) + detok.finish()
+    names = [
+        c["function"]["name"] for d in deltas for c in d.get("tool_calls", [])
+    ]
+    assert names == ["a", "b"]
+    assert deltas[-1] == {"content": "done"}
+
+
+def test_token_detokenizer_unterminated_tool_call_is_content():
+    tokenizer = mock.Mock()
+    tokenizer.decode = mock.Mock(return_value="text<tool_call>\n<function=x>")
+    detok = proxy._TokenDetokenizer(
+        tokenizer, expect_reasoning=False, tools=[{"function": {"name": "x"}}]
+    )
+    detok.add([1])
+    tail = detok.finish()
+    assert detok.saw_tool_calls is False
+    assert tail == [{"content": "<tool_call>\n<function=x>"}]
+
+
+def test_token_detokenizer_partial_open_tag_held_back():
+    tokenizer = mock.Mock()
+    parts = iter(["abc<tool_", "abc<tool_call>\n<function=f>\n</function>\n</tool_call>"])
+    tokenizer.decode = mock.Mock(side_effect=lambda ids, **kw: next(parts))
+    detok = proxy._TokenDetokenizer(
+        tokenizer, expect_reasoning=False, tools=[{"function": {"name": "f"}}]
+    )
+    # The "<tool_" prefix is inside the holdback window, so nothing leaks.
+    assert detok.add([1]) == []
+    tail = detok.finish()
+    assert tail[0] == {"content": "abc"}
+    assert tail[1]["tool_calls"][0]["function"]["name"] == "f"
+
+
 async def _run_complete_chat(response_data, decode_text="hello world"):
     state = State.__new__(State)
     state.__dict__.update({
@@ -155,6 +283,7 @@ async def _run_complete_chat(response_data, decode_text="hello world"):
     })
     config = mock.Mock()
     config.proxy.tokenized_only = True
+    config.proxy.log_content = False
     config.model.model = "qwen"
     config.bench.max_tokens = 512
     config.bench.temperature = 0.6
