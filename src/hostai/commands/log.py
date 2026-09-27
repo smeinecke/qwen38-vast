@@ -36,6 +36,12 @@ def _dim(text: str) -> str:
     return click.style(text, fg="bright_black")
 
 
+def _thinking(text: str) -> str:
+    # Reasoning is long-form content the user reads; distinguish it with
+    # italics instead of a dark color so it stays readable on any theme.
+    return click.style(text, italic=True)
+
+
 def _message_text(content: Any) -> str:
     """Flatten OpenAI message content (string or content-part list) to text."""
     if isinstance(content, str):
@@ -148,7 +154,7 @@ class _Transcript:
         content = delta.get("content")
         if reasoning:
             self._assistant(req_id, "reasoning")
-            click.echo(_dim(reasoning), nl=False)
+            click.echo(_thinking(reasoning), nl=False)
         if content:
             self._assistant(req_id, "content")
             click.echo(content, nl=False)

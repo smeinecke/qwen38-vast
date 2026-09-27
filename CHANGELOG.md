@@ -2,6 +2,7 @@
 
 ## 2026-09-27
 
+- `hostai log` renders reasoning/thinking in italic at normal brightness instead of `bright_black`, which was too dark to read.
 - Fixed tokenized-only sessions recording `local_port: 0` and status/down reporting an invalid endpoint.
   - `ensure_unix_tunnel` no longer zeroes `state.local_port`; the field is the client-facing port owned by the proxy (`_start_proxy` already saves it).
   - `is_tunnel_healthy` now checks the recorded `upstream_socket` Unix socket when present instead of a TCP port.
