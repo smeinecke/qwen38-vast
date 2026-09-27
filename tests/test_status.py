@@ -4,7 +4,7 @@ from unittest import mock
 
 from click.testing import CliRunner
 
-from hostai.commands.status import cmd_status
+from hostai.commands.status import _perf_summary, cmd_status
 
 
 def test_status_no_state(config, project_dir):
@@ -61,6 +61,50 @@ def test_status_happy_path(config, project_dir):
 
     assert result.exit_code == 0, result.output
     assert "hostai status" in result.output
+
+
+def test_status_shows_tok_per_s(config, project_dir):
+    state_file = project_dir / ".hostai-vast" / "state.json"
+    state_file.parent.mkdir(parents=True)
+    state_file.write_text(
+        '{"instance_id": 12345, "profile": "test", "local_port": 18080, "dph": 0.5, "ctx_size": 32768}'
+    )
+
+    class FakeClient:
+        def health(self):
+            return True
+
+        def get_metrics(self):
+            return {
+                "llamacpp:tokens_predicted_total": 800.0,
+                "llamacpp:tokens_predicted_seconds_total": 10.0,
+                "llamacpp:prompt_tokens_total": 4000.0,
+                "llamacpp:prompt_seconds_total": 5.0,
+                "llamacpp:spec_decode_num_draft_tokens_total": 500.0,
+                "llamacpp:spec_decode_num_accepted_tokens_total": 300.0,
+            }
+
+    with (
+        mock.patch(
+            "hostai.commands.status._provider",
+            return_value=mock.Mock(get_instance=mock.Mock(return_value={"actual_status": "running"})),
+        ),
+        mock.patch("hostai.commands.status.ssh.is_tunnel_healthy", return_value=True),
+        mock.patch("hostai.commands.status.api.LlamaClient", return_value=FakeClient()),
+        mock.patch("hostai.commands.status.ssh.resolve_ssh_endpoint", return_value=None),
+    ):
+        runner = CliRunner()
+        result = runner.invoke(cmd_status, [], obj=config)
+
+    assert result.exit_code == 0, result.output
+    assert "decode=80.0 tok/s" in result.output
+    assert "prompt=800.0 tok/s" in result.output
+    assert "draft-accept=60%" in result.output
+
+
+def test_perf_summary_none_without_decode():
+    assert _perf_summary({}) is None
+    assert _perf_summary({"llamacpp:tokens_predicted_total": 10.0}) is None
 
 
 def test_status_logs(config, project_dir):

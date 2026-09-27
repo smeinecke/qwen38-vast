@@ -106,6 +106,27 @@ def _tail_logs_follow(state: State, save: bool, lines: int = 100) -> None:
             proc.wait()
 
 
+def _perf_summary(metrics: Dict[str, float]) -> Optional[str]:
+    """Compact throughput summary from llama.cpp /metrics counters.
+
+    Rates are cumulative averages since server start (tokens/seconds totals).
+    """
+    pred_tok = metrics.get("llamacpp:tokens_predicted_total")
+    pred_sec = metrics.get("llamacpp:tokens_predicted_seconds_total")
+    if not pred_tok or not pred_sec:
+        return None
+    parts = [f"decode={pred_tok / pred_sec:.1f} tok/s"]
+    prompt_tok = metrics.get("llamacpp:prompt_tokens_total")
+    prompt_sec = metrics.get("llamacpp:prompt_seconds_total")
+    if prompt_tok and prompt_sec:
+        parts.append(f"prompt={prompt_tok / prompt_sec:.1f} tok/s")
+    draft = metrics.get("llamacpp:spec_decode_num_draft_tokens_total")
+    accepted = metrics.get("llamacpp:spec_decode_num_accepted_tokens_total")
+    if draft:
+        parts.append(f"draft-accept={100.0 * (accepted or 0) / draft:.0f}%")
+    return " | ".join(parts)
+
+
 def _fetch_gpu_snapshot(ssh_url: str, known_hosts: Path) -> Optional[str]:
     res = ssh.run_remote(
         ssh_url,
@@ -152,6 +173,10 @@ def _print_status(
     table.add_row("API URL", api_url)
     table.add_row("Tunnel healthy", str(tunnel_healthy))
     table.add_row("API healthy", str(api_healthy))
+
+    perf = _perf_summary(metrics)
+    if perf:
+        table.add_row("Perf (avg)", perf)
 
     if state.slot_cache_enabled:
         cache_session = state.slot_cache_session

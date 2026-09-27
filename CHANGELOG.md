@@ -2,6 +2,7 @@
 
 ## 2026-09-27
 
+- `hostai status` now shows a `Perf (avg)` row with decode/prompt tok/s (and MTP draft-accept rate) derived from llama.cpp `/metrics` counters.
 - Added `hostai down --skip-llama` to skip the remote `llama-server` shutdown while still destroying/pausing the instance.
 - Fixed `hostai up` aborting GB10 rentals at the VRAM preflight.
   - GB10 is unified memory (UMA): `nvidia-smi` reports `memory.total` as `[N/A]` / "Not Supported", so the parse found no VRAM and provisioning was destroyed.
