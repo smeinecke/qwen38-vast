@@ -723,8 +723,15 @@ def stop_tunnel(state: State) -> None:
 
 
 def is_tunnel_healthy(config: Config, state: State, timeout: int = 3) -> bool:
-    """Return True if a TCP connection to the local tunnel port succeeds."""
+    """Return True if the local tunnel endpoint accepts connections.
+
+    With a Unix-socket upstream (tokenized-only mode) the tunnel is the local
+    socket file owned by the proxy; otherwise it is the TCP local_port.
+    """
     _ = config
+    upstream_socket = state.data.get("upstream_socket")
+    if upstream_socket and Path(str(upstream_socket)).exists():
+        return _unix_socket_is_open(str(upstream_socket), timeout)
     local_port = state.local_port
     if not local_port:
         return False
@@ -840,7 +847,6 @@ def ensure_unix_tunnel(
     # Reuse an existing healthy tunnel.
     if _unix_tunnel_is_running(local_path) and _unix_socket_is_open(local_path, timeout=3):
         state.data["upstream_socket"] = local_path
-        state.local_port = 0
         state.tunnel_pid = 0
         state.save()
         return local_path
@@ -887,7 +893,6 @@ def ensure_unix_tunnel(
     _UNI_TUNNELS[local_path]["stop"] = stop
     _UNI_TUNNELS[local_path]["identity"] = identity
     state.data["upstream_socket"] = local_path
-    state.local_port = 0
     state.tunnel_pid = 0
     state.save()
     return local_path

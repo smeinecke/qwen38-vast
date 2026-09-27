@@ -274,12 +274,14 @@ def down_instance(
     state.save()
     _client_log(run_dir, f"{action} initiated for instance {state.instance_id}: reason={reason or 'manual'}")
 
-    _stop_proxy(state)
-
     known_hosts = state.state_file.parent / "known_hosts"
 
     _refresh_ssh_state(config, state)
-    if state.ssh_url:
+    # In tokenized-only mode the proxy owns the SSH unix-socket forward and is
+    # itself the local API endpoint; a raw TCP tunnel would forward to the TLS
+    # upstream socket, which the plain-HTTP proxy client cannot use.
+    unix_upstream = bool(state.data.get("upstream_socket")) and not state.unsecure
+    if state.ssh_url and not unix_upstream:
         try:
             ssh.ensure_tunnel(config, state)
         except Exception as exc:
@@ -294,6 +296,7 @@ def down_instance(
     if state.ssh_url and not skip_llama:
         _stop_remote_model(state.ssh_url, known_hosts)
 
+    _stop_proxy(state)
     ssh.stop_tunnel(state)
 
     pause_or_destroy_start = time.monotonic()

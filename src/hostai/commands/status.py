@@ -159,7 +159,13 @@ def _print_status(
 
     # The local hostai proxy in tokenized-only mode is plain HTTP.
     scheme = "http" if (state.unsecure or config.proxy.tokenized_only) else "https"
-    api_url = f"{scheme}://127.0.0.1:{state.local_port}"
+    if state.local_port:
+        api_url = f"{scheme}://127.0.0.1:{state.local_port}"
+    elif config.proxy.tokenized_only:
+        proxy_sock = config.proxy.socket_path or str(state.state_file.parent / "proxy.sock")
+        api_url = f"unix:{proxy_sock}"
+    else:
+        api_url = "not assigned"
 
     table.add_row("Instance ID", str(state.instance_id))
     table.add_row("Profile", state.profile)
@@ -169,7 +175,7 @@ def _print_status(
     table.add_row("Cost ($/h)", f"{state.dph:.4f}")
     table.add_row("Context", str(state.ctx_size))
     table.add_row("SSH", state.ssh_url or "not published")
-    table.add_row("Local port", str(state.local_port))
+    table.add_row("Local port", str(state.local_port) if state.local_port else "-")
     table.add_row("API URL", api_url)
     table.add_row("Tunnel healthy", str(tunnel_healthy))
     table.add_row("API healthy", str(api_healthy))

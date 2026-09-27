@@ -2,6 +2,11 @@
 
 ## 2026-09-27
 
+- Fixed tokenized-only sessions recording `local_port: 0` and status/down reporting an invalid endpoint.
+  - `ensure_unix_tunnel` no longer zeroes `state.local_port`; the field is the client-facing port owned by the proxy (`_start_proxy` already saves it).
+  - `is_tunnel_healthy` now checks the recorded `upstream_socket` Unix socket when present instead of a TCP port.
+  - `hostai down` skips the raw TCP `ensure_tunnel` for unix-socket upstreams (it would forward to the TLS socket, unusable by the plain-HTTP proxy client) and stops the proxy only after the slot-cache save and telemetry archive, which go through the proxy.
+  - `status` renders the proxy unix socket / "-" instead of `127.0.0.1:0` when no TCP port exists.
 - `hostai status` now shows a `Perf (avg)` row with decode/prompt tok/s (and MTP draft-accept rate) derived from llama.cpp `/metrics` counters.
 - Added `hostai down --skip-llama` to skip the remote `llama-server` shutdown while still destroying/pausing the instance.
 - Fixed `hostai up` aborting GB10 rentals at the VRAM preflight.

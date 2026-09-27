@@ -1,5 +1,6 @@
 """Tests for hostai.ssh helpers."""
 
+import socket
 from pathlib import Path
 from unittest import mock
 from unittest.mock import AsyncMock
@@ -126,6 +127,30 @@ def test_wait_for_ssh_returns_false_without_url(tmp_path):
 
 def test_local_port_is_open_not_open():
     assert ssh._local_port_is_open(0, timeout=1) is False
+
+
+def test_is_tunnel_healthy_unix_socket(config, tmp_path):
+    sock_path = tmp_path / "upstream.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(sock_path))
+    listener.listen(1)
+    try:
+        state = State(tmp_path / "state.json", {"upstream_socket": str(sock_path), "local_port": 0})
+        assert ssh.is_tunnel_healthy(config, state, timeout=2) is True
+    finally:
+        listener.close()
+
+
+def test_is_tunnel_healthy_unix_socket_missing_falls_back_to_port(config, tmp_path):
+    # Recorded unix upstream but no socket file: fall back to the TCP check,
+    # which fails when local_port is 0.
+    state = State(tmp_path / "state.json", {"upstream_socket": str(tmp_path / "gone.sock"), "local_port": 0})
+    assert ssh.is_tunnel_healthy(config, state, timeout=1) is False
+
+
+def test_is_tunnel_healthy_no_endpoint(config, tmp_path):
+    state = State(tmp_path / "state.json", {"local_port": 0})
+    assert ssh.is_tunnel_healthy(config, state, timeout=1) is False
 
 
 class _FakeConn:

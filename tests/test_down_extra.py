@@ -222,6 +222,45 @@ def test_down_instance_skip_llama(config, project_dir):
     stop_model.assert_not_called()
 
 
+def test_down_instance_unix_upstream_uses_proxy_endpoint(config, project_dir):
+    """Tokenized-only sessions must not open a raw TCP tunnel: the proxy is
+    the local API endpoint and owns the unix-socket SSH forward."""
+    sock_path = project_dir / "upstream.sock"
+    _write_state(
+        project_dir,
+        instance_id=12345,
+        profile="test",
+        local_port=18081,
+        dph=0.5,
+        ctx_size=32768,
+        ssh_url="ssh://root@10.0.0.1:22",
+        upstream_socket=str(sock_path),
+    )
+    state = State(project_dir / ".hostai-vast" / "state.json")
+    state.instance_id = 12345
+    state.ssh_url = "ssh://root@10.0.0.1:22"
+    state.data["upstream_socket"] = str(sock_path)
+    run_dir = project_dir / "run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    with (
+        mock.patch("hostai.commands.down.init_run_dir", return_value=run_dir),
+        mock.patch("hostai.commands.down._stop_proxy") as stop_proxy,
+        mock.patch("hostai.commands.down._refresh_ssh_state"),
+        mock.patch("hostai.commands.down.ssh.ensure_tunnel") as ensure,
+        mock.patch("hostai.cache.save_and_upload_slot_cache", return_value=None),
+        mock.patch("hostai.commands.down._archive_session"),
+        mock.patch("hostai.commands.down._stop_remote_model"),
+        mock.patch("hostai.commands.down.ssh.stop_tunnel"),
+        mock.patch("hostai.commands.down._pause_or_destroy", return_value="destroyed"),
+    ):
+        outcome = down.down_instance(config, state, skip_confirm=True)
+
+    assert outcome == "destroyed"
+    ensure.assert_not_called()
+    stop_proxy.assert_called_once()
+
+
 def test_cmd_down_skip_llama_flag(config, project_dir):
     _write_state(
         project_dir,
