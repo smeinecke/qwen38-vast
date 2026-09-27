@@ -727,6 +727,88 @@ def test_gpu_vram_preflight_skips_without_requirement(config, project_dir):
     run.assert_not_called()
 
 
+def _fake_remote(nvidia_smi_results, meminfo_kb=None):
+    """Dispatch fake run_remote results by command content."""
+    calls = iter(nvidia_smi_results)
+
+    def fake(url, command, **kwargs):
+        if "meminfo" in command:
+            if meminfo_kb is None:
+                return mock.Mock(returncode=1, stdout="")
+            return mock.Mock(returncode=0, stdout=f"{meminfo_kb}\n")
+        return next(calls)
+
+    return fake
+
+
+def test_gpu_vram_preflight_accepts_gb10_uma_csv(config, project_dir):
+    """GB10 reports memory.total=[N/A]; preflight must fall back to MemTotal."""
+    fake = _fake_remote(
+        [mock.Mock(returncode=0, stdout="NVIDIA GB10, [N/A]\n")],
+        meminfo_kb=131072000,  # 125000 MiB
+    )
+    with mock.patch("hostai.commands.up.ssh.run_remote", side_effect=fake):
+        rc = up._gpu_vram_preflight("ssh://root@h:22", project_dir / "kh", config, "gb10-256k", 115000)
+    assert rc == 0
+
+
+def test_gpu_vram_preflight_accepts_gb10_uma_table(config, project_dir):
+    """GB10 table output with unsupported memory still verifies via RAM."""
+    table = """+-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.95.05              Driver Version: 580.95.05      CUDA Version: 13.0     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GB10                    On  | 00000000:0F:00.0 Off |                    0 |
+| N/A   45C    P0             25W /  140W |           Not Supported |   0%      Default |
++-----------------------------------------+------------------------+----------------------+"""
+    fake = _fake_remote(
+        [mock.Mock(returncode=0, stdout=table)],
+        meminfo_kb=131072000,
+    )
+    with mock.patch("hostai.commands.up.ssh.run_remote", side_effect=fake):
+        rc = up._gpu_vram_preflight("ssh://root@h:22", project_dir / "kh", config, "gb10-256k", 115000)
+    assert rc == 0
+
+
+def test_gpu_vram_preflight_rejects_low_ram_gb10_uma(config, project_dir):
+    fake = _fake_remote(
+        [mock.Mock(returncode=0, stdout="NVIDIA GB10, [N/A]\n")],
+        meminfo_kb=64 * 1024 * 1024,  # 65536 MiB
+    )
+    with mock.patch("hostai.commands.up.ssh.run_remote", side_effect=fake):
+        rc = up._gpu_vram_preflight("ssh://root@h:22", project_dir / "kh", config, "gb10-256k", 115000)
+    assert rc == 1
+
+
+def test_gpu_vram_preflight_gb10_uma_meminfo_unreadable(config, project_dir):
+    fake = _fake_remote(
+        [mock.Mock(returncode=0, stdout="NVIDIA GB10, [N/A]\n")],
+        meminfo_kb=None,
+    )
+    with mock.patch("hostai.commands.up.ssh.run_remote", side_effect=fake):
+        rc = up._gpu_vram_preflight("ssh://root@h:22", project_dir / "kh", config, "gb10-256k", 115000)
+    assert rc == 2
+
+
+def test_gpu_vram_preflight_unparseable_discrete_gpu_still_fails(config, project_dir):
+    """A non-UMA GPU with unparseable memory must not take the RAM fallback."""
+    fake = _fake_remote(
+        [mock.Mock(returncode=0, stdout="NVIDIA CMP 170HX, [N/A]\n")],
+        meminfo_kb=131072000,
+    )
+    with mock.patch("hostai.commands.up.ssh.run_remote", side_effect=fake):
+        rc = up._gpu_vram_preflight("ssh://root@h:22", project_dir / "kh", config, "cmp170hx-256k", 60000)
+    assert rc == 2
+
+
+def test_parse_nvidia_smi_names_csv_and_table():
+    assert up._parse_nvidia_smi_names("NVIDIA GB10, [N/A]\n") == ["NVIDIA GB10"]
+    table = "|   0  NVIDIA GB10                    On  | 00000000:0F:00.0 Off |                  0 |"
+    assert up._parse_nvidia_smi_names(table) == ["NVIDIA GB10"]
+
+
 def test_cpu_arch_preflight_captures_arch(config, project_dir):
     state = State(project_dir / "state.json")
     with mock.patch("hostai.commands.up.ssh.run_remote", return_value=mock.Mock(returncode=0, stdout="aarch64\n")):

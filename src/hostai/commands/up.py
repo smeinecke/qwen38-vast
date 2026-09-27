@@ -305,6 +305,74 @@ def _shm_preflight(
     return 0
 
 
+# GPUs with unified memory (e.g. NVIDIA GB10 on DGX Spark / Grace Blackwell
+# systems) have no dedicated VRAM, so nvidia-smi reports memory.total as
+# "[N/A]" / "Not Supported".  Their usable GPU pool is system RAM instead.
+_UMA_GPU_RE = re.compile(r"\bGB10\b", re.IGNORECASE)
+
+
+def _parse_nvidia_smi_names(output: str) -> List[str]:
+    """Extract GPU names from nvidia-smi CSV (--query-gpu) or table output."""
+    names: List[str] = []
+    for line in output.splitlines():
+        line = line.rstrip()
+        if not line:
+            continue
+        if "," in line:
+            name = line.split(",", 1)[0].strip()
+            if name:
+                names.append(name)
+            continue
+        name_match = re.search(r"\|\s*\d+\s+([A-Za-z][A-Za-z0-9\s\-/_]*?)(?:\s+\||\s*$)", line)
+        if name_match:
+            # The name cell is followed by Persistence-M state ("On"/"Off").
+            name = re.sub(r"\s+(On|Off)$", "", name_match.group(1).strip())
+            if name:
+                names.append(name)
+    return names
+
+
+def _uma_vram_preflight(
+    ssh_url: str,
+    known_hosts: Path,
+    config: Config,
+    gpu_names: List[str],
+    profile_name: str,
+    required_mb: int,
+    state: Optional[State] = None,
+) -> int:
+    """Verify a unified-memory GPU by checking total system RAM.
+
+    On UMA parts the GPU shares the system DRAM pool, so MemTotal is the
+    closest equivalent of "VRAM" for the profile's minimum-memory gate.
+    """
+    res = ssh.run_remote(
+        ssh_url,
+        "awk '/^MemTotal:/ {print $2}' /proc/meminfo",
+        known_hosts=known_hosts,
+        config=config,
+        state=state,
+        timeout=30,
+    )
+    out = res.stdout if isinstance(res.stdout, str) else ""
+    try:
+        total_mb = int(out.strip()) // 1024
+    except (TypeError, ValueError):
+        total_mb = 0
+    if res.returncode != 0 or total_mb <= 0:
+        _log("[gpu] unified-memory GPU but system RAM is unreadable; cannot verify", err=True)
+        return 2
+    for name in gpu_names:
+        _log(f"[gpu] {name} | unified memory; RAM={total_mb} MiB | required>={required_mb} MiB")
+    if total_mb < required_mb:
+        _log(
+            f"ERROR: unified-memory pool is only {total_mb} MiB; profile {profile_name} requires at least {required_mb} MiB",
+            err=True,
+        )
+        return 1
+    return 0
+
+
 def _parse_nvidia_smi_vram(output: str) -> List[Tuple[str, int]]:
     """Parse nvidia-smi output into (gpu_name, total_mib) pairs.
 
@@ -350,7 +418,7 @@ def _parse_nvidia_smi_vram(output: str) -> List[Tuple[str, int]]:
         # Look for a GPU name row: "|   0  NVIDIA ... | ..."
         name_match = re.search(r"\|\s*\d+\s+([A-Za-z][A-Za-z0-9\s\-/_]*?)(?:\s+\||\s*$)", line)
         if name_match:
-            current_name = name_match.group(1).strip()
+            current_name = re.sub(r"\s+(On|Off)$", "", name_match.group(1).strip())
 
     return gpus
 
@@ -398,7 +466,21 @@ def _gpu_vram_preflight(
 
     gpus = _parse_nvidia_smi_vram(output)
     if not gpus:
-        _log("[gpu] nvidia-smi output did not contain GPU memory; cannot verify", err=True)
+        # Unified-memory GPUs (e.g. NVIDIA GB10) cannot report dedicated VRAM
+        # via nvidia-smi; the shared system RAM pool is the effective limit.
+        names = _parse_nvidia_smi_names(output)
+        if names and all(_UMA_GPU_RE.search(name) for name in names):
+            return _uma_vram_preflight(
+                ssh_url,
+                known_hosts,
+                config,
+                names,
+                profile_name,
+                required_mb,
+                state=state,
+            )
+        snippet = " | ".join(line.strip() for line in output.splitlines() if line.strip())[:200]
+        _log(f"[gpu] nvidia-smi output did not contain GPU memory; cannot verify (raw: {snippet})", err=True)
         return 2
 
     for name, total in gpus:

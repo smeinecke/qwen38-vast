@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-09-27
+
+- Fixed `hostai up` aborting GB10 rentals at the VRAM preflight.
+  - GB10 is unified memory (UMA): `nvidia-smi` reports `memory.total` as `[N/A]` / "Not Supported", so the parse found no VRAM and provisioning was destroyed.
+  - When every detected GPU is a UMA part (GB10), the preflight now verifies total system RAM from `/proc/meminfo` against `min_gpu_vram_mb` instead.
+  - Unparseable output on non-UMA GPUs still fails closed, and the failure log now includes a snippet of the raw `nvidia-smi` output.
+
 ## 2026-09-10
 
 - Added NVIDIA GB10 / Grace Blackwell support via a dedicated `:gb10` image.
