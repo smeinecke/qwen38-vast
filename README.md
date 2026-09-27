@@ -198,6 +198,9 @@ Emergency opt-out:
 uv run hostai down --yes --no-cache
 ```
 
+`--skip-llama` skips the remote `llama-server` shutdown (the instance is still
+destroyed or paused), shaving a few seconds off the shutdown tail.
+
 By default a cache upload failure is logged but the instance is still destroyed
 so a storage outage cannot accidentally keep GPU billing running. Set:
 

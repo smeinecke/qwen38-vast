@@ -179,6 +179,72 @@ def test_down_instance_pause_with_skip_confirm(config, project_dir):
     assert outcome == "paused"
 
 
+def _run_down(config, project_dir, **kwargs):
+    _write_state(
+        project_dir,
+        instance_id=12345,
+        profile="test",
+        local_port=18080,
+        dph=0.5,
+        ctx_size=32768,
+        ssh_url="ssh://root@10.0.0.1:22",
+    )
+    state = State(project_dir / ".hostai-vast" / "state.json")
+    state.instance_id = 12345
+    state.ssh_url = "ssh://root@10.0.0.1:22"
+    run_dir = project_dir / "run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    with (
+        mock.patch("hostai.commands.down.init_run_dir", return_value=run_dir),
+        mock.patch("hostai.commands.down._stop_proxy"),
+        mock.patch("hostai.commands.down._refresh_ssh_state"),
+        mock.patch("hostai.commands.down.ssh.ensure_tunnel"),
+        mock.patch("hostai.cache.save_and_upload_slot_cache", return_value=None),
+        mock.patch("hostai.commands.down._archive_session"),
+        mock.patch("hostai.commands.down._stop_remote_model") as stop_model,
+        mock.patch("hostai.commands.down.ssh.stop_tunnel"),
+        mock.patch("hostai.commands.down._pause_or_destroy", return_value="destroyed"),
+    ):
+        outcome = down.down_instance(config, state, skip_confirm=True, **kwargs)
+    return outcome, stop_model
+
+
+def test_down_instance_stops_llama_by_default(config, project_dir):
+    outcome, stop_model = _run_down(config, project_dir)
+    assert outcome == "destroyed"
+    stop_model.assert_called_once()
+
+
+def test_down_instance_skip_llama(config, project_dir):
+    outcome, stop_model = _run_down(config, project_dir, skip_llama=True)
+    assert outcome == "destroyed"
+    stop_model.assert_not_called()
+
+
+def test_cmd_down_skip_llama_flag(config, project_dir):
+    _write_state(
+        project_dir,
+        instance_id=12345,
+        profile="test",
+        local_port=18080,
+        dph=0.5,
+        ctx_size=32768,
+    )
+
+    with (
+        mock.patch("hostai.commands.down.down_instance", return_value="destroyed") as di,
+        mock.patch("hostai.commands.watchdog.stop_watchdog"),
+        mock.patch("hostai.commands.monitor.stop_monitor"),
+    ):
+        runner = CliRunner()
+        result = runner.invoke(down.cmd_down, ["--yes", "--skip-llama"], obj=config)
+
+    assert result.exit_code == 0, result.output
+    di.assert_called_once()
+    assert di.call_args.kwargs["skip_llama"] is True
+
+
 def test_archive_session_creates_json(config, state, tmp_path):
     run_dir = tmp_path / "run"
     run_dir.mkdir()

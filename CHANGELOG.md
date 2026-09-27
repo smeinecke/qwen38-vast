@@ -2,6 +2,7 @@
 
 ## 2026-09-27
 
+- Added `hostai down --skip-llama` to skip the remote `llama-server` shutdown while still destroying/pausing the instance.
 - Fixed `hostai up` aborting GB10 rentals at the VRAM preflight.
   - GB10 is unified memory (UMA): `nvidia-smi` reports `memory.total` as `[N/A]` / "Not Supported", so the parse found no VRAM and provisioning was destroyed.
   - When every detected GPU is a UMA part (GB10), the preflight now verifies total system RAM from `/proc/meminfo` against `min_gpu_vram_mb` instead.

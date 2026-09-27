@@ -248,6 +248,7 @@ def down_instance(
     no_cache: bool = False,
     reason: Optional[str] = None,
     skip_confirm: bool = False,
+    skip_llama: bool = False,
 ) -> str:
     """Stop, persist cache, archive telemetry, and destroy/pause an instance.
 
@@ -290,7 +291,7 @@ def down_instance(
     _archive_session(config, state, run_dir, no_archive)
     archive_duration = time.monotonic() - archive_start
 
-    if state.ssh_url:
+    if state.ssh_url and not skip_llama:
         _stop_remote_model(state.ssh_url, known_hosts)
 
     ssh.stop_tunnel(state)
@@ -334,9 +335,17 @@ def down_instance(
 @click.option("--no-cache", is_flag=True, help="Do not save/upload the slot cache for this shutdown.")
 @click.option("--pause", is_flag=True, help="Pause the instance instead of destroying it.")
 @click.option("--reason", help="Shutdown reason (used by watchdog).")
+@click.option("--skip-llama", is_flag=True, help="Skip the remote llama.cpp shutdown.")
 @click.pass_obj
 def cmd_down(
-    config: Config, yes: bool, no_archive: bool, cache: bool, no_cache: bool, pause: bool, reason: Optional[str]
+    config: Config,
+    yes: bool,
+    no_archive: bool,
+    cache: bool,
+    no_cache: bool,
+    pause: bool,
+    reason: Optional[str],
+    skip_llama: bool,
 ) -> None:
     sd = state_dir(config.root_dir)
     state_file = sd / "state.json"
@@ -362,6 +371,7 @@ def cmd_down(
         no_cache=not cache_enabled,
         reason=reason,
         skip_confirm=yes,
+        skip_llama=skip_llama,
     )
     from hostai.commands.watchdog import stop_watchdog
 
