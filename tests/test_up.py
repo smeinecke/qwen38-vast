@@ -104,6 +104,22 @@ def test_resolve_client_port_free(config, project_dir):
         assert up._resolve_client_port(config) == 18081
 
 
+def test_resolve_client_port_user_overrides_proxy_port(config):
+    config.proxy.port = 18081
+    with mock.patch("hostai.utils.port_is_free", return_value=True):
+        assert up._resolve_client_port(config, user_port=18084) == 18084
+    assert config.ssh.local_port == 18084
+    assert config.proxy.port == 18084
+
+
+def test_resolve_client_port_configured_proxy_port_kept(config):
+    config.proxy.port = 19090
+    config.ssh.local_port = 18081
+    with mock.patch("hostai.utils.port_is_free", return_value=True):
+        assert up._resolve_client_port(config) == 19090
+    assert config.proxy.port == 19090
+
+
 def test_resolve_client_port_user_specified_in_use(config):
     with mock.patch("hostai.utils.port_is_free", return_value=False):
         with pytest.raises(Exception):

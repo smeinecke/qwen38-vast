@@ -563,6 +563,8 @@ def _resolve_client_port(
 
     if utils.port_is_free(desired, host="127.0.0.1"):
         config.ssh.local_port = desired
+        if user_port is not None:
+            config.proxy.port = desired
         return desired
 
     if user_set:
