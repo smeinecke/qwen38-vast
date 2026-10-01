@@ -4,7 +4,7 @@ from unittest import mock
 
 from click.testing import CliRunner
 
-from hostai.commands import watchdog
+from hostai.commands import _common, watchdog
 
 
 def test_watchdog_paths(config, project_dir):
@@ -14,11 +14,11 @@ def test_watchdog_paths(config, project_dir):
 
 
 def test_is_running_with_missing_pid():
-    assert watchdog._is_running(9999999) is False
+    assert _common.pid_is_running(9999999) is False
 
 
 def test_hostai_executable_exists():
-    assert isinstance(watchdog._hostai_executable(), str)
+    assert isinstance(_common.hostai_executable(), str)
 
 
 def test_log_writes_to_file(config, project_dir):
@@ -80,10 +80,12 @@ def test_cmd_watchdog_start_and_stop(config, project_dir):
         assert result.exit_code == 0
 
     runner = CliRunner()
-    with mock.patch("os.kill"):
-        with mock.patch("hostai.commands.watchdog._is_running", return_value=True):
-            result = runner.invoke(watchdog.cmd_watchdog_stop, [], obj=config)
+    with mock.patch("os.kill") as kill:
+        with mock.patch("hostai.commands._common.pid_is_running", return_value=True):
+            with mock.patch("hostai.commands.watchdog._common.pid_cmdline_contains", return_value=True):
+                result = runner.invoke(watchdog.cmd_watchdog_stop, [], obj=config)
     assert result.exit_code == 0
+    assert kill.called
 
 
 def test_maybe_start_watchdog_skips_when_disabled(config, project_dir, running_state):
@@ -106,6 +108,58 @@ def test_maybe_start_watchdog_launches(config, project_dir, running_state):
     with mock.patch.object(watchdog, "_start_watchdog", fake_callback):
         watchdog.maybe_start_watchdog(config, running_state)
     assert watchdog._watchdog_pid_file(config).read_text() == "12345"
+
+
+def test_maybe_start_watchdog_skips_when_alive(config, project_dir, running_state):
+    """A live watchdog daemon must not be duplicated by a second `up`."""
+    config.root_dir = project_dir
+    config.vast.watchdog_auto_start = True
+    config.vast.idle_timeout_seconds = 60
+    running_state.instance_id = 12345
+    pid_file = watchdog._watchdog_pid_file(config)
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+    pid_file.write_text("4321")
+
+    with mock.patch("hostai.commands.watchdog._common.daemon_pid_running", return_value=True):
+        with mock.patch.object(watchdog, "_start_watchdog") as start:
+            watchdog.maybe_start_watchdog(config, running_state)
+    start.assert_not_called()
+
+
+def test_maybe_start_watchdog_starts_when_pidfile_stale(config, project_dir, running_state):
+    """A stale pidfile (dead pid or reused foreign pid) must not block start."""
+    config.root_dir = project_dir
+    config.vast.watchdog_auto_start = True
+    config.vast.idle_timeout_seconds = 60
+    running_state.instance_id = 12345
+    pid_file = watchdog._watchdog_pid_file(config)
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+    pid_file.write_text("4321")
+
+    with mock.patch("hostai.commands.watchdog._common.daemon_pid_running", return_value=False):
+        with mock.patch.object(watchdog, "_start_watchdog") as start:
+            watchdog.maybe_start_watchdog(config, running_state)
+    start.assert_called_once()
+
+
+def test_run_watchdog_exits_when_instance_changes(config, project_dir, running_state):
+    """A watchdog bound to instance A must exit when state.json switches to
+    instance B — its idle/max-runtime clocks belong to A and must never act
+    on B."""
+    config.root_dir = project_dir
+    config.vast.idle_timeout_seconds = 60
+    running_state.instance_id = 111
+    running_state.save()
+
+    def swap_instance(*args, **kwargs):
+        running_state.instance_id = 222
+        running_state.save()
+        return ({}, 0, False, 0, 0)
+
+    with mock.patch("hostai.commands.watchdog._run_once", side_effect=swap_instance) as run_once:
+        with mock.patch("time.sleep"):
+            watchdog.run_watchdog(config)
+    run_once.assert_called_once()
 
 
 def test_stop_watchdog_with_missing_pid(config, project_dir):
@@ -141,6 +195,45 @@ def test_run_once_unknown(config, running_state):
         )
     assert fails == 1
     assert shutdown is False
+
+
+def test_run_once_gone_instance_triggers_cleanup(config, running_state):
+    """A preempted instance reports unreachable metrics forever; after a few
+    misses the watchdog must confirm via the provider and clean up rather
+    than spin until killed."""
+    running_state.instance_id = 12345
+    client = mock.Mock()
+    client.get_metrics.side_effect = Exception("down")
+    with mock.patch("hostai.commands.watchdog.api.LlamaClient", return_value=client):
+        with mock.patch(
+            "hostai.commands.watchdog._common.confirm_instance_dead",
+            return_value="instance no longer exists (preempted or removed)",
+        ):
+            with mock.patch("hostai.commands.watchdog.down_instance") as down:
+                current, last, shutdown, fails, inactive = watchdog._run_once(
+                    config, running_state, {}, 0, None, 2, 0
+                )
+    assert shutdown is True
+    assert fails == 3
+    down.assert_called_once()
+    assert "no longer exists" in down.call_args.kwargs["reason"]
+
+
+def test_run_once_unknown_alive_instance_keeps_waiting(config, running_state):
+    """Unreachable metrics + provider says alive → keep waiting (fail-open
+    on transient network issues must not tear down a live instance)."""
+    running_state.instance_id = 12345
+    client = mock.Mock()
+    client.get_metrics.side_effect = Exception("down")
+    with mock.patch("hostai.commands.watchdog.api.LlamaClient", return_value=client):
+        with mock.patch("hostai.commands.watchdog._common.confirm_instance_dead", return_value=None):
+            with mock.patch("hostai.commands.watchdog.down_instance") as down:
+                current, last, shutdown, fails, inactive = watchdog._run_once(
+                    config, running_state, {}, 0, None, 4, 0
+                )
+    assert shutdown is False
+    assert fails == 5
+    down.assert_not_called()
 
 
 def test_run_once_idle_timeout_triggers_shutdown(config, running_state):

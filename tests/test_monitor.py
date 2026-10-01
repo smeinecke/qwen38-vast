@@ -7,13 +7,15 @@ import click
 import pytest
 from click.testing import CliRunner
 
+from hostai.commands import _common
 from hostai.commands.monitor import (
-    _monitor_is_running,
     _monitor_log_file,
     _monitor_pid_file,
+    _monitor_skips,
     _ranked_best_for_monitor,
     _resolve_monitor_targets,
     _search_profiles,
+    _start_monitor,
     cmd_monitor_logs,
     cmd_monitor_once,
     cmd_monitor_start,
@@ -23,6 +25,7 @@ from hostai.commands.monitor import (
     maybe_start_monitor,
     stop_monitor,
 )
+from hostai.market import OfferExclusions
 from hostai.profiles import HardwareRank, MonitorHardware, Profile, Profiles
 from hostai.state import State
 
@@ -290,7 +293,7 @@ def test_cmd_monitor_once_no_offers(config, project_dir):
 
 
 def test_monitor_is_running_with_missing_pid():
-    assert _monitor_is_running(9999999) is False
+    assert _common.pid_is_running(9999999) is False
 
 
 def test_monitor_paths(config, project_dir):
@@ -431,14 +434,30 @@ def test_stop_monitor_with_missing_pid(config, project_dir):
     # No-op should not raise.
 
 
+def test_maybe_start_monitor_skips_when_alive(config, project_dir, running_state):
+    """A live monitor daemon must not be duplicated by a second `up`."""
+    config.root_dir = project_dir
+    config.monitor.auto_start = True
+    running_state.instance_id = 12345
+    pid_file = _monitor_pid_file(config)
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+    pid_file.write_text("4321")
+
+    with mock.patch("hostai.commands.monitor._common.daemon_pid_running", return_value=True):
+        with mock.patch("hostai.commands.monitor._start_monitor") as start:
+            maybe_start_monitor(config, running_state)
+    start.assert_not_called()
+
+
 def test_cmd_monitor_stop_kills_running(config, project_dir):
     config.root_dir = project_dir
     _monitor_pid_file(config).parent.mkdir(parents=True, exist_ok=True)
     _monitor_pid_file(config).write_text("12345")
     with mock.patch("os.kill") as kill:
-        with mock.patch("hostai.commands.monitor._monitor_is_running", return_value=True):
-            runner = CliRunner()
-            result = runner.invoke(cmd_monitor_stop, [], obj=config)
+        with mock.patch("hostai.commands._common.pid_is_running", return_value=True):
+            with mock.patch("hostai.commands._common.pid_cmdline_contains", return_value=True):
+                runner = CliRunner()
+                result = runner.invoke(cmd_monitor_stop, [], obj=config)
     assert result.exit_code == 0
     assert kill.called
 
@@ -455,7 +474,7 @@ def test_cmd_monitor_start_and_stop(config, project_dir):
 
     runner = CliRunner()
     with mock.patch("os.kill"):
-        with mock.patch("hostai.commands.monitor._monitor_is_running", return_value=True):
+        with mock.patch("hostai.commands._common.pid_is_running", return_value=False):
             result = runner.invoke(cmd_monitor_stop, [], obj=config)
     assert result.exit_code == 0
 
@@ -476,3 +495,89 @@ def test_cmd_monitor_logs(config, project_dir):
     result = runner.invoke(cmd_monitor_logs, ["--lines", "1"], obj=config)
     assert result.exit_code == 0
     assert "log line 2" in result.output
+
+
+def test_monitor_skips_merges_state_and_cli(project_dir):
+    current = _state(
+        project_dir,
+        instance_id=123,
+        skip_machines=[9],
+        skip_offers=[5],
+        skip_countries=["DE"],
+    )
+    merged = _monitor_skips(current, OfferExclusions(machines=[1], offers=[7], countries=["US"]))
+    assert merged.machines == (9, 1)
+    assert merged.offers == (5, 7)
+    assert merged.countries == ("DE", "US")
+
+
+def test_monitor_skips_empty_state(project_dir):
+    current = _state(project_dir)
+    merged = _monitor_skips(current)
+    assert merged.machines == ()
+    assert merged.offers == ()
+    assert merged.countries == ()
+
+
+def test_ranked_best_for_monitor_respects_exclusions(config, project_dir):
+    profiles = _make_profiles(make_profile("test"))
+    current = State(project_dir / ".hostai-vast" / "state.json")
+    current.gpu = "RTX 4090"
+    current.dph = 0.5
+    candidates = [
+        {"id": 1, "dph_total": 0.3, "gpu_name": "RTX 4090", "geolocation": "DE"},
+        {"id": 2, "dph_total": 0.4, "gpu_name": "RTX 4090", "geolocation": "US"},
+    ]
+    best = _ranked_best_for_monitor(
+        config, profiles, current, candidates, exclusions=OfferExclusions(countries=["DE"])
+    )
+    assert best is not None
+    assert best["id"] == 2
+
+
+def test_cmd_monitor_once_passes_exclusions(config, project_dir):
+    config.root_dir = project_dir
+    profiles = _make_profiles(make_profile("test"))
+    with mock.patch("hostai.profiles.Profiles.from_file", return_value=profiles):
+        with mock.patch("hostai.state.State.load", return_value=State(project_dir / ".hostai-vast" / "state.json")):
+            with mock.patch("hostai.commands.monitor._search_profiles", return_value=[]):
+                with mock.patch("hostai.commands.monitor._ranked_best_for_monitor", return_value=None) as ranked:
+                    runner = CliRunner()
+                    result = runner.invoke(
+                        cmd_monitor_once,
+                        ["--skip-offer", "7", "--skip-country", "de", "--skip-machine", "9"],
+                        obj=config,
+                    )
+    assert result.exit_code == 0
+    exclusions = ranked.call_args.kwargs["exclusions"]
+    assert exclusions.offers == (7,)
+    assert exclusions.countries == ("de",)
+    assert exclusions.machines == (9,)
+
+
+def test_start_monitor_forwards_skip_options(config, project_dir):
+    config.root_dir = project_dir
+    with mock.patch("hostai.commands.monitor._common.spawn_daemon", return_value=4242) as spawn:
+        _start_monitor(
+            config,
+            None,
+            None,
+            None,
+            None,
+            OfferExclusions(machines=[9], offers=[7], countries=["DE"]),
+        )
+    argv = spawn.call_args.args[2]
+    for flag, value in (("--skip-machine", "9"), ("--skip-offer", "7"), ("--skip-country", "DE")):
+        idx = argv.index(flag)
+        assert argv[idx + 1] == value
+
+
+def test_cmd_monitor_start_forwards_skip_options(config, project_dir):
+    config.root_dir = project_dir
+    with mock.patch("hostai.commands.monitor._common.daemon_running", return_value=False):
+        with mock.patch("hostai.commands.monitor._start_monitor") as start:
+            runner = CliRunner()
+            result = runner.invoke(cmd_monitor_start, ["--skip-offer", "7"], obj=config)
+    assert result.exit_code == 0
+    exclusions = start.call_args.args[5]
+    assert exclusions.offers == (7,)

@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -104,6 +105,19 @@ def _resolve_session_seconds(config: Config, expected_session: Optional[str]) ->
     multiple=True,
     help="Exclude offers hosted on this Vast machine ID (repeatable).",
 )
+@click.option(
+    "--skip-offer",
+    "skip_offers",
+    type=int,
+    multiple=True,
+    help="Exclude this Vast offer ID (repeatable).",
+)
+@click.option(
+    "--skip-country",
+    "skip_countries",
+    multiple=True,
+    help="Exclude offers in this country (alpha-2 code or name, repeatable).",
+)
 @click.option("--restart", is_flag=True, help="Restart an existing paused instance.")
 @click.option("--interruptible", is_flag=True, help="Use an interruptible/bid instance.")
 @click.option("--bid", type=float, help="Bid price (max $/h) for interruptible instances.")
@@ -131,6 +145,8 @@ def cmd_up(
     abort_if_shm_too_small: bool,
     offer: Optional[int],
     skip_machines: Tuple[int, ...],
+    skip_offers: Tuple[int, ...],
+    skip_countries: Tuple[str, ...],
     restart: bool,
     interruptible: bool,
     bid: Optional[float],
@@ -143,6 +159,11 @@ def cmd_up(
     if not chosen_profile:
         raise click.ClickException("no profile specified and no default profile configured")
     _validate_up_options(local_port, max_price, bid, scoring_mode)
+    exclusions = market.OfferExclusions(
+        machines=skip_machines, offers=skip_offers, countries=skip_countries
+    )
+    if offer is not None and offer in exclusions.offers:
+        raise click.ClickException(f"--offer {offer} conflicts with --skip-offer {offer}")
 
     if scoring_mode:
         config.market.scoring_mode = scoring_mode
@@ -156,28 +177,36 @@ def cmd_up(
     bid_price = _resolve_bid_price(config, interruptible, bid, max_price)
     session_seconds = _resolve_session_seconds(config, expected_session)
 
-    if restart:
-        if skip_machines:
-            _log("[up] --skip-machine is ignored for --restart (existing instance)", err=True)
-        _do_restart(config, chosen_profile, local_port, unsecure, no_cache, allow_unvalidated=allow_unvalidated)
-    else:
-        _do_fresh(
-            config,
-            chosen_profile,
-            cache_session,
-            local_port,
-            max_price,
-            unverified,
-            unsecure,
-            no_cache,
-            abort_if_shm_too_small,
-            offer,
-            skip_machines=skip_machines,
-            bid_price=bid_price,
-            session_seconds=session_seconds,
-            dry_run=dry_run,
-            allow_unvalidated=allow_unvalidated,
-        )
+    # A second concurrent `up`/`--restart` would race `_check_for_live_instance`
+    # and rent (or restart) a duplicate instance; serialize on a flock.
+    with _common.lifecycle_lock(config, "up --restart" if restart else "up"):
+        if restart:
+            for flag, values in (
+                ("--skip-machine", exclusions.machines),
+                ("--skip-offer", exclusions.offers),
+                ("--skip-country", exclusions.countries),
+            ):
+                if values:
+                    _log(f"[up] {flag} is ignored for --restart (existing instance)", err=True)
+            _do_restart(config, chosen_profile, local_port, unsecure, no_cache, allow_unvalidated=allow_unvalidated)
+        else:
+            _do_fresh(
+                config,
+                chosen_profile,
+                cache_session,
+                local_port,
+                max_price,
+                unverified,
+                unsecure,
+                no_cache,
+                abort_if_shm_too_small,
+                offer,
+                exclusions=exclusions,
+                bid_price=bid_price,
+                session_seconds=session_seconds,
+                dry_run=dry_run,
+                allow_unvalidated=allow_unvalidated,
+            )
 
 
 def _check_production_validation(config: Config, allow_unvalidated: bool) -> Optional[ValidationRecord]:
@@ -263,6 +292,18 @@ def _cleanup_instance(config: Config, state: State, reason: str) -> None:
         _log(f"[cleanup] instance {state.instance_id} destroyed", err=True)
     except Exception as exc:
         _log(f"[cleanup] destroy failed: {exc}; please remove it manually", err=True)
+    # Release local helpers so a failed provision cannot leave an orphaned
+    # proxy daemon or SSH tunnel holding the port/socket behind.
+    try:
+        from hostai.commands.down import _stop_proxy
+
+        _stop_proxy(state)
+    except Exception:
+        pass
+    try:
+        ssh.stop_tunnel(state)
+    except Exception:
+        pass
     state.status = "failed"
     state.set("failure_reason", reason)
     state.save()
@@ -704,21 +745,88 @@ def _emit_instance_logs(config: Config, instance_id: int, seen: Dict[str, Set[st
             _log(f"[logs:{kind}] {line}")
 
 
+# Instance statuses that mean provisioning can never succeed.  "stopped"
+# covers interruptible instances preempted by a higher bid.
+_INSTANCE_DEAD_STATUSES = frozenset({"exited", "offline", "unknown", "stopped"})
+# Minimum seconds between provider liveness polls inside retry loops.
+_INSTANCE_CHECK_INTERVAL = 10.0
+
+
+def _instance_alive(config: Config, state: State, *, stopped_is_dead: bool = True) -> Tuple[bool, str]:
+    """Poll the provider once and return ``(alive, reason_if_dead)``.
+
+    A live instance also refreshes ``state.ssh_url`` when Vast has remapped
+    the SSH port since it was first resolved.  Provider errors are treated
+    as "alive" so a transient API failure never aborts provisioning.
+
+    ``stopped_is_dead=False`` skips the "stopped" status, for the restart
+    path where Vast can still report "stopped" briefly after start_instance.
+    """
+    if not state.instance_id:
+        return True, ""
+    try:
+        inst = _provider(config).get_instance(state.instance_id)
+    except Exception:
+        return True, ""
+    if not inst:
+        return False, "instance no longer exists (preempted or removed)"
+    status = str(inst.get("actual_status") or inst.get("status") or "")
+    dead = _INSTANCE_DEAD_STATUSES if stopped_is_dead else _INSTANCE_DEAD_STATUSES - {"stopped"}
+    if status in dead:
+        return False, f"instance status is '{status}'"
+    endpoint = ssh.resolve_ssh_endpoint(inst)
+    if endpoint and endpoint["ssh_url"] != state.ssh_url:
+        _log(f"[instance] ssh endpoint moved {state.ssh_url} -> {endpoint['ssh_url']}")
+        state.ssh_url = endpoint["ssh_url"]
+        state.save()
+    return True, ""
+
+
+def _ensure_instance_alive(config: Config, state: State, context: str, *, stopped_is_dead: bool = True) -> None:
+    """Raise ``ClickException`` when the instance is gone.
+
+    Death is confirmed by a second poll so a single flaky API response
+    cannot destroy a healthy provisioning run.
+    """
+    alive, reason = _instance_alive(config, state, stopped_is_dead=stopped_is_dead)
+    if alive:
+        return
+    time.sleep(3)
+    alive, reason2 = _instance_alive(config, state, stopped_is_dead=stopped_is_dead)
+    if alive:
+        return
+    raise click.ClickException(f"instance {state.instance_id} lost during {context}: {reason2 or reason}")
+
+
 def _wait_for_ssh_endpoint(config: Config, state: State, timeout: int) -> None:
     if not state.instance_id:
         raise click.ClickException("no instance id in state")
     start = time.monotonic()
     last_status = 0
+    seen_instance = False
     seen_log_lines: Dict[str, Set[str]] = {"container": set(), "daemon": set()}
     while True:
         elapsed = time.monotonic() - start
         if elapsed > timeout:
             raise click.ClickException(f"[boot:ssh-endpoint] timeout after {elapsed:.1f}s")
-        inst = _provider(config).get_instance(state.instance_id)
-        if not inst:
-            _log("[boot] waiting for instance to appear...")
+        try:
+            inst = _provider(config).get_instance(state.instance_id)
+        except Exception as exc:
+            # A flaky provider response must not abort a booting instance.
+            _log(f"[boot] instance lookup failed: {exc}; retrying", err=True)
             time.sleep(5)
             continue
+        if not inst:
+            if seen_instance:
+                # Was visible before and vanished — likely preempted or
+                # destroyed.  _ensure_instance_alive confirms via a second
+                # poll before raising.
+                _ensure_instance_alive(config, state, "SSH endpoint wait")
+            else:
+                _log("[boot] waiting for instance to appear...")
+            time.sleep(5)
+            continue
+        seen_instance = True
         status = inst.get("actual_status") or inst.get("status") or "loading"
         if status in ("exited", "offline", "unknown"):
             raise click.ClickException(f"instance entered status '{status}'")
@@ -774,6 +882,7 @@ def _wait_for_api(
             detail = f" | last: {client.last_health_error}" if client.last_health_error else ""
             _log(f"[api] waiting for llama-server ({now - start}s / {timeout}s){detail}")
             if state.instance_id:
+                _ensure_instance_alive(config, state, "API health wait")
                 _emit_instance_logs(config, state.instance_id, seen_logs)
             # best-effort server log tail from inside the container
             try:
@@ -966,8 +1075,21 @@ def _start_proxy(config: Config, state: State, client_api_scheme: str = "http") 
 
     port = config.proxy.port or config.ssh.local_port or 0
     if port and not utils.port_is_free(port, host="127.0.0.1"):
-        _log(f"[proxy] WARNING: configured port {port} is in use; skipping", err=True)
-        return None
+        # The port may be held by a stale hostai proxy from a previous run —
+        # those can be killed safely (a foreign process must not be touched).
+        stale_pid = _common.running_proxy_pid(state)
+        if stale_pid:
+            _log(f"[proxy] stopping stale proxy (pid {stale_pid}) holding port {port}")
+            try:
+                os.kill(stale_pid, signal.SIGTERM)
+            except OSError:
+                pass
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not utils.port_is_free(port, host="127.0.0.1"):
+                time.sleep(0.2)
+        if not utils.port_is_free(port, host="127.0.0.1"):
+            _log(f"[proxy] WARNING: configured port {port} is in use; skipping", err=True)
+            return None
     if not port:
         try:
             port = utils.find_free_port(start=18083, host="127.0.0.1")
@@ -1050,8 +1172,14 @@ def _prefetch_slot_cache_to_vast(
         script = cache.rclone_prefetch_script(config, slot_dir, remote_dir)
     else:
         script = cache.rsync_prefetch_script(config, slot_dir, remote_dir)
+    _log(f"[cache] checking cache server for a warm slot ({'rclone' if config.cache.rclone else 'rsync'})...")
     res = ssh.run_remote(ssh_url, "bash -s", input_data=script, known_hosts=known_hosts, config=config, timeout=330)
-    return res.returncode == 0 and "ok" in (res.stdout or "")
+    ok = res.returncode == 0 and "ok" in (res.stdout or "")
+    if not ok:
+        tail = [line.strip() for line in (res.stderr or "").splitlines() if line.strip()]
+        if tail:
+            _log(f"[cache] prefetch: {tail[-1]}", err=True)
+    return ok
 
 
 class _FreshOffer(NamedTuple):
@@ -1075,6 +1203,7 @@ class _FreshOffer(NamedTuple):
     dph: float
     bid_price: Optional[float]
     session_seconds: Optional[int]
+    exclusions: market.OfferExclusions
 
 
 def _check_for_live_instance(config: Config) -> None:
@@ -1102,7 +1231,7 @@ def _resolve_fresh_offer(
     max_price: Optional[float],
     unverified: bool,
     offer: Optional[int],
-    skip_machines: Tuple[int, ...],
+    exclusions: market.OfferExclusions,
     bid_price: Optional[float],
     session_seconds: Optional[int],
     allow_unvalidated: bool,
@@ -1134,8 +1263,8 @@ def _resolve_fresh_offer(
         )
     else:
         _log(f"[search]  mode={offer_type} max_dph=${configured_max_dph:.4f}/h")
-    if skip_machines:
-        _log(f"[search]  skipping machine ids: {', '.join(str(m) for m in skip_machines)}")
+    if exclusions:
+        _log(f"[search]  excluding {exclusions.describe()}")
     provider = _provider(config)
     _log(f"[provider] {provider.name}")
     previous = _check_production_validation(config, allow_unvalidated)
@@ -1156,7 +1285,7 @@ def _resolve_fresh_offer(
         storage=disk_gb,
         offer_type=offer_type,
         session_seconds=session_seconds,
-        skip_machines=skip_machines,
+        exclusions=exclusions,
         verbose=True,
     )
     offer_id_raw = offer_data.get("id") or offer_data.get("ask_contract_id")
@@ -1190,6 +1319,7 @@ def _resolve_fresh_offer(
         dph=dph,
         bid_price=bid_price,
         session_seconds=session_seconds,
+        exclusions=exclusions,
     )
 
 
@@ -1258,6 +1388,9 @@ def _fill_fresh_state(
     state.status = "provisioning"
     state.offer_id = offer.offer_id
     state.data["machine_id"] = offer.machine_id
+    # Exclusions stick to the deployment: the monitor merges them from state
+    # so it never recommends an offer/host the user already ruled out.
+    state.data.update(offer.exclusions.to_state())
     state.gpu = offer.gpu_name
     state.dph = float(offer.dph)
     state.local_port = offer.local_port if offer.local_port is not None else config.ssh.local_port
@@ -1393,7 +1526,7 @@ def _do_fresh(
     abort_if_shm_too_small: bool,
     offer: Optional[int],
     *,
-    skip_machines: Tuple[int, ...] = (),
+    exclusions: Optional[market.OfferExclusions] = None,
     bid_price: Optional[float] = None,
     session_seconds: Optional[int] = None,
     dry_run: bool = False,
@@ -1407,7 +1540,7 @@ def _do_fresh(
         max_price,
         unverified,
         offer,
-        skip_machines,
+        exclusions or market.OfferExclusions(),
         bid_price,
         session_seconds,
         allow_unvalidated,
@@ -1470,7 +1603,16 @@ def _do_fresh_core(
 
     known_hosts = state.state_file.parent / "known_hosts"
     ssh_start = time.monotonic()
-    if not ssh.wait_for_ssh(state.ssh_url, known_hosts=known_hosts, config=config, state=state, timeout=300):
+    alive_check = lambda: _ensure_instance_alive(config, state, "SSH wait")  # noqa: E731
+    if not ssh.wait_for_ssh(
+        state.ssh_url,
+        known_hosts=known_hosts,
+        config=config,
+        state=state,
+        timeout=300,
+        alive_check=alive_check,
+    ):
+        _ensure_instance_alive(config, state, "SSH wait")
         raise click.ClickException("[boot:ssh-command] timeout")
     _log(f"[boot:ssh-command] ready after {time.monotonic() - ssh_start:.1f}s")
 
@@ -1545,6 +1687,7 @@ def _deliver_tls_cert(config: Config, state: State, known_hosts: Path) -> str:
         tls.generate_cert(tls_dir)
     _log("[tls] delivering certificates to container")
     tls_deadline = time.monotonic() + min(120.0, float(config.ssh.start_timeout or 1200))
+    last_alive_check = 0.0
     while True:
         if tls.deliver_cert(
             state.ssh_url,
@@ -1555,7 +1698,11 @@ def _deliver_tls_cert(config: Config, state: State, known_hosts: Path) -> str:
             timeout=60,
         ):
             break
-        if time.monotonic() >= tls_deadline:
+        now = time.monotonic()
+        if now - last_alive_check >= _INSTANCE_CHECK_INTERVAL:
+            last_alive_check = now
+            _ensure_instance_alive(config, state, "TLS certificate delivery")
+        if now >= tls_deadline:
             raise click.ClickException("TLS certificate delivery failed")
         _log("[tls] delivery attempt failed; retrying in 5s", err=True)
         time.sleep(5)
@@ -1755,7 +1902,18 @@ def _do_restart(
 
     _wait_for_ssh_endpoint(config, state, config.ssh.start_timeout)
     known_hosts = state.state_file.parent / "known_hosts"
-    if not ssh.wait_for_ssh(state.ssh_url, known_hosts=known_hosts, config=config, state=state, timeout=300):
+    # stopped_is_dead=False: Vast can still report "stopped" briefly while
+    # a restarted instance transitions to loading.
+    alive_check = lambda: _ensure_instance_alive(config, state, "SSH wait", stopped_is_dead=False)  # noqa: E731
+    if not ssh.wait_for_ssh(
+        state.ssh_url,
+        known_hosts=known_hosts,
+        config=config,
+        state=state,
+        timeout=300,
+        alive_check=alive_check,
+    ):
+        _ensure_instance_alive(config, state, "SSH wait", stopped_is_dead=False)
         raise click.ClickException("SSH daemon did not become reachable")
 
     # GPU memory preflight on restart: if the profile has a minimum, verify it.

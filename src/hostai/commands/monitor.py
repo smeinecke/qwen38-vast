@@ -12,44 +12,26 @@ compares apples-to-apples.
 """
 
 import dataclasses
-import os
-import shutil
-import signal
 import subprocess
-import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import click
 
 from hostai import market
+from hostai.commands import _common
 from hostai.config import Config
 from hostai.profiles import Profile, Profiles
 from hostai.state import State, state_dir
 
 
 def _monitor_pid_file(config: Config) -> Path:
-    return config.root_dir / ".hostai-cache" / "monitor.pid"
+    return _common.daemon_pid_file(config, "monitor")
 
 
 def _monitor_log_file(config: Config) -> Path:
-    return config.root_dir / ".hostai-cache" / "monitor.log"
-
-
-def _monitor_is_running(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except (OSError, ValueError):
-        return False
-    return True
-
-
-def _hostai_executable() -> str:
-    exe = shutil.which("hostai")
-    if exe:
-        return exe
-    return sys.argv[0]
+    return _common.daemon_log_file(config, "monitor")
 
 
 @click.group("monitor", help="Monitor Vast prices for cheaper offers.")
@@ -119,6 +101,16 @@ def _resolve_monitor_targets(
     raise click.ClickException("no monitorable profile configured")
 
 
+def _monitor_skips(current: State, exclusions: Optional[market.OfferExclusions] = None) -> market.OfferExclusions:
+    """Merge CLI exclusions with the ones ``up`` recorded in state.json.
+
+    Exclusions passed to ``hostai up`` (e.g. a host that failed provisioning)
+    stay attached to the deployment, so the monitor does not recommend an
+    offer the user already ruled out.
+    """
+    return market.OfferExclusions.from_state(current.data).merged(exclusions or market.OfferExclusions())
+
+
 def _search_profiles(
     config: Config,
     profiles: Profiles,
@@ -172,6 +164,8 @@ def _ranked_best_for_monitor(
     profiles: Profiles,
     current: State,
     candidates: List[Dict[str, Any]],
+    *,
+    exclusions: Optional[market.OfferExclusions] = None,
 ) -> Optional[Dict[str, Any]]:
     """Return the cheapest offer that is an economic/performance upgrade."""
     if not candidates:
@@ -194,6 +188,7 @@ def _ranked_best_for_monitor(
         current_gpu=current_gpu,
         profiles=profiles,
         ctx_size=running_ctx,
+        exclusions=exclusions,
     )
     if not matches:
         return None
@@ -202,26 +197,58 @@ def _ranked_best_for_monitor(
     return matches[0]
 
 
+def _skip_options(func):
+    """Attach the offer-exclusion options shared by the monitor commands."""
+    for args, kwargs in (
+        (
+            ("--skip-machine", "skip_machines"),
+            {"type": int, "multiple": True, "help": "Exclude offers hosted on this Vast machine ID (repeatable)."},
+        ),
+        (
+            ("--skip-offer", "skip_offers"),
+            {"type": int, "multiple": True, "help": "Exclude this Vast offer ID (repeatable)."},
+        ),
+        (
+            ("--skip-country", "skip_countries"),
+            {"multiple": True, "help": "Exclude offers in this country (alpha-2 code or name, repeatable)."},
+        ),
+    ):
+        func = click.option(*args, **kwargs)(func)
+    return func
+
+
 @cmd_monitor.command("once", help="Run a single price check.")
 @click.option("--profile", help="Profile to monitor.")
 @click.option("--group", help="Monitor group to search.")
+@_skip_options
 @click.pass_obj
-def cmd_monitor_once(config: Config, profile: Optional[str], group: Optional[str]):
+def cmd_monitor_once(
+    config: Config,
+    profile: Optional[str],
+    group: Optional[str],
+    skip_machines: Tuple[int, ...],
+    skip_offers: Tuple[int, ...],
+    skip_countries: Tuple[str, ...],
+):
     profiles = Profiles.from_file(config.root_dir / config.hostai.profiles_file)
     current = State.load(state_dir(config.root_dir) / "state.json")
     targets = _resolve_monitor_targets(config, profiles, profile, group, current)
     current_dph = current.dph if current.exists else None
+    exclusions = _monitor_skips(
+        current, market.OfferExclusions(machines=skip_machines, offers=skip_offers, countries=skip_countries)
+    )
 
     all_offers = _search_profiles(config, profiles, targets, current)
-    best = _ranked_best_for_monitor(config, profiles, current, all_offers)
+    best = _ranked_best_for_monitor(config, profiles, current, all_offers, exclusions=exclusions)
     if best is None:
         click.echo("no matching offers")
         return
 
     best_dph = best.get("dph_total", 0)
+    loc = market._format_country(best.get("geolocation") or best.get("location"))
     click.echo(
         f"[monitor] best {best.get('gpu_name')} at ${best_dph:.4f}/h "
-        f"(id={best.get('id') or best.get('ask_contract_id')} machine={best.get('machine_id', '?')})"
+        f"(id={best.get('id') or best.get('ask_contract_id')} machine={best.get('machine_id', '?')} loc={loc})"
     )
     if current_dph and current_dph > 0:
         saving = (current_dph - best_dph) / current_dph * 100
@@ -233,9 +260,17 @@ def cmd_monitor_once(config: Config, profile: Optional[str], group: Optional[str
 @click.option("--group", help="Monitor group to search.")
 @click.option("--interval", type=int, default=None, help="Seconds between checks.")
 @click.option("--threshold", type=float, default=None, help="Pct saving before alerting.")
+@_skip_options
 @click.pass_obj
 def cmd_monitor_watch(
-    config: Config, profile: Optional[str], group: Optional[str], interval: Optional[int], threshold: Optional[float]
+    config: Config,
+    profile: Optional[str],
+    group: Optional[str],
+    interval: Optional[int],
+    threshold: Optional[float],
+    skip_machines: Tuple[int, ...],
+    skip_offers: Tuple[int, ...],
+    skip_countries: Tuple[str, ...],
 ):
     sec = interval if interval is not None else config.monitor.interval
     pct = threshold if threshold is not None else config.monitor.threshold_pct
@@ -247,23 +282,37 @@ def cmd_monitor_watch(
     try:
         while True:
             current = State.load(state_dir(config.root_dir) / "state.json")
+            # Re-resolve targets each round: a new instance may run a
+            # different profile/ctx than when the watch started.
+            try:
+                targets = _resolve_monitor_targets(config, profiles, profile, group, current)
+            except click.ClickException:
+                pass  # keep the last known-good targets
             current_dph = current.dph if current.exists else None
+            # Re-merge each round: exclusions recorded by a new `up` land in
+            # state.json between iterations.
+            exclusions = _monitor_skips(
+                current, market.OfferExclusions(machines=skip_machines, offers=skip_offers, countries=skip_countries)
+            )
             all_offers = _search_profiles(config, profiles, targets, current)
-            best = _ranked_best_for_monitor(config, profiles, current, all_offers)
+            best = _ranked_best_for_monitor(config, profiles, current, all_offers, exclusions=exclusions)
             if best:
                 best_dph = best.get("dph_total", 0)
                 machine = best.get("machine_id", "?")
+                loc = market._format_country(best.get("geolocation") or best.get("location"))
                 if current_dph and current_dph > 0 and current_dph > best_dph:
                     saving = (current_dph - best_dph) / current_dph * 100
                     if saving >= pct:
                         click.echo(
                             f"[monitor] ALERT: {best.get('gpu_name')} ${best_dph:.4f}/h "
-                            f"is {saving:.1f}% cheaper (machine={machine})"
+                            f"is {saving:.1f}% cheaper (machine={machine} loc={loc})"
                         )
                     else:
-                        click.echo(f"[monitor] best ${best_dph:.4f}/h (saving {saving:.1f}%, machine={machine})")
+                        click.echo(
+                            f"[monitor] best ${best_dph:.4f}/h (saving {saving:.1f}%, machine={machine} loc={loc})"
+                        )
                 else:
-                    click.echo(f"[monitor] best ${best_dph:.4f}/h (machine={machine})")
+                    click.echo(f"[monitor] best ${best_dph:.4f}/h (machine={machine} loc={loc})")
             else:
                 click.echo("[monitor] no cheaper equivalent offer")
             time.sleep(sec)
@@ -277,83 +326,29 @@ def _start_monitor(
     group: Optional[str],
     interval: Optional[int],
     threshold: Optional[float],
+    exclusions: Optional[market.OfferExclusions] = None,
 ) -> None:
     """Launch the monitor daemon in a detached subprocess."""
-    pid_file = _monitor_pid_file(config)
-    log_file = _monitor_log_file(config)
-
     sec = interval if interval is not None else config.monitor.interval
     pct = threshold if threshold is not None else config.monitor.threshold_pct
     target_label = profile or group or config.monitor.profile or config.monitor.group or config.hostai.default_profile
 
-    log_file.parent.mkdir(parents=True, exist_ok=True)
-    with log_file.open("a", encoding="utf-8") as log:
-        log.write(f"\n# monitor start {target_label} interval={sec}s threshold={pct}%\n")
-
-    cmd = [_hostai_executable(), "monitor", "watch", "--interval", str(sec), "--threshold", str(pct)]
+    cmd = [_common.hostai_executable(), "monitor", "watch", "--interval", str(sec), "--threshold", str(pct)]
     if profile:
         cmd.extend(["--profile", profile])
     if group:
         cmd.extend(["--group", group])
+    cmd.extend((exclusions or market.OfferExclusions()).cli_args())
 
-    with log_file.open("a", encoding="utf-8") as log:
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            close_fds=True,
-        )
-
-    pid_file.write_text(str(proc.pid))
-    click.echo(f"[monitor] started daemon (pid {proc.pid}) logging to {log_file}")
+    pid = _common.spawn_daemon(
+        config, "monitor", cmd, banner=f"\n# monitor start {target_label} interval={sec}s threshold={pct}%\n"
+    )
+    click.echo(f"[monitor] started daemon (pid {pid}) logging to {_monitor_log_file(config)}")
 
 
 def _stop_monitor(config: Config, echo: bool = False) -> None:
     """Kill the monitor daemon and remove its pid file."""
-    pid_file = _monitor_pid_file(config)
-    if not pid_file.exists():
-        if echo:
-            click.echo("[monitor] not running")
-        return
-    try:
-        pid = int(pid_file.read_text().strip())
-    except (ValueError, OSError):
-        pid_file.unlink(missing_ok=True)
-        if echo:
-            click.echo("[monitor] not running")
-        return
-
-    if not _monitor_is_running(pid):
-        pid_file.unlink(missing_ok=True)
-        if echo:
-            click.echo("[monitor] not running")
-        return
-
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except Exception as exc:
-        if echo:
-            click.echo(f"[monitor] could not stop daemon: {exc}", err=True)
-        return
-
-    # Wait briefly for the process to exit.
-    for _ in range(20):
-        if not _monitor_is_running(pid):
-            break
-        time.sleep(0.2)
-
-    if _monitor_is_running(pid):
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except Exception as exc:
-            if echo:
-                click.echo(f"[monitor] could not kill daemon: {exc}", err=True)
-
-    pid_file.unlink(missing_ok=True)
-    if echo:
-        click.echo("[monitor] stopped")
+    _common.stop_daemon(config, "monitor", echo=echo)
 
 
 @cmd_monitor.command("start", help="Start the price monitor daemon.")
@@ -361,20 +356,30 @@ def _stop_monitor(config: Config, echo: bool = False) -> None:
 @click.option("--group", help="Monitor group to search.")
 @click.option("--interval", type=int, default=None, help="Seconds between checks.")
 @click.option("--threshold", type=float, default=None, help="Pct saving before alerting.")
+@_skip_options
 @click.pass_obj
 def cmd_monitor_start(
-    config: Config, profile: Optional[str], group: Optional[str], interval: Optional[int], threshold: Optional[float]
+    config: Config,
+    profile: Optional[str],
+    group: Optional[str],
+    interval: Optional[int],
+    threshold: Optional[float],
+    skip_machines: Tuple[int, ...],
+    skip_offers: Tuple[int, ...],
+    skip_countries: Tuple[str, ...],
 ):
-    pid_file = _monitor_pid_file(config)
-    if pid_file.exists():
-        try:
-            pid = int(pid_file.read_text().strip())
-            if _monitor_is_running(pid):
-                click.echo(f"[monitor] already running (pid {pid})")
-                return
-        except (ValueError, OSError):
-            pass
-    _start_monitor(config, profile, group, interval, threshold)
+    if _common.daemon_running(config, "monitor"):
+        pid = _monitor_pid_file(config).read_text().strip()
+        click.echo(f"[monitor] already running (pid {pid})")
+        return
+    _start_monitor(
+        config,
+        profile,
+        group,
+        interval,
+        threshold,
+        market.OfferExclusions(machines=skip_machines, offers=skip_offers, countries=skip_countries),
+    )
 
 
 @cmd_monitor.command("stop", help="Stop the price monitor daemon.")
@@ -386,23 +391,7 @@ def cmd_monitor_stop(config: Config):
 @cmd_monitor.command("status", help="Show monitor daemon status.")
 @click.pass_obj
 def cmd_monitor_status(config: Config):
-    pid_file = _monitor_pid_file(config)
-    if not pid_file.exists():
-        click.echo("[monitor] not running")
-        return
-    try:
-        pid = int(pid_file.read_text().strip())
-    except (ValueError, OSError):
-        click.echo("[monitor] not running (stale pid file)")
-        pid_file.unlink(missing_ok=True)
-        return
-
-    if _monitor_is_running(pid):
-        log_file = _monitor_log_file(config)
-        click.echo(f"[monitor] running (pid {pid}) log={log_file}")
-    else:
-        click.echo("[monitor] not running (stale pid file)")
-        pid_file.unlink(missing_ok=True)
+    click.echo(_common.daemon_status_line(config, "monitor"))
 
 
 def maybe_start_monitor(config: Config, state: State) -> None:
@@ -411,14 +400,8 @@ def maybe_start_monitor(config: Config, state: State) -> None:
         return
     if not state.instance_id:
         return
-    pid_file = _monitor_pid_file(config)
-    if pid_file.exists():
-        try:
-            pid = int(pid_file.read_text().strip())
-            if _monitor_is_running(pid):
-                return
-        except (ValueError, OSError):
-            pass
+    if _common.daemon_running(config, "monitor"):
+        return
     _log_monitor(config, f"auto-starting monitor for instance {state.instance_id}")
     _start_monitor(config, profile=None, group=None, interval=None, threshold=None)
 
@@ -429,10 +412,7 @@ def stop_monitor(config: Config) -> None:
 
 
 def _log_monitor(config: Config, message: str) -> None:
-    log_file = _monitor_log_file(config)
-    log_file.parent.mkdir(parents=True, exist_ok=True)
-    with log_file.open("a", encoding="utf-8") as f:
-        f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {message}\n")
+    _common.daemon_log(config, "monitor", message)
 
 
 @cmd_monitor.command("logs", help="Tail the monitor daemon log.")

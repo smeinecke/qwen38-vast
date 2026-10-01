@@ -142,7 +142,9 @@ def test_filter_eligible_offers_skip_machines():
         {"id": 3, "gpu_name": "RTX 4090", "dph_total": 0.5, "machine_id": 333},
         {"id": 4, "gpu_name": "RTX 4090", "dph_total": 0.6},
     ]
-    matches = market.filter_eligible_offers(offers, max_dph=1.0, skip_machines=[111, 333])
+    matches = market.filter_eligible_offers(
+        offers, max_dph=1.0, exclusions=market.OfferExclusions(machines=[111, 333])
+    )
     assert [o["id"] for o in matches] == [2, 4]
 
 
@@ -152,8 +154,92 @@ def test_filter_eligible_offers_skip_machines_str_id():
         {"id": 1, "gpu_name": "RTX 4090", "dph_total": 0.3, "machine_id": "111"},
         {"id": 2, "gpu_name": "RTX 4090", "dph_total": 0.4, "machine_id": 222},
     ]
-    matches = market.filter_eligible_offers(offers, max_dph=1.0, skip_machines={111})
+    matches = market.filter_eligible_offers(offers, max_dph=1.0, exclusions=market.OfferExclusions(machines={111}))
     assert [o["id"] for o in matches] == [2]
+
+
+def test_filter_eligible_offers_skip_offers():
+    """Skipped offer IDs match both ``id`` and ``ask_contract_id``."""
+    offers = [
+        {"id": 1, "ask_contract_id": 101, "gpu_name": "RTX 4090", "dph_total": 0.3},
+        {"id": 2, "ask_contract_id": 102, "gpu_name": "RTX 4090", "dph_total": 0.4},
+        {"id": 3, "gpu_name": "RTX 4090", "dph_total": 0.5},
+    ]
+    matches = market.filter_eligible_offers(
+        offers, max_dph=1.0, exclusions=market.OfferExclusions(offers=[101, 3])
+    )
+    assert [o["id"] for o in matches] == [2]
+
+
+def test_filter_eligible_offers_skip_countries():
+    """Skipped countries match codes and names, including the location fallback."""
+    offers = [
+        {"id": 1, "gpu_name": "RTX 4090", "dph_total": 0.3, "geolocation": "DE"},
+        {"id": 2, "gpu_name": "RTX 4090", "dph_total": 0.4, "geolocation": "US"},
+        {"id": 3, "gpu_name": "RTX 4090", "dph_total": 0.5, "location": "de"},
+        {"id": 4, "gpu_name": "RTX 4090", "dph_total": 0.6},
+    ]
+    matches = market.filter_eligible_offers(
+        offers, max_dph=1.0, exclusions=market.OfferExclusions(countries=["Germany", "de"])
+    )
+    assert [o["id"] for o in matches] == [2, 4]
+
+
+def test_filter_eligible_offers_skip_countries_region_format():
+    """Vast reports geolocation as "Region/City, CC"; the trailing code wins."""
+    offers = [
+        {"id": 1, "gpu_name": "RTX 4090", "dph_total": 0.3, "geolocation": "Shenzhen, CN"},
+        {"id": 2, "gpu_name": "RTX 4090", "dph_total": 0.4, "geolocation": "Arizona, US"},
+        {"id": 3, "gpu_name": "RTX 4090", "dph_total": 0.5, "geolocation": ", DE"},
+    ]
+    matches = market.filter_eligible_offers(
+        offers, max_dph=1.0, exclusions=market.OfferExclusions(countries=["CN", "de"])
+    )
+    assert [o["id"] for o in matches] == [2]
+    # Region names alone are not countries: "Arizona" must not match.
+    matches = market.filter_eligible_offers(
+        offers, max_dph=1.0, exclusions=market.OfferExclusions(countries=["Arizona"])
+    )
+    assert [o["id"] for o in matches] == [1, 2, 3]
+
+
+def test_normalize_country_code():
+    assert market.normalize_country_code("de") == "DE"
+    assert market.normalize_country_code(" DEU ") == "DE"
+    assert market.normalize_country_code("Germany") == "DE"
+    assert market.normalize_country_code("united states") == "US"
+    assert market.normalize_country_code("local") == "LOCAL"
+    assert market.normalize_country_code("") == ""
+    assert market.normalize_country_code(None) == ""
+    # Vast geolocation format: "Region/City, CC".
+    assert market.normalize_country_code("Arizona, US") == "US"
+    assert market.normalize_country_code("Shenzhen, CN") == "CN"
+    assert market.normalize_country_code("Türkiye, TR") == "TR"
+    assert market.normalize_country_code(", US") == "US"
+
+
+def test_offer_exclusions_state_roundtrip_and_cli_args():
+    excl = market.OfferExclusions(machines=[9], offers=[7], countries=["DE"])
+    assert market.OfferExclusions.from_state(excl.to_state()) == excl
+    assert excl.cli_args() == ["--skip-machine", "9", "--skip-offer", "7", "--skip-country", "DE"]
+    assert not market.OfferExclusions()
+    assert excl.describe() == "machines [9], offers [7], countries ['DE']"
+
+
+def test_offer_exclusions_merged_dedupes():
+    merged = market.OfferExclusions(machines=[1], offers=[5]).merged(
+        market.OfferExclusions(machines=[1, 2], countries=["DE"])
+    )
+    assert merged.machines == (1, 2)
+    assert merged.offers == (5,)
+    assert merged.countries == ("DE",)
+
+
+def test_offer_exclusions_from_state_ignores_garbage():
+    restored = market.OfferExclusions.from_state({"skip_machines": ["x", 3], "skip_offers": None})
+    assert restored.machines == (3,)
+    assert restored.offers == ()
+    assert restored.countries == ()
 
 
 def test_filter_eligible_offers_zero_max_dph():
@@ -455,7 +541,14 @@ def test_select_offer_skip_machines(config):
     ]
     with mock.patch("hostai.market.search_offers", return_value=offers):
         best = market.select_offer(
-            config, profiles, "query", max_dph=0.5, unverified=False, offer=None, storage=35, skip_machines=[111]
+            config,
+            profiles,
+            "query",
+            max_dph=0.5,
+            unverified=False,
+            offer=None,
+            storage=35,
+            exclusions=market.OfferExclusions(machines=[111]),
         )
     assert best["id"] == 2
 
@@ -472,7 +565,65 @@ def test_select_offer_skip_machines_no_match(config):
     with mock.patch("hostai.market.search_offers", return_value=offers):
         with pytest.raises(click.ClickException, match="excluding machines"):
             market.select_offer(
-                config, profiles, "query", max_dph=0.5, unverified=False, offer=None, storage=35, skip_machines=[111]
+                config,
+                profiles,
+                "query",
+                max_dph=0.5,
+                unverified=False,
+                offer=None,
+                storage=35,
+                exclusions=market.OfferExclusions(machines=[111]),
+            )
+
+
+def test_select_offer_skip_offers_and_countries(config):
+    """Skipped offer IDs and countries are excluded before the best offer is picked."""
+    profiles = Profiles(
+        schema_version=1,
+        images=[],
+        profiles=[make_profile()],
+        monitor_hardware=MonitorHardware(),
+        market_policy=MarketPolicy(),
+    )
+    offers = [
+        {"id": 1, "gpu_name": "RTX 4090", "dph_total": 0.3, "geolocation": "DE"},
+        {"id": 2, "gpu_name": "RTX 4090", "dph_total": 0.4, "geolocation": "US"},
+        {"id": 3, "gpu_name": "RTX 4090", "dph_total": 0.45, "geolocation": "US"},
+    ]
+    with mock.patch("hostai.market.search_offers", return_value=offers):
+        best = market.select_offer(
+            config,
+            profiles,
+            "query",
+            max_dph=0.5,
+            unverified=False,
+            offer=None,
+            storage=35,
+            exclusions=market.OfferExclusions(offers=[3], countries=["DE"]),
+        )
+    assert best["id"] == 2
+
+
+def test_select_offer_exclusions_no_match_message(config):
+    profiles = Profiles(
+        schema_version=1,
+        images=[],
+        profiles=[make_profile()],
+        monitor_hardware=MonitorHardware(),
+        market_policy=MarketPolicy(),
+    )
+    offers = [{"id": 1, "gpu_name": "RTX 4090", "dph_total": 0.3, "machine_id": 111, "geolocation": "DE"}]
+    with mock.patch("hostai.market.search_offers", return_value=offers):
+        with pytest.raises(click.ClickException, match=r"excluding machines.*offers.*countries"):
+            market.select_offer(
+                config,
+                profiles,
+                "query",
+                max_dph=0.5,
+                unverified=False,
+                offer=None,
+                storage=35,
+                exclusions=market.OfferExclusions(machines=[111], offers=[1], countries=["DE"]),
             )
 
 

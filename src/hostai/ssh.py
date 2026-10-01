@@ -42,6 +42,10 @@ _TUNNEL_START_TIMEOUT = 45
 SSH_KEEPALIVE_INTERVAL = 15.0
 SSH_KEEPALIVE_COUNT_MAX = 3
 
+# Bound a single TCP connect so a blackholed host (packets dropped, no RST)
+# fails in seconds instead of waiting out the kernel retransmission timeout.
+SSH_CONNECT_TIMEOUT = 30.0
+
 
 def resolve_ssh_endpoint(instance: dict) -> Optional[Dict[str, Any]]:
     """Extract an SSH endpoint from a Vast instance dict.
@@ -125,6 +129,7 @@ def _connect_kwargs(known_hosts: Optional[Path] = None, identity: Optional[Path]
         kwargs["agent_path"] = None
     kwargs["keepalive_interval"] = SSH_KEEPALIVE_INTERVAL
     kwargs["keepalive_count_max"] = SSH_KEEPALIVE_COUNT_MAX
+    kwargs["connect_timeout"] = SSH_CONNECT_TIMEOUT
     return kwargs
 
 
@@ -275,17 +280,28 @@ def wait_for_ssh(
     state: Optional[State] = None,
     timeout: int = 120,
     quiet: bool = False,
+    alive_check: Optional[Callable[[], None]] = None,
+    alive_check_interval: float = 15.0,
 ) -> bool:
-    """Wait up to timeout seconds for SSH to become reachable."""
+    """Wait up to timeout seconds for SSH to become reachable.
+
+    When ``alive_check`` is provided it is invoked between probes, at most
+    every ``alive_check_interval`` seconds.  An exception it raises aborts
+    the wait early — e.g. when the remote instance was preempted or removed.
+    """
     if not ssh_url:
         return False
     if identity is None and (config or state):
         identity = _default_identity(config, state)
     user, host, port = _parse_url(ssh_url)
     deadline = time.time() + timeout
+    last_alive_check = 0.0
     while time.time() < deadline:
         if _run_coro(_is_ssh_reachable(host, port, user, known_hosts, identity)):
             return True
+        if alive_check is not None and time.monotonic() - last_alive_check >= alive_check_interval:
+            last_alive_check = time.monotonic()
+            alive_check()
         if not quiet:
             print(f"[ssh] waiting for {ssh_url} ...")
         time.sleep(2)
@@ -486,6 +502,15 @@ def _tunnel_log(message: str) -> None:
     print(f"[{ts}] [tunnel] {message}", flush=True)
 
 
+def _run_in_thread_loop(loop: asyncio.AbstractEventLoop, coro: Any) -> None:
+    """Run a coroutine on *loop* inside a dedicated thread; always close."""
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
 def _tunnel_thread_runner(
     loop: asyncio.AbstractEventLoop,
     local_port: int,
@@ -499,11 +524,10 @@ def _tunnel_thread_runner(
     stop: threading.Event,
     outcome: Dict[str, Any],
 ) -> None:
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(
-        _start_tunnel_worker(user, host, port, local_port, remote_dest, identity, connect_timeout, ready, stop, outcome)
+    _run_in_thread_loop(
+        loop,
+        _start_tunnel_worker(user, host, port, local_port, remote_dest, identity, connect_timeout, ready, stop, outcome),
     )
-    loop.close()
 
 
 def _resolve_forward_timeout(config: Config, timeout: Optional[float]) -> float:
@@ -803,13 +827,12 @@ def _unix_tunnel_thread_runner(
     stop: threading.Event,
     outcome: Dict[str, Any],
 ) -> None:
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(
+    _run_in_thread_loop(
+        loop,
         _start_unix_tunnel_worker(
             local_path, user, host, port, remote_dest, identity, connect_timeout, ready, stop, outcome
-        )
+        ),
     )
-    loop.close()
 
 
 def _unix_socket_is_open(local_path: str, timeout: int = 3) -> bool:

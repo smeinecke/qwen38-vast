@@ -17,6 +17,7 @@ import aiohttp
 from aiohttp import web
 
 from hostai import ssh
+from hostai.commands import _common
 from hostai.config import Config
 from hostai.state import State
 from hostai.tokenize import Tokenizer, TokenizerError, default_reasoning_kwargs
@@ -657,9 +658,17 @@ class TokenizedProxy:
             stream,
             len(stop_strings),
         )
-        if stream:
-            return await self._stream_chat(request, upstream_response, stop_strings, expect_reasoning, tools, req_id)
-        return await self._complete_chat(upstream_response, len(token_ids), stop_strings, tools, req_id)
+        try:
+            if stream:
+                return await self._stream_chat(request, upstream_response, stop_strings, expect_reasoning, tools, req_id)
+            return await self._complete_chat(upstream_response, len(token_ids), stop_strings, tools, req_id)
+        except (asyncio.CancelledError, ConnectionError):
+            # Client went away (handler_cancellation) or the downstream write
+            # failed — dropping the upstream connection aborts generation.
+            upstream_response.close()
+            self._log_content("error", req_id, error="client disconnected")
+            _logger.info("client disconnected; aborted upstream request")
+            raise
 
     @staticmethod
     def build_completion_payload(
@@ -722,6 +731,11 @@ class TokenizedProxy:
             data = await response.json()
         except json.JSONDecodeError as exc:
             raise web.HTTPInternalServerError(reason=f"invalid upstream JSON: {exc}") from exc
+        except (asyncio.CancelledError, Exception):
+            # Cancelled = client disconnected; closing the upstream response
+            # drops the connection so llama-server aborts the generation.
+            response.close()
+            raise
 
         finish_reason = self._map_finish_reason(data)
         completion_tokens = data.get("tokens_predicted", 0) or 0
@@ -943,37 +957,59 @@ class TokenizedProxy:
         # reads so a partial line is never parsed as JSON and dropped.
         buffer = ""
 
-        async for raw in response.content:
-            buffer += raw.decode("utf-8", errors="replace")
-            *lines, buffer = buffer.split("\n")
-            for line in lines:
-                line = line.strip()
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if not data or data == "[DONE]":
-                    continue
-                try:
-                    obj = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
+        try:
+            while True:
+                # Any await here (read or write) raises CancelledError the
+                # moment the client connection dies (handler_cancellation);
+                # closing the upstream response aborts remote generation.
+                raw = await response.content.readany()
+                if not raw:
+                    break
+                buffer += raw.decode("utf-8", errors="replace")
+                *lines, buffer = buffer.split("\n")
+                for line in lines:
+                    line = line.strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if not data or data == "[DONE]":
+                        continue
+                    try:
+                        obj = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
 
-                deltas, finish, token_mode, sent_reasoning, sent_content = self._process_stream_chunk(
-                    obj, detok, token_mode, sent_reasoning, sent_content, tools
-                )
-                if deltas:
-                    for i, delta_payload in enumerate(deltas):
-                        self._log_content("delta", req_id, **delta_payload)
-                        chunk_finish = finish if i == len(deltas) - 1 else None
-                        await stream.write(
-                            self._build_sse_chunk(completion_id, created, model, delta_payload, chunk_finish)
-                        )
-                elif finish:
-                    await stream.write(self._build_sse_chunk(completion_id, created, model, {}, finish))
+                    deltas, finish, token_mode, sent_reasoning, sent_content = self._process_stream_chunk(
+                        obj, detok, token_mode, sent_reasoning, sent_content, tools
+                    )
+                    if deltas:
+                        for i, delta_payload in enumerate(deltas):
+                            self._log_content("delta", req_id, **delta_payload)
+                            chunk_finish = finish if i == len(deltas) - 1 else None
+                            await stream.write(
+                                self._build_sse_chunk(completion_id, created, model, delta_payload, chunk_finish)
+                            )
+                    elif finish:
+                        await stream.write(self._build_sse_chunk(completion_id, created, model, {}, finish))
 
-                stop = obj.get("stop", False)
-                if stop or (token_mode and detok.stopped):
-                    return await self._stream_end(stream, response, detok, token_mode, stop, finish, req_id)
+                    stop = obj.get("stop", False)
+                    if stop or (token_mode and detok.stopped):
+                        return await self._stream_end(stream, response, detok, token_mode, stop, finish, req_id)
+        except ConnectionError:
+            # A write to a dead client socket lands here.
+            response.close()
+            self._log_content("error", req_id, error="client connection reset")
+            _logger.info("client connection reset; aborted upstream stream at %d tokens", detok.token_count)
+            return stream
+        except asyncio.CancelledError:
+            # handler_cancellation: client disconnected mid-stream.
+            response.close()
+            self._log_content("error", req_id, error="client disconnected")
+            _logger.info("client disconnected; aborted upstream stream at %d tokens", detok.token_count)
+            raise
+        except Exception:
+            response.close()
+            raise
 
         if token_mode:
             for tail in detok.finish():
@@ -1037,11 +1073,22 @@ class TokenizedProxy:
                         continue
                     response.headers[k] = v
                 await response.prepare(request)
-                async for chunk in upstream_response.content.iter_any():
-                    if log_id:
-                        self._log_content("upstream_chunk", log_id, data=chunk.decode("utf-8", "replace"))
-                    await response.write(chunk)
-                await response.write_eof()
+                try:
+                    while True:
+                        chunk = await upstream_response.content.readany()
+                        if not chunk:
+                            break
+                        if log_id:
+                            self._log_content("upstream_chunk", log_id, data=chunk.decode("utf-8", "replace"))
+                        await response.write(chunk)
+                    await response.write_eof()
+                except ConnectionError:
+                    upstream_response.close()
+                    self._log_content("error", log_id, error="client disconnected")
+                except (asyncio.CancelledError, Exception):
+                    # Cancelled = client disconnected (handler_cancellation).
+                    upstream_response.close()
+                    raise
                 return response
         except aiohttp.ClientError as exc:
             self._log_content("error", log_id, error=_one_line(exc))
@@ -1080,41 +1127,53 @@ class TokenizedProxy:
             raise web.HTTPBadGateway(reason=f"upstream health failed: {_one_line(exc)}") from exc
 
     async def run(self) -> None:
-        runner = web.AppRunner(self.app)
+        # handler_cancellation: aiohttp cancels the request handler task as
+        # soon as the client connection dies — without it a closed client is
+        # only noticed when a write fails, and a non-streaming request would
+        # let llama-server finish a generation nobody is listening to.
+        runner = web.AppRunner(self.app, handler_cancellation=True)
         await runner.setup()
+
+        # Pid file: lets `down`/`up` find this daemon even when state.json was
+        # reset or proxy_pid was never persisted.
+        pid_file = self.state.state_file.parent / "proxy.pid"
+        pid_file.write_text(str(os.getpid()))
 
         sites: List[web.BaseSite] = []
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
         self.socket_path.unlink(missing_ok=True)
-        unix_site = web.UnixSite(runner, str(self.socket_path))
-        await unix_site.start()
-        sites.append(unix_site)
-        os.chmod(self.socket_path, 0o600)
-        print(f"proxy listening on unix socket {self.socket_path}")
-
-        if self.port:
-            tcp_site = web.TCPSite(
-                runner,
-                "127.0.0.1",
-                self.port,
-                reuse_address=True,
-            )
-            for attempt in range(10):
-                try:
-                    await tcp_site.start()
-                    break
-                except OSError as exc:
-                    if exc.errno == errno.EADDRINUSE and attempt < 9:
-                        print(f"port {self.port} in use, retrying in 0.5s (attempt {attempt + 1}/10)")
-                        await asyncio.sleep(0.5)
-                        continue
-                    raise
-            sites.append(tcp_site)
-            print(f"proxy listening on tcp 127.0.0.1:{self.port}")
-            self.state.local_port = self.port
-            self.state.save()
-
         try:
+            unix_site = web.UnixSite(runner, str(self.socket_path))
+            await unix_site.start()
+            sites.append(unix_site)
+            os.chmod(self.socket_path, 0o600)
+            print(f"proxy listening on unix socket {self.socket_path}")
+
+            if self.port:
+                tcp_site = web.TCPSite(
+                    runner,
+                    "127.0.0.1",
+                    self.port,
+                    reuse_address=True,
+                )
+                for attempt in range(10):
+                    try:
+                        await tcp_site.start()
+                        break
+                    except OSError as exc:
+                        if exc.errno == errno.EADDRINUSE and attempt < 9:
+                            print(f"port {self.port} in use, retrying in 0.5s (attempt {attempt + 1}/10)")
+                            await asyncio.sleep(0.5)
+                            continue
+                        raise
+                sites.append(tcp_site)
+                print(f"proxy listening on tcp 127.0.0.1:{self.port}")
+                # Reload before writing so a concurrent down/up isn't
+                # clobbered by this stale copy.
+                fresh = State.load(self.state.state_file)
+                fresh.local_port = self.port
+                fresh.save()
+
             while True:
                 await asyncio.sleep(3600)
         finally:
@@ -1122,6 +1181,7 @@ class TokenizedProxy:
                 await site.stop()
             await runner.cleanup()
             self.socket_path.unlink(missing_ok=True)
+            pid_file.unlink(missing_ok=True)
 
 
 async def _fetch_props_once(config: Config, state: State) -> Optional[Dict[str, Any]]:
@@ -1160,12 +1220,14 @@ async def _wait_for_upstream_health(
 
     Logs the failure reason periodically and re-establishes the SSH unix
     tunnel when it dies (the local socket path is removed by the tunnel
-    worker on connection loss).
+    worker on connection loss).  If the provider confirms the instance is
+    gone, gives up so the proxy exits instead of polling a dead host forever.
     """
     if proxy.session is None:
         return False
     last_log = 0.0
     last_err = ""
+    last_dead_check = 0.0
     while not server_task.done():
         err = ""
         try:
@@ -1181,6 +1243,17 @@ async def _wait_for_upstream_health(
             last_log = now
             last_err = err
             _logger.info("waiting for upstream /health: %s", err)
+
+        # A preempted/deleted instance never becomes healthy — confirm via the
+        # provider (double-checked, fail-open) and stop waiting.
+        if now - last_dead_check >= 60 and proxy.state.instance_id:
+            last_dead_check = now
+            dead = await asyncio.to_thread(
+                _common.confirm_instance_dead, proxy.config, proxy.state.instance_id
+            )
+            if dead:
+                _logger.error("upstream instance %s; giving up", dead)
+                return False
 
         if proxy.upstream_socket and not Path(proxy.upstream_socket).exists():
             _logger.warning("upstream socket %s gone; restarting SSH unix tunnel", proxy.upstream_socket)
@@ -1214,7 +1287,7 @@ async def _bootstrap_proxy(
         raise RuntimeError("proxy server did not start")
 
     if not await _wait_for_upstream_health(proxy, server_task):
-        raise RuntimeError("upstream /health did not become ready")
+        raise ProxyError("upstream /health did not become ready")
 
     props = await _fetch_props_once(config, state)
     chat_template: Optional[str] = None
@@ -1264,17 +1337,23 @@ async def run_proxy(config: Config, state: State) -> None:
     log_file = _configure_proxy_logging(config)
     _logger.info("proxy starting, logging to %s", log_file)
 
-    # Record the proxy pid so hostai down can stop it.
-    state.data["proxy_pid"] = os.getpid()
-    state.save()
+    # A second `hostai proxy` would unlink the running proxy's socket file and
+    # overwrite proxy_pid in state, orphaning the first daemon — refuse early.
+    existing_pid = _common.running_proxy_pid(state)
+    if existing_pid:
+        raise ProxyError(f"proxy already running (pid {existing_pid})")
 
     socket_path = Path(config.proxy.socket_path) if config.proxy.socket_path else _default_socket_path(state)
     port = config.proxy.port or config.ssh.local_port or 0
 
-    # Pre-register the upstream Unix socket path so the proxy can create its
-    # aiohttp app immediately.  The SSH tunnel (and remote socket) is set up
-    # concurrently below; the proxy returns 503 until the model is ready.
+    # Record the proxy pid so hostai down can stop it, and pre-register the
+    # upstream Unix socket path so the proxy can create its aiohttp app
+    # immediately (the SSH tunnel and remote socket are set up concurrently
+    # below; the proxy returns 503 until the model is ready).  Reload state
+    # first — the copy loaded at CLI entry may be stale by the time we write.
     upstream_socket = state.data.get("upstream_socket") or str(state.state_file.parent / "upstream.sock")
+    state = State.load(state.state_file)
+    state.data["proxy_pid"] = os.getpid()
     state.data["upstream_socket"] = upstream_socket
     state.save()
 

@@ -179,6 +179,154 @@ def test_wait_for_ssh_endpoint_offline(config, project_dir):
                     up._wait_for_ssh_endpoint(config, state, 10)
 
 
+def test_wait_for_ssh_endpoint_gone_after_seen(config, project_dir):
+    """An instance that vanishes mid-boot (preemption during image pull)
+    aborts the endpoint wait instead of polling until the timeout."""
+    state = State(project_dir / ".hostai-vast" / "state.json")
+    state.instance_id = 12345
+    inst = {"public_ipaddr": "203.0.113.1", "ports": {}, "actual_status": "loading"}
+    provider = mock.Mock()
+    # seen once, then gone — including the confirm poll inside
+    # _ensure_instance_alive
+    provider.get_instance.side_effect = [inst, None, None, None]
+    with mock.patch("hostai.commands.up._provider", return_value=provider):
+        with mock.patch("hostai.commands.up.time.sleep"):
+            with mock.patch("hostai.commands.up.time.monotonic", side_effect=iter(range(100))):
+                with pytest.raises(click.ClickException, match="lost during SSH endpoint wait"):
+                    up._wait_for_ssh_endpoint(config, state, 10)
+
+
+def test_wait_for_ssh_endpoint_tolerates_api_error(config, project_dir):
+    """A transient provider error must not abort (and thereby destroy) a
+    booting instance."""
+    state = State(project_dir / ".hostai-vast" / "state.json")
+    state.instance_id = 12345
+    provider = mock.Mock()
+    provider.get_instance.side_effect = [RuntimeError("api down"), _running_inst()]
+    with mock.patch("hostai.commands.up._provider", return_value=provider):
+        with mock.patch("hostai.commands.up.time.sleep"):
+            with mock.patch("hostai.commands.up.time.monotonic", side_effect=iter(range(100))):
+                up._wait_for_ssh_endpoint(config, state, 10)
+    assert state.ssh_url == "ssh://root@203.0.113.1:2222"
+
+
+def test_cleanup_instance_stops_local_helpers(config, project_dir):
+    """A failed provision must not orphan the local proxy daemon/tunnel."""
+    state = State(project_dir / ".hostai-vast" / "state.json")
+    state.instance_id = 12345
+    provider = mock.Mock()
+    with mock.patch("hostai.commands.up._provider", return_value=provider):
+        with mock.patch("hostai.commands.down._stop_proxy") as stop_proxy:
+            with mock.patch("hostai.commands.up.ssh.stop_tunnel") as stop_tunnel:
+                up._cleanup_instance(config, state, "test reason")
+    provider.destroy_instance.assert_called_once_with(12345)
+    stop_proxy.assert_called_once_with(state)
+    stop_tunnel.assert_called_once_with(state)
+
+
+def _running_inst(public_ip="203.0.113.1", host_port="2222"):
+    return {
+        "public_ipaddr": public_ip,
+        "ports": {"22/tcp": [{"HostPort": host_port}]},
+        "actual_status": "running",
+    }
+
+
+def test_instance_alive_gone(config, project_dir):
+    state = State(project_dir / ".hostai-vast" / "state.json")
+    state.instance_id = 12345
+    provider = mock.Mock()
+    provider.get_instance.return_value = None
+    with mock.patch("hostai.commands.up._provider", return_value=provider):
+        alive, reason = up._instance_alive(config, state)
+    assert alive is False
+    assert "no longer exists" in reason
+
+
+def test_instance_alive_dead_status(config, project_dir):
+    state = State(project_dir / ".hostai-vast" / "state.json")
+    state.instance_id = 12345
+    provider = mock.Mock()
+    provider.get_instance.return_value = {"actual_status": "stopped"}
+    with mock.patch("hostai.commands.up._provider", return_value=provider):
+        alive, reason = up._instance_alive(config, state)
+    assert alive is False
+    assert "stopped" in reason
+
+
+def test_instance_alive_stopped_not_dead_for_restart(config, project_dir):
+    state = State(project_dir / ".hostai-vast" / "state.json")
+    state.instance_id = 12345
+    provider = mock.Mock()
+    provider.get_instance.return_value = {"actual_status": "stopped"}
+    with mock.patch("hostai.commands.up._provider", return_value=provider):
+        alive, _ = up._instance_alive(config, state, stopped_is_dead=False)
+    assert alive is True
+
+
+def test_instance_alive_provider_error_is_alive(config, project_dir):
+    state = State(project_dir / ".hostai-vast" / "state.json")
+    state.instance_id = 12345
+    provider = mock.Mock()
+    provider.get_instance.side_effect = RuntimeError("api down")
+    with mock.patch("hostai.commands.up._provider", return_value=provider):
+        alive, _ = up._instance_alive(config, state)
+    assert alive is True
+
+
+def test_instance_alive_refreshes_ssh_url(config, project_dir):
+    state = State(project_dir / ".hostai-vast" / "state.json")
+    state.instance_id = 12345
+    state.ssh_url = "ssh://root@203.0.113.1:2222"
+    provider = mock.Mock()
+    provider.get_instance.return_value = _running_inst(host_port="3333")
+    with mock.patch("hostai.commands.up._provider", return_value=provider):
+        with mock.patch("hostai.commands.up._log"):
+            alive, _ = up._instance_alive(config, state)
+    assert alive is True
+    assert state.ssh_url == "ssh://root@203.0.113.1:3333"
+
+
+def test_ensure_instance_alive_raises_when_gone(config, project_dir):
+    state = State(project_dir / ".hostai-vast" / "state.json")
+    state.instance_id = 12345
+    provider = mock.Mock()
+    provider.get_instance.return_value = None
+    with mock.patch("hostai.commands.up._provider", return_value=provider):
+        with mock.patch("hostai.commands.up.time.sleep"):
+            with pytest.raises(click.ClickException, match="lost during TLS certificate delivery"):
+                up._ensure_instance_alive(config, state, "TLS certificate delivery")
+
+
+def test_ensure_instance_alive_confirmed_by_second_poll(config, project_dir):
+    """A single flaky 'gone' response does not abort."""
+    state = State(project_dir / ".hostai-vast" / "state.json")
+    state.instance_id = 12345
+    provider = mock.Mock()
+    provider.get_instance.side_effect = [None, _running_inst()]
+    with mock.patch("hostai.commands.up._provider", return_value=provider):
+        with mock.patch("hostai.commands.up.time.sleep"):
+            up._ensure_instance_alive(config, state, "TLS certificate delivery")
+
+
+def test_deliver_tls_cert_aborts_when_instance_gone(config, project_dir):
+    state = State(project_dir / ".hostai-vast" / "state.json")
+    state.instance_id = 12345
+    state.unsecure = False
+    state.ssh_url = "ssh://root@h:22"
+    tls_dir = project_dir / "tls"
+    tls_dir.mkdir()
+    provider = mock.Mock()
+    provider.get_instance.return_value = None
+    with mock.patch("hostai.commands.up.tls.ensure_local_tls_dir", return_value=tls_dir):
+        with mock.patch("hostai.commands.up.tls.cert_needs_regeneration", return_value=False):
+            with mock.patch("hostai.commands.up.tls.deliver_cert", return_value=False):
+                with mock.patch("hostai.commands.up._provider", return_value=provider):
+                    with mock.patch("hostai.commands.up.time.sleep"):
+                        with pytest.raises(click.ClickException, match="lost during TLS certificate delivery"):
+                            up._deliver_tls_cert(config, state, project_dir / "kh")
+
+
 def test_wait_for_api_ready(config, project_dir):
     state = State(project_dir / ".hostai-vast" / "state.json")
     client = mock.Mock()
@@ -314,7 +462,65 @@ def test_cmd_up_skip_machine(config, project_dir):
                                         obj=config,
                                     )
     assert result.exit_code == 0
-    assert select.call_args.kwargs["skip_machines"] == (42, 43)
+    assert select.call_args.kwargs["exclusions"].machines == (42, 43)
+
+
+def test_cmd_up_skip_offer_and_country(config, project_dir):
+    config.hostai.default_profile = "test"
+    runner = CliRunner()
+    with mock.patch("hostai.commands.up._resolve_client_port", return_value=18080):
+        with mock.patch(
+            "hostai.commands.up._resolve_profile", return_value=(mock.Mock(), _make_profile_mock(), _make_image_mock())
+        ):
+            with mock.patch("hostai.commands.up.image_for_profile", return_value="ghcr.io/test"):
+                with mock.patch("hostai.commands.up.market.resolved_disk_gb", return_value=35):
+                    with mock.patch("hostai.commands.up.market.build_search_query", return_value=("query", 1.0)):
+                        with mock.patch(
+                            "hostai.commands.up.market.select_offer",
+                            return_value={"id": 1, "dph_total": 0.5, "gpu_name": "A100", "machine_id": 99},
+                        ) as select:
+                            with mock.patch("hostai.commands.up.market.offer_summary", return_value="summary"):
+                                provider = mock.Mock()
+                                provider.name = "vast"
+                                with mock.patch("hostai.commands.up._provider", return_value=provider):
+                                    result = runner.invoke(
+                                        up.cmd_up,
+                                        [
+                                            "--skip-offer", "7",
+                                            "--skip-offer", "8",
+                                            "--skip-country", "de",
+                                            "--dry-run",
+                                        ],
+                                        obj=config,
+                                    )
+    assert result.exit_code == 0
+    exclusions = select.call_args.kwargs["exclusions"]
+    assert exclusions.offers == (7, 8)
+    assert exclusions.countries == ("de",)
+
+
+def test_cmd_up_offer_conflicts_with_skip_offer(config, project_dir):
+    config.hostai.default_profile = "test"
+    runner = CliRunner()
+    result = runner.invoke(up.cmd_up, ["--offer", "7", "--skip-offer", "7"], obj=config)
+    assert result.exit_code != 0
+    assert "conflicts with --skip-offer" in result.output
+
+
+def test_cmd_up_restart_ignores_skip_options(config, project_dir):
+    config.hostai.default_profile = "test"
+    runner = CliRunner()
+    with mock.patch("hostai.commands.up._do_restart") as restart:
+        result = runner.invoke(
+            up.cmd_up,
+            ["--restart", "--skip-machine", "1", "--skip-offer", "2", "--skip-country", "DE"],
+            obj=config,
+        )
+    assert result.exit_code == 0
+    restart.assert_called_once()
+    assert "--skip-machine is ignored" in result.output
+    assert "--skip-offer is ignored" in result.output
+    assert "--skip-country is ignored" in result.output
 
 
 def test_cmd_up_restart(config, project_dir):

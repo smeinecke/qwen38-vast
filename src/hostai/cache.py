@@ -157,6 +157,19 @@ def _rclone_env_script(config: Config) -> str:
     return "\n".join(lines)
 
 
+# An aborted `hostai up` can leave an orphaned prefetch still writing here;
+# refuse to overlap rather than interleave writes into current.bin.
+_PREFETCH_LOCK_SNIPPET = """
+if command -v flock >/dev/null 2>&1; then
+    exec 9>"$slot_dir/.prefetch.lock"
+    if ! flock -n 9; then
+        echo "[cache] another prefetch is still running; skipping" >&2
+        exit 1
+    fi
+fi
+"""
+
+
 def rclone_prefetch_script(config: Config, slot_dir: str, remote_dir: str) -> str:
     """Return a bash script that downloads current.bin/json via rclone.
 
@@ -178,6 +191,7 @@ slot_dir={shlex.quote(slot_dir)}
 remote_dir={shlex.quote(remote_dir)}
 mkdir -p "$slot_dir"
 chmod 700 "$slot_dir"
+{_PREFETCH_LOCK_SNIPPET}
 {env}
 remote_name={shlex.quote(remote_name)}
 success=0
@@ -191,14 +205,18 @@ trap cleanup EXIT
 
 # Determine the remote size of current.bin up-front for ETA projection.
 # Prefer rclone's stable JSON output; fall back to the text form, which
-# varies in case/suffix across versions (Bytes, Byte, bytes, ...).
+# varies in case/suffix across versions (Bytes, Byte, bytes, ...).  The
+# bounded rclone flags keep a dead/unreachable cache endpoint from stalling
+# on low-level retries for minutes.  (GNU `timeout` is intentionally not
+# used — some environments shadow it with non-coreutils binaries.)
+rclone_net="--contimeout=15s --timeout=30s --low-level-retries=2 --retries=1"
 total_bytes=""
-rclone_size_json=$(rclone size --json "$remote_name:$remote_dir/current.bin" 2>/dev/null) || true
+rclone_size_json=$(rclone size --json $rclone_net "$remote_name:$remote_dir/current.bin" 2>/dev/null) || true
 if [ -n "$rclone_size_json" ]; then
     total_bytes=$(echo "$rclone_size_json" | sed -n 's/.*"bytes"[[:space:]]*:[[:space:]]*\\([0-9]*\\).*/\\1/p' | head -1) || true
 fi
 if [ -z "$total_bytes" ] || [ "$total_bytes" -eq 0 ]; then
-    rclone_size_text=$(rclone size "$remote_name:$remote_dir/current.bin" 2>/dev/null) || true
+    rclone_size_text=$(rclone size $rclone_net "$remote_name:$remote_dir/current.bin" 2>/dev/null) || true
     if [ -n "$rclone_size_text" ]; then
         total_bytes=$(echo "$rclone_size_text" | tail -n 1 | grep -oE '\\([0-9]+ [a-zA-Z]+\\)' | grep -oE '[0-9]+' | head -1) || true
     fi
@@ -223,7 +241,7 @@ fi
 
 # Start current.bin download with a hard 5 minute rclone cap and in-place
 # writes (when supported) so we can observe the growing file size.
-rclone copyto $rclone_inplace $rclone_maxdur "$remote_name:$remote_dir/current.bin" "$slot_dir/current.bin" &
+rclone copyto $rclone_inplace $rclone_maxdur $rclone_net "$remote_name:$remote_dir/current.bin" "$slot_dir/current.bin" &
 pid=$!
 finished=1
 
@@ -268,8 +286,9 @@ if [ "$final_size" -ne "$total_bytes" ]; then
     exit 1
 fi
 
-# current.json is tiny; pull it best-effort.
-rclone copyto "$remote_name:$remote_dir/current.json" "$slot_dir/current.json" || true
+# current.json is tiny; pull it best-effort (bounded so a dead endpoint
+# cannot stall the tail of the script).
+rclone copyto $rclone_net "$remote_name:$remote_dir/current.json" "$slot_dir/current.json" || true
 chmod 600 "$slot_dir/current.bin" "$slot_dir/current.json" 2>/dev/null || true
 success=1
 echo ok
@@ -329,7 +348,7 @@ fi
 
 mkdir -p "$slot_dir"
 chmod 700 "$slot_dir"
-
+{_PREFETCH_LOCK_SNIPPET}
 # Start current.bin download.
 rsync -av -e "$rsync_ssh" "${{cache_user}}@${{cache_host}}:${{remote_dir}}/current.bin" "$slot_dir/.current.bin.part" < /dev/null &
 pid=$!

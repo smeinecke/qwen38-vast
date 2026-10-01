@@ -13,7 +13,7 @@ import statistics
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import click
 import pycountry
@@ -66,6 +66,128 @@ def _effective_dph(offer: Dict[str, Any]) -> float:
 
 def _normalized_gpu_name(offer: Dict[str, Any]) -> str:
     return re_normalize_gpu(str(offer.get("gpu_name", "")))
+
+
+def normalize_country_code(value: Any) -> str:
+    """Normalize a country code or name to an uppercase ISO alpha-2 code.
+
+    Two-letter inputs are returned uppercased.  Longer inputs are resolved via
+    exact ``pycountry`` lookups (alpha-3, name, official name, common name);
+    fuzzy matching is deliberately avoided because it maps garbage like ``xx``
+    to real countries.  Unresolvable values are returned uppercased so raw
+    provider locations (e.g. ``"local"``) still match literally.
+
+    Providers report ``geolocation`` as ``"Region/City, CC"`` (e.g.
+    ``"Arizona, US"``); the trailing comma-separated segment is the ISO
+    alpha-2 country code and takes precedence over resolving the full value.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if "," in raw:
+        raw = raw.rsplit(",", 1)[-1].strip() or raw
+    upper = raw.upper()
+    if len(upper) == 2:
+        return upper
+    # Iterating ``pycountry.countries`` is typed as ``Database`` in the stubs,
+    # so keep the lookup result untyped here.
+    country: Any = pycountry.countries.get(alpha_3=upper)
+    if country is None:
+        lowered = raw.casefold()
+        country = next(
+            (
+                c
+                for c in pycountry.countries
+                if lowered
+                in {getattr(c, attr, "").casefold() for attr in ("name", "official_name", "common_name")}
+            ),
+            None,
+        )
+    return country.alpha_2.upper() if country is not None else upper
+
+
+def offer_country_code(offer: Dict[str, Any]) -> str:
+    """Return the normalized alpha-2 country code for an offer, or ""."""
+    return normalize_country_code(offer.get("geolocation") or offer.get("location"))
+
+
+@dataclass(frozen=True)
+class OfferExclusions:
+    """Offers excluded from consideration (the ``--skip-*`` CLI options).
+
+    ``machines`` are Vast machine IDs (``machine_id``), ``offers`` are
+    offer/contract IDs (``id``/``ask_contract_id``), and ``countries`` are
+    ISO codes or country names (normalized at filter time).
+    """
+
+    machines: Tuple[int, ...] = ()
+    offers: Tuple[int, ...] = ()
+    countries: Tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "machines", tuple(self.machines))
+        object.__setattr__(self, "offers", tuple(self.offers))
+        object.__setattr__(self, "countries", tuple(self.countries))
+
+    def __bool__(self) -> bool:
+        return bool(self.machines or self.offers or self.countries)
+
+    def merged(self, other: "OfferExclusions") -> "OfferExclusions":
+        """Return a new exclusions object combining both sets, deduplicated."""
+        return OfferExclusions(
+            machines=tuple(dict.fromkeys([*self.machines, *other.machines])),
+            offers=tuple(dict.fromkeys([*self.offers, *other.offers])),
+            countries=tuple(dict.fromkeys([*self.countries, *other.countries])),
+        )
+
+    def describe(self) -> str:
+        """Short human-readable summary, e.g. ``machines [1], offers [2]``."""
+        parts = []
+        if self.machines:
+            parts.append(f"machines {sorted(self.machines)}")
+        if self.offers:
+            parts.append(f"offers {sorted(self.offers)}")
+        if self.countries:
+            parts.append(f"countries {sorted(self.countries)}")
+        return ", ".join(parts)
+
+    def cli_args(self) -> List[str]:
+        """Render as ``--skip-*`` argv fragments (e.g. for daemon respawning)."""
+        args: List[str] = []
+        for m in self.machines:
+            args += ["--skip-machine", str(m)]
+        for o in self.offers:
+            args += ["--skip-offer", str(o)]
+        for c in self.countries:
+            args += ["--skip-country", c]
+        return args
+
+    def to_state(self) -> Dict[str, Any]:
+        """Serialize into ``state.json`` keys."""
+        return {
+            "skip_machines": [int(m) for m in self.machines],
+            "skip_offers": [int(o) for o in self.offers],
+            "skip_countries": [str(c) for c in self.countries],
+        }
+
+    @classmethod
+    def from_state(cls, data: Dict[str, Any]) -> "OfferExclusions":
+        """Rebuild exclusions from the ``state.json`` keys ``to_state`` wrote."""
+
+        def _ints(key: str) -> Tuple[int, ...]:
+            out: List[int] = []
+            for value in data.get(key) or []:
+                try:
+                    out.append(int(value))
+                except (TypeError, ValueError):
+                    continue
+            return tuple(out)
+
+        return cls(
+            machines=_ints("skip_machines"),
+            offers=_ints("skip_offers"),
+            countries=tuple(str(c) for c in (data.get("skip_countries") or [])),
+        )
 
 
 def is_same_or_better_gpu(
@@ -506,18 +628,30 @@ def filter_eligible_offers(
     current_gpu: Optional[str] = None,
     profiles: Optional[Profiles] = None,
     ctx_size: Optional[int] = None,
-    skip_machines: Optional[Iterable[int]] = None,
+    exclusions: Optional[OfferExclusions] = None,
 ) -> List[Dict[str, Any]]:
     """Filter search results by price, specific id, hardware rank, and context.
 
-    ``skip_machines`` excludes every offer hosted on the given Vast machine
-    IDs (``machine_id``), e.g. a dedicated host that failed a previous boot.
+    ``exclusions`` drops offers on skipped machine IDs (e.g. a dedicated host
+    that failed a previous boot), offers with skipped offer/contract IDs, and
+    offers whose geolocation resolves to a skipped country.
     """
-    skipped = {str(m) for m in skip_machines} if skip_machines else set()
+    exclusions = exclusions or OfferExclusions()
+    skipped = {str(m) for m in exclusions.machines}
+    skipped_ids = {str(i) for i in exclusions.offers}
+    skipped_countries = {
+        c for c in (normalize_country_code(x) for x in exclusions.countries) if c
+    }
     matches: List[Dict[str, Any]] = []
     for o in offers:
         if skipped and str(o.get("machine_id")) in skipped:
             continue
+        if skipped_ids and (str(o.get("id")) in skipped_ids or str(o.get("ask_contract_id")) in skipped_ids):
+            continue
+        if skipped_countries:
+            geo = offer_country_code(o)
+            if geo and geo in skipped_countries:
+                continue
         if offer is not None:
             if str(o.get("id")) != str(offer) and str(o.get("ask_contract_id")) != str(offer):
                 continue
@@ -582,7 +716,7 @@ def select_offer(
     ctx_size: Optional[int] = None,
     session_seconds: Optional[int] = None,
     cache_state: Optional[str] = None,
-    skip_machines: Optional[Iterable[int]] = None,
+    exclusions: Optional[OfferExclusions] = None,
     verbose: bool = False,
 ) -> Dict[str, Any]:
     """Search, filter, and select the best offer for ``up`` or ``monitor``.
@@ -618,13 +752,13 @@ def select_offer(
         current_gpu=current_gpu,
         profiles=profiles,
         ctx_size=ctx_size,
-        skip_machines=skip_machines,
+        exclusions=exclusions,
     )
 
     if not matches:
         if offer is not None:
             raise click.ClickException(f"no matching offer for id {offer}")
-        suffix = f" (excluding machines {sorted(skip_machines)})" if skip_machines else ""
+        suffix = f" (excluding {exclusions.describe()})" if exclusions else ""
         raise click.ClickException(f"no matching offer at or below ${max_dph:.2f}/h{suffix}")
 
     if cache_state is None:

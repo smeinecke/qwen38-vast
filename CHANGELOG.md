@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-10-01
+
+- Added offer-exclusion options `--skip-offer` and `--skip-country` (repeatable), alongside the existing `--skip-machine`.
+  - `hostai up` accepts all three; `--skip-country` takes alpha-2/alpha-3 codes or country names (exact lookups only — no fuzzy matching).
+  - `--offer` combined with the same `--skip-offer` id fails fast with a conflict error; all `--skip-*` flags are ignored (with a warning) on `--restart`.
+  - `hostai monitor once|watch|start` accept the same flags; `monitor start` forwards them to the spawned `watch` daemon.
+  - Exclusions given to `up` are recorded in `state.json` (via `market.OfferExclusions`), so a running or auto-started monitor never recommends an offer/host the user already ruled out.
+  - Market layer: new `market.OfferExclusions` dataclass replaces the per-flag `skip_machines` kwarg on `filter_eligible_offers`/`select_offer` and adds offer-ID and country filtering.
+- Monitor output (`monitor once`/`watch`) now prints the candidate's location (`loc=...`).
+- Fixed `--skip-country` never matching real Vast offers: `geolocation` is reported as `"Region/City, CC"` (e.g. `"Arizona, US"`, `"Jiangsu, CN"`); the normalizer now extracts the trailing alpha-2 code.
+
 ## 2026-09-27
 
 - `hostai log` renders reasoning/thinking in italic at normal brightness instead of `bright_black`, which was too dark to read.

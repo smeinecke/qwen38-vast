@@ -7,7 +7,7 @@ import os
 import signal
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import click
 import requests
@@ -27,7 +27,38 @@ def _provider(config: Config):
     return get_provider(config)
 
 
-def _archive_session(config: Config, state: State, run_dir: Path, no_archive: bool) -> None:
+def _instance_remote_status(
+    config: Config, state: State
+) -> Tuple[bool, Optional[Dict[str, Any]], str]:
+    """Decide once whether remote SSH/API steps are worth attempting.
+
+    Returns ``(remote_ok, instance, reason)``.  ``remote_ok`` is False only
+    when the provider positively reports the instance as gone or terminal —
+    a preempted or already-destroyed instance turns every remote step into a
+    dead-timeout wait.  Provider errors fail open (``remote_ok=True``) so the
+    legacy bounded-timeout behaviour is preserved.
+    """
+    if not state.instance_id:
+        return False, None, "no instance id in state"
+    try:
+        instance = _provider(config).get_instance(state.instance_id)
+    except Exception:
+        return True, None, ""
+    reason = _common.instance_dead_reason(instance, api_ok=True)
+    if reason:
+        return False, instance, reason
+    return True, instance, ""
+
+
+def _archive_session(
+    config: Config,
+    state: State,
+    run_dir: Path,
+    no_archive: bool,
+    *,
+    instance: Optional[Dict[str, Any]] = None,
+    remote_ok: bool = True,
+) -> None:
     """Collect final telemetry before destroy/pause."""
     if no_archive or not run_dir:
         return
@@ -40,11 +71,15 @@ def _archive_session(config: Config, state: State, run_dir: Path, no_archive: bo
     state.save_metadata(run_dir, status="archiving")
 
     try:
-        instance = _provider(config).get_instance(state.instance_id) if state.instance_id else None
+        if instance is None and remote_ok and state.instance_id:
+            instance = _provider(config).get_instance(state.instance_id)
         if instance:
             (run_dir / "vast-final.json").write_text(json.dumps(instance, indent=2, default=str))
     except Exception:
         pass
+
+    if not remote_ok:
+        return
 
     try:
         client = api.LlamaClient(config, state)
@@ -91,12 +126,22 @@ def _client_log(run_dir: Path, message: str) -> None:
 
 def _stop_proxy(state: State) -> None:
     """Stop a proxy that was auto-started by `hostai up`."""
-    pid = state.data.get("proxy_pid")
+    pid_file = state.state_file.parent / "proxy.pid"
+    pid = _common.running_proxy_pid(state)
     if not pid:
-        return
-    try:
-        os.kill(pid, 0)
-    except (OSError, ProcessLookupError):
+        # Nothing verifiably ours is running — but warn if state recorded a
+        # pid that is alive and *not* a proxy (PID reuse is suspicious).
+        raw = state.data.get("proxy_pid")
+        if raw:
+            try:
+                os.kill(int(raw), 0)
+                click.echo(
+                    f"[down] pid {raw} is not a hostai proxy (stale state?); leaving it alone",
+                    err=True,
+                )
+            except (OSError, ProcessLookupError, TypeError, ValueError):
+                pass
+        pid_file.unlink(missing_ok=True)
         return
     click.echo(f"[down] stopping proxy (pid {pid})")
     os.kill(pid, signal.SIGTERM)
@@ -105,13 +150,15 @@ def _stop_proxy(state: State) -> None:
         try:
             os.kill(pid, 0)
         except (OSError, ProcessLookupError):
-            return
+            break
         time.sleep(0.2)
-    click.echo(f"[down] proxy did not stop; killing (pid {pid})", err=True)
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except (OSError, ProcessLookupError):
-        pass
+    else:
+        click.echo(f"[down] proxy did not stop; killing (pid {pid})", err=True)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+    pid_file.unlink(missing_ok=True)
 
 
 def _session_end_summary(duration: int, cost: float, outcome: str) -> str:
@@ -276,24 +323,41 @@ def down_instance(
 
     known_hosts = state.state_file.parent / "known_hosts"
 
-    _refresh_ssh_state(config, state)
+    # Check once whether the instance still exists before spending time on
+    # SSH-dependent steps (tunnel, slot cache, remote telemetry).  A gone or
+    # terminal instance turns each of those into a dead-timeout wait.
+    remote_ok, instance, inst_reason = _instance_remote_status(config, state)
+    if not remote_ok:
+        click.echo(
+            f"[down] instance {state.instance_id}: {inst_reason}; skipping remote steps",
+            err=True,
+        )
+    else:
+        _refresh_ssh_state(config, state, instance)
+
     # In tokenized-only mode the proxy owns the SSH unix-socket forward and is
     # itself the local API endpoint; a raw TCP tunnel would forward to the TLS
     # upstream socket, which the plain-HTTP proxy client cannot use.
     unix_upstream = bool(state.data.get("upstream_socket")) and not state.unsecure
-    if state.ssh_url and not unix_upstream:
+    if remote_ok and state.ssh_url and not unix_upstream:
         try:
-            ssh.ensure_tunnel(config, state)
+            # Best-effort telemetry only: a short budget is enough.  The
+            # default resolves to ssh.start_timeout (up to 20 min) spent
+            # waiting for a remote socket that may never appear while the
+            # model is still loading.
+            ssh.ensure_tunnel(config, state, timeout=30)
         except Exception as exc:
             click.echo(f"[down] WARNING: tunnel not available: {exc}", err=True)
 
-    slot_details = cache.save_and_upload_slot_cache(config, state, run_dir, no_cache, known_hosts)
+    slot_details = (
+        cache.save_and_upload_slot_cache(config, state, run_dir, no_cache, known_hosts) if remote_ok else None
+    )
 
     archive_start = time.monotonic()
-    _archive_session(config, state, run_dir, no_archive)
+    _archive_session(config, state, run_dir, no_archive, instance=instance, remote_ok=remote_ok)
     archive_duration = time.monotonic() - archive_start
 
-    if state.ssh_url and not skip_llama:
+    if remote_ok and state.ssh_url and not skip_llama:
         _stop_remote_model(state.ssh_url, known_hosts)
 
     _stop_proxy(state)

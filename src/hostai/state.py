@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -43,10 +44,15 @@ class State:
     def save(self) -> None:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         self.state_file.parent.chmod(0o700)
-        tmp = self.state_file.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(self._data, indent=2, ensure_ascii=False))
-        tmp.chmod(0o600)
-        tmp.replace(self.state_file)
+        # Unique per-process tmp name: two processes sharing a fixed tmp path
+        # could interleave writes and rename a torn JSON file into place.
+        tmp = self.state_file.with_name(f"{self.state_file.name}.tmp.{os.getpid()}")
+        try:
+            tmp.write_text(json.dumps(self._data, indent=2, ensure_ascii=False))
+            tmp.chmod(0o600)
+            tmp.replace(self.state_file)
+        finally:
+            tmp.unlink(missing_ok=True)
 
     def get(self, key: str, default: Any = None) -> Any:
         return self._data.get(key, default)
@@ -273,10 +279,13 @@ class State:
         run_dir.mkdir(parents=True, exist_ok=True)
         run_dir.chmod(0o700)
         path = run_dir / "metadata.json"
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(metadata, indent=2, ensure_ascii=False))
-        tmp.chmod(0o600)
-        tmp.replace(path)
+        tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+        try:
+            tmp.write_text(json.dumps(metadata, indent=2, ensure_ascii=False))
+            tmp.chmod(0o600)
+            tmp.replace(path)
+        finally:
+            tmp.unlink(missing_ok=True)
 
 
 def init_run_dir(runs_dir: Path, profile: str, run_id: Optional[str] = None) -> Path:

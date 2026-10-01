@@ -6,8 +6,8 @@ from unittest import mock
 
 from click.testing import CliRunner
 
+from hostai.commands import _common
 from hostai.commands.monitor import (
-    _monitor_is_running,
     _monitor_log_file,
     _monitor_pid_file,
     cmd_monitor_logs,
@@ -23,8 +23,8 @@ def test_monitor_pid_and_log_files(config):
 
 
 def test_monitor_is_running():
-    assert _monitor_is_running(os.getpid()) is True
-    assert _monitor_is_running(99999999) is False
+    assert _common.pid_is_running(os.getpid()) is True
+    assert _common.pid_is_running(99999999) is False
 
 
 def test_monitor_start(config):
@@ -33,8 +33,8 @@ def test_monitor_start(config):
     log_file.parent.mkdir(parents=True, exist_ok=True)
 
     fake_proc = mock.Mock(pid=12345)
-    with mock.patch("hostai.commands.monitor.subprocess.Popen", return_value=fake_proc) as popen:
-        with mock.patch("hostai.commands.monitor._hostai_executable", return_value="hostai"):
+    with mock.patch("hostai.commands._common.subprocess.Popen", return_value=fake_proc) as popen:
+        with mock.patch("hostai.commands._common.hostai_executable", return_value="hostai"):
             runner = CliRunner()
             result = runner.invoke(cmd_monitor_start, ["--profile", "test"], obj=config)
 
@@ -52,9 +52,10 @@ def test_monitor_start_already_running(config):
     pid_file.parent.mkdir(parents=True, exist_ok=True)
     pid_file.write_text("12345")
 
-    with mock.patch("hostai.commands.monitor._monitor_is_running", return_value=True):
-        runner = CliRunner()
-        result = runner.invoke(cmd_monitor_start, [], obj=config)
+    with mock.patch("os.kill"):
+        with mock.patch("hostai.commands.monitor._common.pid_cmdline_contains", return_value=True):
+            runner = CliRunner()
+            result = runner.invoke(cmd_monitor_start, [], obj=config)
 
     assert result.exit_code == 0
     assert "already running" in result.output
@@ -65,10 +66,11 @@ def test_monitor_stop(config):
     pid_file.parent.mkdir(parents=True, exist_ok=True)
     pid_file.write_text("12345")
 
-    with mock.patch("hostai.commands.monitor._monitor_is_running", side_effect=[True, False, False]):
-        with mock.patch("os.kill") as kill:
-            runner = CliRunner()
-            result = runner.invoke(cmd_monitor_stop, [], obj=config)
+    with mock.patch("hostai.commands._common.pid_is_running", side_effect=[True, False, False]):
+        with mock.patch("hostai.commands._common.pid_cmdline_contains", return_value=True):
+            with mock.patch("os.kill") as kill:
+                runner = CliRunner()
+                result = runner.invoke(cmd_monitor_stop, [], obj=config)
 
     assert result.exit_code == 0
     assert "stopped" in result.output
@@ -81,7 +83,7 @@ def test_monitor_stop_not_running(config):
     pid_file.parent.mkdir(parents=True, exist_ok=True)
     pid_file.write_text("12345")
 
-    with mock.patch("hostai.commands.monitor._monitor_is_running", return_value=False):
+    with mock.patch("hostai.commands._common.pid_is_running", return_value=False):
         runner = CliRunner()
         result = runner.invoke(cmd_monitor_stop, [], obj=config)
 
@@ -95,9 +97,10 @@ def test_monitor_status_running(config):
     pid_file.parent.mkdir(parents=True, exist_ok=True)
     pid_file.write_text("12345")
 
-    with mock.patch("hostai.commands.monitor._monitor_is_running", return_value=True):
-        runner = CliRunner()
-        result = runner.invoke(cmd_monitor_status, [], obj=config)
+    with mock.patch("os.kill"):
+        with mock.patch("hostai.commands.monitor._common.pid_cmdline_contains", return_value=True):
+            runner = CliRunner()
+            result = runner.invoke(cmd_monitor_status, [], obj=config)
 
     assert result.exit_code == 0
     assert "running (pid 12345)" in result.output
@@ -108,7 +111,7 @@ def test_monitor_status_stale(config):
     pid_file.parent.mkdir(parents=True, exist_ok=True)
     pid_file.write_text("99999999")
 
-    with mock.patch("hostai.commands.monitor._monitor_is_running", return_value=False):
+    with mock.patch("hostai.commands._common.pid_is_running", return_value=False):
         runner = CliRunner()
         result = runner.invoke(cmd_monitor_status, [], obj=config)
 

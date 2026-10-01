@@ -79,8 +79,8 @@ def fake_tokenizer():
     return _FakeTokenizer()
 
 
-async def run_proxy(config, running_state, fake_tokenizer, tmp_path, requests):
-    async with TestServer(await upstream_app(), host="127.0.0.1") as upstream:
+async def run_proxy(config, running_state, fake_tokenizer, tmp_path, requests, app_factory=upstream_app):
+    async with TestServer(await app_factory(), host="127.0.0.1") as upstream:
         running_state.local_port = upstream.port
         socket_path = tmp_path / "proxy.sock"
         proxy = TokenizedProxy(config, running_state, fake_tokenizer, socket_path, port=0)
@@ -330,3 +330,107 @@ def test_proxy_no_content_log_by_default(config, running_state, fake_tokenizer, 
 
     asyncio.run(run_proxy(config, running_state, fake_tokenizer, tmp_path, requests))
     assert not log_file.exists()
+
+
+def test_proxy_client_disconnect_aborts_upstream_stream(config, running_state, fake_tokenizer, tmp_path):
+    """A client that hangs up mid-SSE stream must abort upstream generation —
+    closing the upstream response is what tells llama-server to stop."""
+    running_state.unsecure = True
+    config.proxy.tokenized_only = True
+    config.model.model = "qwen-test"
+    flags = {"aborted": False}
+
+    async def endless_app():
+        app = web.Application()
+
+        async def completion(request):
+            response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream"})
+            await response.prepare(request)
+            try:
+                while True:
+                    await response.write(b'data: {"tokens": [1], "stop": false}\n\n')
+                    await asyncio.sleep(0.02)
+            except (ConnectionError, asyncio.CancelledError):
+                flags["aborted"] = True
+                raise
+
+        app.router.add_post("/completion", completion)
+        return app
+
+    async def requests(client):
+        resp = await client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 10,
+            "stream": True,
+        })
+        assert resp.status == 200
+        first = await resp.content.readany()
+        assert b"data:" in first
+        resp.close()
+        for _ in range(100):
+            if flags["aborted"]:
+                break
+            await asyncio.sleep(0.05)
+        assert flags["aborted"], "proxy did not abort upstream generation on client disconnect"
+
+    asyncio.run(run_proxy(config, running_state, fake_tokenizer, tmp_path, requests, app_factory=endless_app))
+
+
+def test_proxy_client_disconnect_aborts_nonstream(config, running_state, fake_tokenizer, tmp_path):
+    """Non-streaming: a client disconnect while llama-server is still
+    generating must close the upstream request too."""
+    running_state.unsecure = True
+    config.proxy.tokenized_only = True
+    config.model.model = "qwen-test"
+    flags = {"aborted": False}
+
+    async def slow_app():
+        app = web.Application()
+
+        async def completion(request):
+            try:
+                for _ in range(200):
+                    transport = request.transport
+                    if transport is None or transport.is_closing():
+                        flags["aborted"] = True
+                        return web.Response(status=200)
+                    await asyncio.sleep(0.05)
+                return web.json_response({"tokens": [1], "stop": True})
+            except (asyncio.CancelledError, ConnectionError):
+                # Upstream connection dropped = generation aborted.
+                flags["aborted"] = True
+                raise
+
+        app.router.add_post("/completion", completion)
+        return app
+
+    async def requests(client):
+        # The upstream only responds after ~10s, so drive the request on a
+        # dedicated force_close session and drop the socket while the proxy
+        # is still waiting for the response body.
+        import aiohttp as _aiohttp
+
+        session = _aiohttp.ClientSession(connector=_aiohttp.TCPConnector(force_close=True))
+        try:
+            task = asyncio.ensure_future(
+                session.post(str(client.make_url("/v1/chat/completions")), json={
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 10,
+                    "stream": False,
+                })
+            )
+            await asyncio.sleep(0.2)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        finally:
+            await session.close()
+        for _ in range(100):
+            if flags["aborted"]:
+                break
+            await asyncio.sleep(0.05)
+        assert flags["aborted"], "proxy did not abort non-stream upstream request on client disconnect"
+
+    asyncio.run(run_proxy(config, running_state, fake_tokenizer, tmp_path, requests, app_factory=slow_app))

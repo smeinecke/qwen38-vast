@@ -5,6 +5,8 @@ from pathlib import Path
 from unittest import mock
 from unittest.mock import AsyncMock
 
+import pytest
+
 from hostai import ssh
 from hostai.state import State
 
@@ -200,6 +202,37 @@ def test_wait_for_ssh_returns_true(tmp_path):
     result = mock.Mock(returncode=0, stdout="ok", stderr="")
     with mock.patch("asyncssh.connect", _make_connect(result)):
         assert ssh.wait_for_ssh("ssh://root@host:22", known_hosts=tmp_path / "kh", timeout=3) is True
+
+
+def test_wait_for_ssh_alive_check_aborts(tmp_path):
+    def _gone():
+        raise RuntimeError("instance gone")
+
+    with mock.patch("asyncssh.connect", _make_connect(fail=True)):
+        with mock.patch("hostai.ssh.time.sleep"):
+            with pytest.raises(RuntimeError, match="instance gone"):
+                ssh.wait_for_ssh(
+                    "ssh://root@host:22",
+                    known_hosts=tmp_path / "kh",
+                    timeout=30,
+                    quiet=True,
+                    alive_check=_gone,
+                )
+
+
+def test_wait_for_ssh_alive_check_not_called_when_reachable(tmp_path):
+    calls = []
+    result = mock.Mock(returncode=0, stdout="ok", stderr="")
+    with mock.patch("asyncssh.connect", _make_connect(result)):
+        ok = ssh.wait_for_ssh(
+            "ssh://root@host:22",
+            known_hosts=tmp_path / "kh",
+            timeout=3,
+            quiet=True,
+            alive_check=lambda: calls.append(1),
+        )
+    assert ok is True
+    assert calls == []
 
 
 def test_scp_to_success(tmp_path):
