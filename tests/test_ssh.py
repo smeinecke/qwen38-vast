@@ -192,6 +192,14 @@ def test_run_remote_exception():
     assert cp.returncode == 1
 
 
+def test_run_remote_exception_names_class_when_message_empty(tmp_path):
+    """Timeouts produce an empty str(exc); stderr must still name the cause."""
+    with mock.patch("hostai.ssh._run_coro", side_effect=TimeoutError()):
+        cp = ssh.run_remote("ssh://root@host:22", "ls", known_hosts=tmp_path / "kh")
+    assert cp.returncode == 1
+    assert cp.stderr == "TimeoutError"
+
+
 def test_is_ssh_reachable_true():
     result = mock.Mock(returncode=0, stdout="ok", stderr="")
     with mock.patch("asyncssh.connect", _make_connect(result)):

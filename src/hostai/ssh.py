@@ -234,11 +234,14 @@ def run_remote(
     try:
         return _run_coro(_run_remote(host, port, user, command, input_data, timeout, known_hosts, identity))
     except Exception as exc:
+        # str(exc) is empty for e.g. asyncio.TimeoutError; always name the
+        # exception class so callers never surface a blank error message.
+        detail = str(exc)
         return CompletedProcess(
             args=command,
             returncode=1,
             stdout=None,
-            stderr=str(exc),
+            stderr=f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__,
         )
 
 

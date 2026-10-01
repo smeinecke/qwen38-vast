@@ -1632,7 +1632,8 @@ def _do_fresh_core(
         timeout=30,
     )
     if result.returncode != 0:
-        raise click.ClickException(f"remote llama-server preflight failed: {result.stderr}")
+        detail = (result.stderr or result.stdout or "no output").strip()
+        raise click.ClickException(f"remote llama-server preflight failed (rc={result.returncode}): {detail}")
 
     state.data["cuda_arch"] = image.cuda_arch
     client_base_url, cache_remote, cache_enabled = _start_instance_runtime(
