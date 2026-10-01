@@ -2,6 +2,14 @@
 
 ## 2026-10-01
 
+- Expanded cheap single-GPU coverage after a Vast market scan (all reuse existing images):
+  - New `turing` image (SM75) + `turing-128k` profile for the Quadro RTX 8000 48 GB — roughly V100 money (~$0.26/h) with 1.4x the VRAM. Built on the default CUDA 12.8 bases (Turing is still supported there; only Volta needs the 12.2 pin).
+  - New `5000ada-128k` profile (SM89 `ada` image) for the 32 GB Ada value tier: RTX 5000 Ada (~$0.34/h) and modded RTX 4080S 32 GB. Same ctx/cache settings as `5090-128k`, which proves 128k fits in ~32 GB.
+  - `a100-128k` now also matches `A100_PCIE` offers (~$0.42/h) in addition to `A100_SXM4`.
+  - `blackwell-128k` now also matches `RTX_PRO_4500` (32 GB, ~$0.37/h) and `RTX_PRO_5000` (48 GB).
+  - The 48 GB Ada profiles (`ada-64k`/`ada-128k`/`ada-256k`) now also match `RTX_4090` 48 GB modded variants; the `gpu_ram>=48` floor keeps stock 24 GB 4090s out.
+- Fixed all profile queries using `num_gpus>=1`: now `num_gpus=1`. `llama-server` runs `--split-mode none` on a single GPU, so multi-GPU listings only billed idle cards, and `gpu_ram` reporting on multi-GPU offers is ambiguous for the VRAM floor.
+- `monitor_hardware.gpu_ranks` gained entries for the new GPUs (Q RTX 8000, RTX 5000 Ada, RTX 4080S, RTX PRO 4500/5000) plus the previously unranked CMP 170HX, A100 PCIE and A100 SXM4 so `same_or_better` monitoring covers every profiled card.
 - Added offer-exclusion options `--skip-offer` and `--skip-country` (repeatable), alongside the existing `--skip-machine`.
   - `hostai up` accepts all three; `--skip-country` takes alpha-2/alpha-3 codes or country names (exact lookups only — no fuzzy matching).
   - `--offer` combined with the same `--skip-offer` id fails fast with a conflict error; all `--skip-*` flags are ignored (with a warning) on `--restart`.

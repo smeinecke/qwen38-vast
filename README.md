@@ -239,16 +239,17 @@ said success" from real avoided prompt processing.
 `profiles.json` is the single editable configuration file for architectures,
 context defaults and Vast search queries.
 
-There are six compiled CUDA images:
+There are seven compiled CUDA images:
 
 | Image name | CUDA | Platform | Stable GHCR tag | GPUs |
 |---|---|---|---:|---|
 | `a6000` | SM86 | `linux/amd64` | `:a6000` | RTX A6000, A40 |
-| `ada` | SM89 | `linux/amd64` | `:ada-128k` | RTX 4090, RTX 6000 Ada, L40/L40S, RTX 5880 Ada |
-| `blackwell` | SM120 | `linux/amd64` | `:blackwell-128k` | RTX 5090, RTX PRO 6000 Blackwell |
-| `ga100` | SM80 | `linux/amd64` | `:ga100` | NVIDIA A100 SXM4, unlocked CMP 170HX |
+| `ada` | SM89 | `linux/amd64` | `:ada-128k` | RTX 4090 (incl. 48 GB mods), RTX 6000 Ada, RTX 5000 Ada, RTX 4080S 32 GB, L40/L40S, RTX 5880 Ada |
+| `blackwell` | SM120 | `linux/amd64` | `:blackwell-128k` | RTX 5090, RTX PRO 4500/5000/6000 Blackwell |
+| `ga100` | SM80 | `linux/amd64` | `:ga100` | NVIDIA A100 SXM4/PCIe, unlocked CMP 170HX |
 | `gb10` | SM121 | `linux/arm64` | `:gb10` | NVIDIA GB10 / Grace Blackwell |
 | `v100` | SM70 | `linux/amd64` | `:v100` | Tesla V100 |
+| `turing` | SM75 | `linux/amd64` | `:turing` | Quadro RTX 8000 |
 
 Runtime profiles can reuse one compiled image. The included profiles are:
 
@@ -261,23 +262,28 @@ Runtime profiles can reuse one compiled image. The included profiles are:
 | `ampere-value-128k` | `:a6000` | 131,072 | cheapest RTX A6000 or A40 |
 | `a6000-256k` | `:a6000` | 262,144 | exact RTX A6000, full native-context test profile |
 | `ampere-value-256k` | `:a6000` | 262,144 | RTX A6000 or A40, full native-context test profile |
-| `ada-64k` | `:ada-128k` | 65,536 | 48 GB Ada-class (6000 Ada/L40/L40S/5880 Ada) |
-| `ada-128k` | `:ada-128k` | 131,072 | 48 GB Ada-class (6000 Ada/L40/L40S/5880 Ada) |
+| `ada-64k` | `:ada-128k` | 65,536 | 48 GB Ada-class (6000 Ada/L40/L40S/5880 Ada/4090-48G) |
+| `ada-128k` | `:ada-128k` | 131,072 | 48 GB Ada-class (6000 Ada/L40/L40S/5880 Ada/4090-48G) |
 | `ada-256k` | `:ada-128k` | 262,144 | 48 GB Ada-class, full native-context test profile |
+| `5000ada-128k` | `:ada-128k` | 131,072 | 32 GB Ada value option (RTX 5000 Ada, RTX 4080S 32 GB) |
 | `5090-64k` | `:blackwell-128k` | 65,536 | exact RTX 5090 |
 | `5090-128k` | `:blackwell-128k` | 131,072 | exact RTX 5090 |
-| `blackwell-128k` | `:blackwell-128k` | 131,072 | RTX 5090 or RTX PRO 6000 |
+| `blackwell-128k` | `:blackwell-128k` | 131,072 | RTX 5090 or RTX PRO 4500/5000/6000 |
 | `blackwell-256k` | `:blackwell-128k` | 262,144 | exact RTX PRO 6000, 96 GB |
 | `pro6000-256k` | `:blackwell-128k` | 262,144 | RTX PRO 6000 family (WS/S), 96 GB |
-| `a100-128k` | `:ga100` | 131,072 | A100 SXM4 40 GB, fast single-GPU 128k option |
+| `a100-128k` | `:ga100` | 131,072 | A100 SXM4/PCIe 40 GB, fast single-GPU 128k option |
 | `cmp170hx-256k` | `:ga100` | 262,144 | unlocked CMP 170HX 64 GB, rejects <60 GB VRAM |
 | `gb10-128k` | `:gb10` | 131,072 | GB10 / Grace Blackwell / ARM64, 128k test/completeness |
 | `gb10-256k` | `:gb10` | 262,144 | GB10 / Grace Blackwell / ~119 GB unified / ARM64 / sm121 |
 | `v100-128k` | `:v100` | 131,072 | Tesla V100 |
+| `turing-128k` | `:turing` | 131,072 | Quadro RTX 8000 48 GB, cheapest alternative to V100 |
 
 `256k` means the model's full 262,144-token native context. The 256k runtime
 profiles reuse the existing SM86/SM89/SM120 images and therefore do not add
-CUDA builds; `v100-128k` uses the dedicated `:v100` image. The 48 GB 256k
+CUDA builds; `v100-128k` uses the dedicated `:v100` image and `turing-128k`
+the dedicated `:turing` (SM75) image. All queries require `num_gpus=1` because
+`llama-server` runs `--split-mode none` on a single GPU — renting multi-GPU
+listings would only bill idle cards. The 48 GB 256k
 profiles are deliberately explicit test profiles: actual headroom still depends
 on the selected model, KV-cache type and FastMTP configuration. The exact
 `blackwell-256k` profile is the conservative 256k Blackwell choice; the broader
