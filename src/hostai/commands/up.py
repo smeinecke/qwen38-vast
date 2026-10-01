@@ -159,9 +159,7 @@ def cmd_up(
     if not chosen_profile:
         raise click.ClickException("no profile specified and no default profile configured")
     _validate_up_options(local_port, max_price, bid, scoring_mode)
-    exclusions = market.OfferExclusions(
-        machines=skip_machines, offers=skip_offers, countries=skip_countries
-    )
+    exclusions = market.OfferExclusions(machines=skip_machines, offers=skip_offers, countries=skip_countries)
     if offer is not None and offer in exclusions.offers:
         raise click.ClickException(f"--offer {offer} conflicts with --skip-offer {offer}")
 

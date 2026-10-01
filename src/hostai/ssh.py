@@ -529,7 +529,9 @@ def _tunnel_thread_runner(
 ) -> None:
     _run_in_thread_loop(
         loop,
-        _start_tunnel_worker(user, host, port, local_port, remote_dest, identity, connect_timeout, ready, stop, outcome),
+        _start_tunnel_worker(
+            user, host, port, local_port, remote_dest, identity, connect_timeout, ready, stop, outcome
+        ),
     )
 
 

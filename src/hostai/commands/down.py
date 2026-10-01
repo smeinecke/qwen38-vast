@@ -27,9 +27,7 @@ def _provider(config: Config):
     return get_provider(config)
 
 
-def _instance_remote_status(
-    config: Config, state: State
-) -> Tuple[bool, Optional[Dict[str, Any]], str]:
+def _instance_remote_status(config: Config, state: State) -> Tuple[bool, Optional[Dict[str, Any]], str]:
     """Decide once whether remote SSH/API steps are worth attempting.
 
     Returns ``(remote_ok, instance, reason)``.  ``remote_ok`` is False only

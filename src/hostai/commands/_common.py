@@ -36,9 +36,7 @@ def _provider(config: Config):
     return get_provider(config)
 
 
-def refresh_ssh_state(
-    config: Config, state: State, instance: Optional[Dict[str, Any]] = None
-) -> bool:
+def refresh_ssh_state(config: Config, state: State, instance: Optional[Dict[str, Any]] = None) -> bool:
     """Refresh SSH endpoint fields from the provider.
 
     ``instance`` may carry a recently fetched provider response to avoid a

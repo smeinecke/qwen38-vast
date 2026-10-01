@@ -98,8 +98,7 @@ def normalize_country_code(value: Any) -> str:
             (
                 c
                 for c in pycountry.countries
-                if lowered
-                in {getattr(c, attr, "").casefold() for attr in ("name", "official_name", "common_name")}
+                if lowered in {getattr(c, attr, "").casefold() for attr in ("name", "official_name", "common_name")}
             ),
             None,
         )
@@ -639,9 +638,7 @@ def filter_eligible_offers(
     exclusions = exclusions or OfferExclusions()
     skipped = {str(m) for m in exclusions.machines}
     skipped_ids = {str(i) for i in exclusions.offers}
-    skipped_countries = {
-        c for c in (normalize_country_code(x) for x in exclusions.countries) if c
-    }
+    skipped_countries = {c for c in (normalize_country_code(x) for x in exclusions.countries) if c}
     matches: List[Dict[str, Any]] = []
     for o in offers:
         if skipped and str(o.get("machine_id")) in skipped:
