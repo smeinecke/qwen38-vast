@@ -434,3 +434,127 @@ def test_proxy_client_disconnect_aborts_nonstream(config, running_state, fake_to
         assert flags["aborted"], "proxy did not abort non-stream upstream request on client disconnect"
 
     asyncio.run(run_proxy(config, running_state, fake_tokenizer, tmp_path, requests, app_factory=slow_app))
+
+
+def _closed_port() -> int:
+    """Return a TCP port that refuses connections."""
+    import socket
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def test_proxy_chat_upstream_unreachable_returns_502(config, running_state, fake_tokenizer, tmp_path):
+    """A dead upstream must surface as 502, not a bare 500 traceback."""
+    running_state.unsecure = True
+    config.proxy.tokenized_only = True
+
+    async def scenario():
+        running_state.local_port = _closed_port()
+        proxy = TokenizedProxy(config, running_state, fake_tokenizer, tmp_path / "proxy.sock", port=0)
+        proxy.ready = True
+        async with TestServer(proxy.app, host="127.0.0.1") as proxy_server:
+            async with TestClient(proxy_server) as client:
+                resp = await client.post("/v1/chat/completions", json={
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 10,
+                })
+                assert resp.status == 502
+                assert "upstream unavailable" in resp.reason
+
+    asyncio.run(scenario())
+
+
+def _make_supervised_proxy(config, running_state, fake_tokenizer, tmp_path):
+    """A TokenizedProxy with a live aiohttp session, ready for supervisor tests."""
+    proxy = TokenizedProxy(config, running_state, fake_tokenizer, tmp_path / "proxy.sock", port=0)
+    proxy.ready = True
+    return proxy
+
+
+def test_supervisor_drops_and_recovers_ready(config, running_state, fake_tokenizer, tmp_path):
+    """Steady-state supervision marks the proxy not-ready on upstream failure and back."""
+    from unittest import mock
+
+    import aiohttp as _aiohttp
+
+    from hostai.proxy import _upstream_supervisor
+
+    running_state.unsecure = True
+    healthy = {"up": False}
+
+    async def app():
+        async def health(request):
+            return web.Response(status=200 if healthy["up"] else 503)
+
+        app = web.Application()
+        app.router.add_get("/health", health)
+        return app
+
+    async def scenario():
+        async with TestServer(await app(), host="127.0.0.1") as upstream:
+            proxy = _make_supervised_proxy(config, running_state, fake_tokenizer, tmp_path)
+            proxy.upstream = f"http://127.0.0.1:{upstream.port}"
+            proxy.upstream_socket = None
+            proxy.session = _aiohttp.ClientSession(timeout=_aiohttp.ClientTimeout(total=2))
+            server_task = asyncio.create_task(asyncio.sleep(3600))
+            with mock.patch(
+                "hostai.commands._common.confirm_instance_dead", return_value=None
+            ), mock.patch("hostai.proxy.ssh._tunnel_is_running", return_value=True):
+                supervisor = asyncio.create_task(_upstream_supervisor(proxy, server_task, interval=0.05))
+                try:
+                    # Two consecutive failures are required before unready.
+                    for _ in range(100):
+                        if not proxy.ready:
+                            break
+                        await asyncio.sleep(0.05)
+                    assert proxy.ready is False
+
+                    healthy["up"] = True
+                    for _ in range(100):
+                        if proxy.ready:
+                            break
+                        await asyncio.sleep(0.05)
+                    assert proxy.ready is True
+                finally:
+                    supervisor.cancel()
+                    server_task.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_supervisor_recreates_missing_unix_tunnel(config, running_state, fake_tokenizer, tmp_path):
+    """A vanished upstream.sock must trigger ensure_unix_tunnel post-bootstrap."""
+    from unittest import mock
+
+    import aiohttp as _aiohttp
+
+    from hostai.proxy import _upstream_supervisor
+
+    running_state.unsecure = True
+    running_state.data["upstream_socket"] = str(tmp_path / "missing.sock")
+
+    async def scenario():
+        async with TestServer(await upstream_app(), host="127.0.0.1") as upstream:
+            proxy = _make_supervised_proxy(config, running_state, fake_tokenizer, tmp_path)
+            proxy.upstream = f"http://127.0.0.1:{upstream.port}"
+            proxy.session = _aiohttp.ClientSession(timeout=_aiohttp.ClientTimeout(total=2))
+            server_task = asyncio.create_task(asyncio.sleep(3600))
+            with mock.patch(
+                "hostai.ssh.ensure_unix_tunnel", return_value=str(proxy.upstream_socket)
+            ) as ensure:
+                supervisor = asyncio.create_task(_upstream_supervisor(proxy, server_task, interval=0.05))
+                try:
+                    for _ in range(100):
+                        if ensure.called:
+                            break
+                        await asyncio.sleep(0.05)
+                    assert ensure.called
+                finally:
+                    supervisor.cancel()
+                    server_task.cancel()
+
+    asyncio.run(scenario())

@@ -640,10 +640,14 @@ class TokenizedProxy:
 
         payload = self.build_completion_payload(token_ids, max_tokens, temperature, stream, body)
 
-        upstream_response = await self.session.post(
-            f"{self.upstream}/completion",
-            json=payload,
-        )
+        try:
+            upstream_response = await self.session.post(
+                f"{self.upstream}/completion",
+                json=payload,
+            )
+        except aiohttp.ClientError as exc:
+            self._log_content("error", req_id, error=f"upstream connect: {_one_line(exc)}")
+            raise web.HTTPBadGateway(reason=f"upstream unavailable: {_one_line(exc)}") from exc
 
         if upstream_response.status != 200:
             text = await upstream_response.text()
@@ -660,7 +664,9 @@ class TokenizedProxy:
         )
         try:
             if stream:
-                return await self._stream_chat(request, upstream_response, stop_strings, expect_reasoning, tools, req_id)
+                return await self._stream_chat(
+                    request, upstream_response, stop_strings, expect_reasoning, tools, req_id
+                )
             return await self._complete_chat(upstream_response, len(token_ids), stop_strings, tools, req_id)
         except (asyncio.CancelledError, ConnectionError):
             # Client went away (handler_cancellation) or the downstream write
@@ -1248,9 +1254,7 @@ async def _wait_for_upstream_health(
         # provider (double-checked, fail-open) and stop waiting.
         if now - last_dead_check >= 60 and proxy.state.instance_id:
             last_dead_check = now
-            dead = await asyncio.to_thread(
-                _common.confirm_instance_dead, proxy.config, proxy.state.instance_id
-            )
+            dead = await asyncio.to_thread(_common.confirm_instance_dead, proxy.config, proxy.state.instance_id)
             if dead:
                 _logger.error("upstream instance %s; giving up", dead)
                 return False
@@ -1267,6 +1271,82 @@ async def _wait_for_upstream_health(
     # The server task died (likely a startup failure); re-raise its exception.
     await server_task
     return False
+
+
+async def _probe_upstream_health(proxy: TokenizedProxy, timeout: float = 10.0) -> bool:
+    """Return True when upstream ``/health`` answers 200 within *timeout*."""
+    if proxy.session is None:
+        return False
+    try:
+        async with proxy.session.get(
+            f"{proxy.upstream}/health", timeout=aiohttp.ClientTimeout(total=timeout)
+        ) as response:
+            return response.status == 200
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        return False
+
+
+async def _upstream_supervisor(
+    proxy: TokenizedProxy,
+    server_task: asyncio.Task,
+    interval: float = 5.0,
+) -> None:
+    """Keep the upstream reachable after bootstrap marked the proxy ready.
+
+    The SSH tunnel worker removes the local socket when the remote sshd
+    restarts, and post-bootstrap nothing recreated it — every request then
+    failed with a bare 500 forever.  This loop re-establishes the tunnel,
+    gates ``proxy.ready`` on upstream /health (clients see a clean 503
+    while the model restarts), and stops the proxy once the provider
+    confirms the instance is gone.
+    """
+    consecutive_failures = 0
+    last_dead_check = 0.0
+    while not server_task.done():
+        healthy = await _probe_upstream_health(proxy)
+        if healthy:
+            if not proxy.ready:
+                proxy.ready = True
+                _logger.info("upstream /health recovered; marking proxy ready")
+            consecutive_failures = 0
+        else:
+            consecutive_failures += 1
+            if consecutive_failures >= 2 and proxy.ready:
+                proxy.ready = False
+                _logger.warning("upstream /health failing; marking proxy not ready")
+
+        if proxy.upstream_socket:
+            socket_alive = Path(proxy.upstream_socket).exists() and await asyncio.to_thread(
+                ssh._unix_socket_is_open, proxy.upstream_socket, 3
+            )
+            if not socket_alive:
+                _logger.warning("upstream socket %s gone; restarting SSH unix tunnel", proxy.upstream_socket)
+                try:
+                    await asyncio.to_thread(ssh.ensure_unix_tunnel, proxy.config, proxy.state)
+                    _logger.info("SSH unix tunnel re-established on %s", proxy.upstream_socket)
+                except Exception as exc:
+                    _logger.error("SSH unix tunnel restart failed: %s", exc)
+        elif proxy.state.local_port and not ssh._tunnel_is_running(proxy.state):
+            _logger.warning("SSH TCP tunnel on :%s down; restarting", proxy.state.local_port)
+            try:
+                await asyncio.to_thread(ssh.ensure_tunnel, proxy.config, proxy.state)
+                _logger.info("SSH TCP tunnel re-established on :%s", proxy.state.local_port)
+            except Exception as exc:
+                _logger.error("SSH TCP tunnel restart failed: %s", exc)
+
+        # A preempted/deleted instance never recovers — stop the proxy so it
+        # exits instead of serving 503s forever.  Only poll the provider while
+        # the upstream is actually failing.
+        now = time.monotonic()
+        if not healthy and now - last_dead_check >= 60 and proxy.state.instance_id:
+            last_dead_check = now
+            dead = await asyncio.to_thread(_common.confirm_instance_dead, proxy.config, proxy.state.instance_id)
+            if dead:
+                _logger.error("upstream instance %s; stopping proxy", dead)
+                server_task.cancel()
+                return
+
+        await asyncio.sleep(interval)
 
 
 async def _bootstrap_proxy(
@@ -1388,4 +1468,14 @@ async def run_proxy(config: Config, state: State) -> None:
             pass
         raise
 
-    await server_task
+    supervisor = asyncio.create_task(_upstream_supervisor(proxy, server_task))
+    try:
+        await server_task
+    except asyncio.CancelledError:
+        pass  # supervisor stopped the server (upstream instance confirmed gone)
+    finally:
+        supervisor.cancel()
+        try:
+            await supervisor
+        except asyncio.CancelledError:
+            pass

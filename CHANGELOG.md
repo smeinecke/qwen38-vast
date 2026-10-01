@@ -18,6 +18,8 @@
   - Market layer: new `market.OfferExclusions` dataclass replaces the per-flag `skip_machines` kwarg on `filter_eligible_offers`/`select_offer` and adds offer-ID and country filtering.
 - Monitor output (`monitor once`/`watch`) now prints the candidate's location (`loc=...`).
 - Fixed `--skip-country` never matching real Vast offers: `geolocation` is reported as `"Region/City, CC"` (e.g. `"Arizona, US"`, `"Jiangsu, CN"`); the normalizer now extracts the trailing alpha-2 code.
+- `hostai proxy` now self-heals after the SSH upstream tunnel dies: a steady-state supervisor re-establishes the unix (or TCP) tunnel, flips `ready` so clients get a clean 503 while the model restarts instead of a bare 500, and exits once the provider confirms the instance is gone. `_chat` also maps upstream connect failures to 502 instead of an unhandled 500.
+- `ssh.run_remote` reports the exception class name when `str(exc)` is empty (e.g. `TimeoutError`), and the `up` llama-server preflight error now shows the return code and falls back to stdout.
 
 ## 2026-09-27
 
