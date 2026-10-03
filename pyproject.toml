@@ -46,6 +46,16 @@ dev = [
     "xenon>=0.9.3",
 ]
 
+[tool.uv]
+# vastai pins cryptography==49.0.0 and pillow==12.2.0 exactly (even in 1.8.3),
+# which keeps known-vulnerable versions in the lockfile (13 Pillow CVEs fixed
+# in 12.3.0, 1 cryptography CVE fixed in 50.0.0). borb only needs
+# pillow>=7.1.0 / cryptography>=37.0.4, so overriding is safe.
+override-dependencies = [
+    "cryptography>=50.0.0",
+    "pillow>=12.3.0",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/hostai"]
 
