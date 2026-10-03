@@ -42,6 +42,11 @@ if [[ "$SLOT_SAVE_PATH" == /dev/shm/* ]]; then
 fi
 CACHE_TYPE_K="${CACHE_TYPE_K:-}"
 CACHE_TYPE_V="${CACHE_TYPE_V:-}"
+MODEL_SHA256="${MODEL_SHA256:-}"
+DRAFT_SHA256="${DRAFT_SHA256:-}"
+HOSTAI_HF_ENDPOINT="${HOSTAI_HF_ENDPOINT:-}"
+HF_MIRROR_ENDPOINT="${HF_MIRROR_ENDPOINT:-https://hf-mirror.com}"
+HF_PROBE_TIMEOUT="${HF_PROBE_TIMEOUT:-8}"
 
 if [[ -z "${LLAMA_API_KEY:-}" ]]; then
   echo >&2 "ERROR: LLAMA_API_KEY is required."
@@ -97,6 +102,44 @@ download_file() {
   hf download "$HF_REPO" "$filename" --revision "$HF_REVISION" --local-dir "$MODEL_DIR"
 }
 
+resolve_hf_endpoint() {
+  # An explicit override wins; otherwise probe huggingface.co once and fall
+  # back to a public mirror when egress to it is filtered (e.g. CN hosts where
+  # the domain is DNS-poisoned and SNI-reset). Probing by reachability covers
+  # blocked and broken-DNS hosts alike without hard-coding countries.
+  if [[ -n "$HOSTAI_HF_ENDPOINT" ]]; then
+    echo "$HOSTAI_HF_ENDPOINT"
+    return
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "https://huggingface.co"
+    return
+  fi
+  if curl -fsI --max-time "$HF_PROBE_TIMEOUT" -o /dev/null https://huggingface.co; then
+    echo "https://huggingface.co"
+    return
+  fi
+  if curl -fsI --max-time "$HF_PROBE_TIMEOUT" -o /dev/null "$HF_MIRROR_ENDPOINT"; then
+    echo >&2 "[download] huggingface.co unreachable; falling back to $HF_MIRROR_ENDPOINT"
+    echo "$HF_MIRROR_ENDPOINT"
+    return
+  fi
+  # Both probes failed; let hf's own retry/backoff report the real error.
+  echo "https://huggingface.co"
+}
+
+verify_sha256() {
+  local filename="$1" expected="$2"
+  [[ -n "$expected" ]] || return 0
+  echo "[download] verifying sha256 for $filename"
+  local actual
+  actual="$(sha256sum "$MODEL_DIR/$filename" | awk '{print $1}')"
+  if [[ "$actual" != "$expected" ]]; then
+    echo >&2 "ERROR: sha256 mismatch for $filename: expected ${expected}, got ${actual}"
+    exit 70
+  fi
+}
+
 record_disk_usage() {
   local stage="$1"
   HOSTAI_DISK_STAGE="$stage" python3 - <<'PY'
@@ -144,8 +187,16 @@ PY
 # prepared. HF_TOKEN is optional; huggingface_hub will automatically use it if
 # supplied (for rate limits or if upstream access rules change later).
 
+HF_ENDPOINT="$(resolve_hf_endpoint)"
+export HF_ENDPOINT
+if [[ "$HF_ENDPOINT" != "https://huggingface.co" ]]; then
+  # Mirrors only proxy the classic LFS path; xet CAS endpoints are not mirrored.
+  export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
+fi
+
 record_disk_usage "after-preflight"
 download_file "$MODEL"
+verify_sha256 "$MODEL" "$MODEL_SHA256"
 record_disk_usage "after-main-model"
 
 server_args=(
@@ -194,6 +245,7 @@ fi
 
 if [[ "$USE_FASTMTP" == "1" ]]; then
   download_file "$DRAFT"
+  verify_sha256 "$DRAFT" "$DRAFT_SHA256"
   record_disk_usage "after-draft-model"
   server_args+=(
     --spec-draft-model "$MODEL_DIR/$DRAFT"

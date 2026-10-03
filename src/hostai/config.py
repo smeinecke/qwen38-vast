@@ -144,6 +144,8 @@ class ModelSection:
     ctx_checkpoints: Optional[int] = None
     cache_type_k: str = ""
     cache_type_v: str = ""
+    model_sha256: str = ""
+    draft_sha256: str = ""
 
 
 @dataclass
@@ -282,6 +284,8 @@ ENV_MAP: Dict[str, tuple[str, str, Optional[Type[Any]]]] = {
     "CTX_CHECKPOINTS": ("model", "ctx_checkpoints", int),
     "CACHE_TYPE_K": ("model", "cache_type_k", str),
     "CACHE_TYPE_V": ("model", "cache_type_v", str),
+    "MODEL_SHA256": ("model", "model_sha256", str),
+    "DRAFT_SHA256": ("model", "draft_sha256", str),
     "GHCR_IMAGE_BASE": ("image", "base", str),
     "GHCR_IMAGE": ("image", "base", str),
     "HOSTAI_UNSECURE": ("image", "unsecure", bool),

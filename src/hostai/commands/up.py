@@ -740,6 +740,13 @@ def _env_dict(
 
     _env_model_overrides(config, profile, env)
 
+    for key, value in (
+        ("MODEL_SHA256", config.model.model_sha256),
+        ("DRAFT_SHA256", config.model.draft_sha256),
+    ):
+        if value:
+            env[key] = value
+
     ssh_public_key = config.secrets.get("SSH_PUBLIC_KEY")
     if ssh_public_key:
         env["HOSTAI_SSH_PUBLIC_KEY_B64"] = base64.b64encode(ssh_public_key.encode()).decode()
@@ -749,6 +756,10 @@ def _env_dict(
     for key, value in os.environ.items():
         if key.startswith("HOSTAI_FAULT_") or key.startswith("HOSTAI_TEST_"):
             env[key] = value
+    # Explicit HF endpoint override (e.g. a private mirror) skips start.sh's
+    # reachability probe entirely.
+    if os.environ.get("HOSTAI_HF_ENDPOINT"):
+        env["HOSTAI_HF_ENDPOINT"] = os.environ["HOSTAI_HF_ENDPOINT"]
 
     # Vast maps container port 22 to a public host port in args/entrypoint mode.
     env["-p 22:22"] = "1"

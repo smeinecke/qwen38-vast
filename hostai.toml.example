@@ -46,6 +46,11 @@ ctx_checkpoints = ""
 # Optional llama-server KV cache type (e.g. q4_0, f16). Leave empty for default.
 cache_type_k = ""
 cache_type_v = ""
+# Expected sha256 of the LFS blobs. When set, start.sh verifies each downloaded
+# file and refuses to serve on mismatch — required to trust the hf-mirror.com
+# fallback that start.sh uses when huggingface.co is unreachable (e.g. CN hosts).
+model_sha256 = ""
+draft_sha256 = ""
 
 [image]
 # Repository only, WITHOUT a tag. hostai up appends the architecture image tag
