@@ -76,6 +76,21 @@ class Provider(ABC):
     def destroy_instance(self, instance_id: int) -> Dict[str, Any]:
         """Destroy an instance permanently."""
 
+    def list_instances(self) -> List[Dict[str, Any]]:
+        """Return every instance the account currently holds (any status).
+
+        Used by ``hostai info`` to surface machines that have no local
+        hostai state.  Backends without a fleet-wide listing return ``[]``.
+        """
+        return []
+
+    def get_account_info(self) -> Optional[Dict[str, Any]]:
+        """Return account/billing details (e.g. remaining credit balance).
+
+        ``None`` means the backend has no billing concept.
+        """
+        return None
+
     def get_logs(
         self,
         instance_id: int,

@@ -164,6 +164,73 @@ def _session_end_summary(duration: int, cost: float, outcome: str) -> str:
     return f"{outcome}. Session duration: {duration}s | estimated compute: ${cost:.4f}"
 
 
+def _describe_remote(instance: Dict[str, Any]) -> str:
+    num = instance.get("num_gpus") or 1
+    gpu = instance.get("gpu_name") or "unknown-gpu"
+    status = instance.get("actual_status") or instance.get("status") or "unknown"
+    raw_dph = instance.get("dph_total")
+    try:
+        dph = f"${float(raw_dph):.4f}/h" if raw_dph is not None else "$?/h"
+    except (TypeError, ValueError):
+        dph = "$?/h"
+    return f"{num}x {gpu}, {dph}, status={status}"
+
+
+def down_remote_instance(
+    config: Config,
+    instance_id: int,
+    *,
+    pause: bool = False,
+    skip_confirm: bool = False,
+) -> str:
+    """Destroy/pause a provider instance that has no local hostai state.
+
+    Orphaned machines (created outside hostai or after local state was lost)
+    still bill the account; this path talks to the provider directly and
+    skips every local step — no cache save, telemetry archive, or daemon
+    cleanup, since none exists for an untracked id.
+    """
+    action = "Pause" if pause else "Destroy"
+    provider = _provider(config)
+    try:
+        instance = provider.get_instance(instance_id)
+        api_ok = True
+    except Exception:
+        instance, api_ok = None, False
+
+    if api_ok and instance is None:
+        click.echo(f"[down] instance {instance_id} does not exist; nothing to do")
+        return "absent"
+
+    if not skip_confirm:
+        desc = _describe_remote(instance) if instance else "provider lookup failed"
+        if not click.confirm(
+            f"{action} untracked instance {instance_id} ({desc})? "
+            "No local state exists — cache save and telemetry archive will be skipped."
+        ):
+            click.echo("Cancelled.")
+            return "cancelled"
+
+    try:
+        if pause:
+            provider.stop_instance(instance_id)
+        else:
+            provider.destroy_instance(instance_id)
+    except requests.exceptions.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code == 404:
+            click.echo(f"[down] instance {instance_id} already absent")
+            return "already_absent"
+        raise click.ClickException(f"{action.lower()} failed: {exc}")
+    except requests.exceptions.RequestException as exc:
+        raise click.ClickException(f"{action.lower()} failed (timeout): {exc}")
+    except Exception as exc:
+        raise click.ClickException(f"{action.lower()} failed: {exc}")
+
+    outcome = "paused" if pause else "destroyed"
+    click.echo(f"{outcome.capitalize()} untracked instance {instance_id}.")
+    return outcome
+
+
 def _record_session_end(
     state: State, status: str, now: str, epoch: int, duration: int, cost: float, outcome_key: str, outcome: str
 ) -> None:
@@ -397,6 +464,14 @@ def down_instance(
 @click.command("down", help="Stop, save cache, and destroy/pause instances.")
 @_common.instance_option
 @click.option("--all", "all_instances", is_flag=True, help="Apply to every tracked instance.")
+@click.option(
+    "--id",
+    "remote_ids",
+    multiple=True,
+    type=int,
+    help="Provider instance id (see 'hostai info'); repeatable. Untracked ids are "
+    "destroyed/paused directly without local cache save or telemetry archive.",
+)
 @click.option("--yes", is_flag=True, help="Skip confirmation.")
 @click.option("--no-archive", is_flag=True, help="Skip telemetry archive.")
 @click.option("--cache", is_flag=True, help="Save/upload the slot cache for this shutdown.")
@@ -409,6 +484,7 @@ def cmd_down(
     config: Config,
     instance_name: Optional[str],
     all_instances: bool,
+    remote_ids: Tuple[int, ...],
     yes: bool,
     no_archive: bool,
     cache: bool,
@@ -419,20 +495,34 @@ def cmd_down(
 ) -> None:
     if all_instances and instance_name:
         raise click.ClickException("cannot combine --all with --name")
+    if remote_ids and (all_instances or instance_name):
+        raise click.ClickException("cannot combine --id with --all/--name")
 
-    states = state_mod.find_instance_states(config.root_dir)
-    if not states:
-        click.echo("No local hostai Vast state found.")
-        return
-
-    if all_instances:
-        targets = [(name, State.load(path)) for name, path in states.items()]
+    targets: list = []
+    remote_only: list = []
+    if remote_ids:
+        # An --id that matches a tracked instance runs the full shutdown
+        # path (cache save, archive, daemon stops); the rest go straight
+        # to the provider.
+        tracked = _common.tracked_instance_ids(config.root_dir)
+        for iid in remote_ids:
+            name = tracked.get(iid)
+            if name is None:
+                remote_only.append(iid)
+            else:
+                targets.append((name, State.load(state_mod.instance_state_file(config.root_dir, name))))
     else:
-        name, state = _common.resolve_state(config, instance_name)
-        targets = [(name, state)]
+        states = state_mod.find_instance_states(config.root_dir)
+        if not states:
+            click.echo("No local hostai Vast state found.")
+            return
+        if all_instances:
+            targets = [(name, State.load(path)) for name, path in states.items()]
+        else:
+            targets = [_common.resolve_state(config, instance_name)]
 
     targets = [(n, s) for n, s in targets if s.instance_id]
-    if not targets:
+    if not targets and not remote_only:
         click.echo("No Vast instance id in local state.")
         return
 
@@ -442,7 +532,7 @@ def cmd_down(
 
     errors: list = []
     for name, state in targets:
-        if len(targets) > 1:
+        if len(targets) + len(remote_only) > 1:
             click.echo(f"\n=== instance '{name}' ===")
         if cache_enabled:
             state.set("slot_cache_enabled", True)
@@ -464,6 +554,15 @@ def cmd_down(
         if outcome != "cancelled":
             stop_watchdog(config, instance=name)
             stop_monitor(config, instance=name)
+
+    for iid in remote_only:
+        if len(targets) + len(remote_only) > 1:
+            click.echo(f"\n=== instance id {iid} (untracked) ===")
+        try:
+            down_remote_instance(config, iid, pause=pause, skip_confirm=yes)
+        except click.ClickException as exc:
+            errors.append(f"id {iid}: {exc.message or exc}")
+            click.echo(f"[down] instance id {iid} failed: {exc.message or exc}", err=True)
 
     if errors:
         raise click.ClickException("; ".join(errors))

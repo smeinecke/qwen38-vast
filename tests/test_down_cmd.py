@@ -161,6 +161,125 @@ def test_down_pause_keeps_state(config, project_dir):
     assert (run_dir / "shutdown-tail.json").exists()
 
 
+def _fake_provider_with_instance(config):
+    from hostai.providers.fake import FakeProvider
+
+    provider = FakeProvider(config)
+    created = provider.create_instance(90001, image="img", disk=10, env={})
+    iid = created["instance_id"]
+    provider.start_instance(iid)
+    return provider, iid
+
+
+def test_down_by_id_untracked_destroys(config):
+    """`down --id` destroys a provider instance that has no local state."""
+    provider, iid = _fake_provider_with_instance(config)
+    with mock.patch("hostai.commands.down._provider", return_value=provider):
+        result = CliRunner().invoke(cmd_down, ["--id", str(iid), "--yes"], obj=config)
+    assert result.exit_code == 0, result.output
+    assert provider.get_instance(iid) is None
+    assert "untracked" in result.output
+
+
+def test_down_by_id_pause_stops_instance(config):
+    provider, iid = _fake_provider_with_instance(config)
+    with mock.patch("hostai.commands.down._provider", return_value=provider):
+        result = CliRunner().invoke(cmd_down, ["--id", str(iid), "--yes", "--pause"], obj=config)
+    assert result.exit_code == 0, result.output
+    inst = provider.get_instance(iid)
+    assert inst is not None
+    assert inst["actual_status"] == "stopped"
+
+
+def test_down_by_id_not_found(config):
+    provider, _ = _fake_provider_with_instance(config)
+    provider.destroy_instance(provider.list_instances()[0]["id"])
+    with mock.patch("hostai.commands.down._provider", return_value=provider):
+        result = CliRunner().invoke(cmd_down, ["--id", "424242", "--yes"], obj=config)
+    assert result.exit_code == 0, result.output
+    assert "does not exist" in result.output
+
+
+def test_down_by_id_cancelled(config):
+    provider, iid = _fake_provider_with_instance(config)
+    with (
+        mock.patch("hostai.commands.down._provider", return_value=provider),
+        mock.patch("click.confirm", return_value=False),
+    ):
+        result = CliRunner().invoke(cmd_down, ["--id", str(iid)], obj=config)
+    assert result.exit_code == 0, result.output
+    assert "Cancelled." in result.output
+    assert provider.get_instance(iid) is not None
+
+
+def test_down_by_id_multiple_untracked(config):
+    from hostai.providers.fake import FakeProvider
+
+    provider = FakeProvider(config)
+    ids = [provider.create_instance(90001, image="img", disk=10, env={})["instance_id"] for _ in range(2)]
+    args = ["--yes"] + [arg for iid in ids for arg in ("--id", str(iid))]
+    with mock.patch("hostai.commands.down._provider", return_value=provider):
+        result = CliRunner().invoke(cmd_down, args, obj=config)
+    assert result.exit_code == 0, result.output
+    assert provider.list_instances() == []
+
+
+def test_down_by_id_tracked_routes_to_full_path(config, project_dir):
+    """An --id matching local state runs down_instance, not the bare destroy."""
+    from hostai.state import State
+
+    State(
+        project_dir / ".hostai-vast" / "state.json",
+        {"instance_id": 555, "profile": "test", "dph": 0.5, "ctx_size": 32768},
+    ).save()
+
+    with (
+        mock.patch("hostai.commands.down.down_instance", return_value="destroyed") as di,
+        mock.patch("hostai.commands.down.down_remote_instance") as dri,
+        mock.patch("hostai.commands.watchdog.stop_watchdog"),
+        mock.patch("hostai.commands.monitor.stop_monitor"),
+    ):
+        result = CliRunner().invoke(cmd_down, ["--id", "555", "--yes"], obj=config)
+
+    assert result.exit_code == 0, result.output
+    di.assert_called_once()
+    dri.assert_not_called()
+
+
+def test_down_by_id_mixed_tracked_and_untracked(config, project_dir):
+    from hostai.state import State
+
+    State(
+        project_dir / ".hostai-vast" / "state.json",
+        {"instance_id": 555, "profile": "test", "dph": 0.5, "ctx_size": 32768},
+    ).save()
+    provider, iid = _fake_provider_with_instance(config)
+
+    with (
+        mock.patch("hostai.commands.down.down_instance", return_value="destroyed") as di,
+        mock.patch("hostai.commands.down._provider", return_value=provider),
+        mock.patch("hostai.commands.watchdog.stop_watchdog"),
+        mock.patch("hostai.commands.monitor.stop_monitor"),
+    ):
+        result = CliRunner().invoke(cmd_down, ["--id", "555", "--id", str(iid), "--yes"], obj=config)
+
+    assert result.exit_code == 0, result.output
+    di.assert_called_once()
+    assert provider.get_instance(iid) is None
+
+
+def test_down_by_id_conflicts_with_all(config):
+    result = CliRunner().invoke(cmd_down, ["--id", "1", "--all"], obj=config)
+    assert result.exit_code != 0
+    assert "cannot combine --id" in result.output
+
+
+def test_down_by_id_conflicts_with_name(config):
+    result = CliRunner().invoke(cmd_down, ["--id", "1", "--name", "foo"], obj=config)
+    assert result.exit_code != 0
+    assert "cannot combine --id" in result.output
+
+
 def test_down_failed_destroy_preserves_state(config, project_dir):
     from hostai.commands.down import down_instance
     from hostai.state import State

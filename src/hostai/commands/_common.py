@@ -73,6 +73,22 @@ def resolve_state(
     return name, State.load(state_mod.instance_state_file(config.root_dir, name))
 
 
+def tracked_instance_ids(root_dir: Path) -> Dict[int, str]:
+    """Return ``{provider_instance_id: instance_name}`` for all tracked instances."""
+    out: Dict[int, str] = {}
+    for name, sf in state_mod.find_instance_states(root_dir).items():
+        try:
+            iid = json.loads(sf.read_text(encoding="utf-8")).get("instance_id")
+        except Exception:
+            continue
+        try:
+            if iid is not None:
+                out[int(iid)] = name
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def claimed_local_ports(config: Config, exclude_instance: Optional[str] = None) -> Set[int]:
     """Local ports claimed by other tracked instances (live instance_id + port)."""
     exclude = state_mod.normalize_instance_name(exclude_instance)

@@ -24,6 +24,8 @@
 
 ## Lifecycle & Cost
 
+- `hostai info` shows provider ground truth: account balance/credit (via `get_account_info`) and every instance on the account (via `list_instances`), marking which ids are tracked by local state and summing the running $/h burn.
+- `hostai down --id <provider-id>` (repeatable) destroys/pauses by raw provider id: ids matching tracked instances run the full shutdown path; untracked ids go through `down_remote_instance`, which skips cache save, telemetry archive, and daemon cleanup entirely. `--id` conflicts with `--all`/`--name`.
 - `hostai up` can auto-start a watchdog when `watchdog_auto_start = true` is set in `[vast]`.
 - `hostai down` records shutdown-tail metrics and reuses the cache-save/telemetery path.
 - `hostai cost volume-break-even` estimates whether a persistent model volume is cheaper than re-downloading.
@@ -43,6 +45,7 @@
 - Ports: `claimed_local_ports`/`_sibling_claimed_ports` treat ports recorded in sibling `state.json` files as taken even before they are bound.
 - Daemons: monitor/watchdog pid+log files get a `-<name>` suffix in `.hostai-cache/` (`monitor-foo.pid`, `watchdog-foo.log`); proxy uses `proxy-<name>.log`/`proxy-content-<name>.jsonl`. Daemon argv always ends in `--name <instance>` so identity-checked signaling never stops a sibling's daemon.
 - `LocalProvider` serializes its shared `.hostai-vast/local-provider.json` registry under `.local-provider.lock` (`_state_mutation`) and re-reads it on each access.
+- `LocalProvider.list_instances` merges the registry with `docker ps` results for the `hostai.provider=local` label so orphaned containers still show up in `hostai info` (marked untracked); `get_instance`/`start`/`stop`/`destroy` fall back to the `hostai.instance_id=<id>` docker label when the registry entry is missing.
 - TLS: `.hostai-cache/tls` is shared; regeneration is serialized under the allocation lock.
 
 ## Local provider and integration tests

@@ -10,12 +10,14 @@ from __future__ import annotations
 import shlex
 from typing import Any, Dict, List, Optional
 
+from vastai.api.billing import show_user
 from vastai.api.client import VastClient
 from vastai.api.instances import (
     build_create_instance_payload,
     create_instance_from_payload,
     destroy_instance,
     show_instance,
+    show_instances,
     start_instance,
     stop_instance,
 )
@@ -84,6 +86,14 @@ class VastProvider(Provider):
     def get_instance(self, instance_id: int) -> Optional[Dict[str, Any]]:
         client = self._client(timeout=120.0)
         return show_instance(client, instance_id)
+
+    def list_instances(self) -> List[Dict[str, Any]]:
+        client = self._client(timeout=120.0)
+        return show_instances(client)
+
+    def get_account_info(self) -> Optional[Dict[str, Any]]:
+        client = self._client(timeout=120.0)
+        return show_user(client)
 
     def get_logs(
         self,

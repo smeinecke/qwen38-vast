@@ -298,23 +298,51 @@ class LocalProvider(Provider):
     def get_instance(self, instance_id: int) -> Optional[Dict[str, Any]]:
         self._refresh_state()
         info = self._state["containers"].get(str(instance_id))
-        if not info:
-            return None
-        container_id = info["container_id"]
-        return self._inspect_container(instance_id, container_id, info)
+        if info:
+            return self._inspect_container(instance_id, info["container_id"], info)
+        # Orphaned container: the registry entry was lost but the container
+        # still carries its hostai.instance_id label.
+        orphan = self._find_container_by_instance_id(instance_id)
+        if orphan:
+            return self._inspect_orphan(orphan)
+        return None
+
+    def list_instances(self) -> List[Dict[str, Any]]:
+        """List every local container known to the provider, including orphans.
+
+        Rows for containers missing from the shared registry are marked with
+        ``untracked=True`` so callers can flag them for ``down --id`` cleanup.
+        """
+        self._refresh_state()
+        rows: List[Dict[str, Any]] = []
+        registered: set[str] = set()
+        for iid_str, info in self._state["containers"].items():
+            try:
+                iid = int(iid_str)
+            except (TypeError, ValueError):
+                continue
+            row = self._inspect_container(iid, info["container_id"], info)
+            if row:
+                rows.append(row)
+            registered.add(info["container_id"])
+        for cid in self._find_hostai_containers(exclude=registered):
+            row = self._inspect_orphan(cid)
+            if row:
+                rows.append(row)
+        return rows
 
     def start_instance(self, instance_id: int) -> Dict[str, Any]:
-        container_id = self._container_id(instance_id)
+        container_id = self._container_id_or_label(instance_id)
         self._docker_cmd(["start", container_id], timeout=60)
         return {"success": True, "instance_id": instance_id}
 
     def stop_instance(self, instance_id: int) -> Dict[str, Any]:
-        container_id = self._container_id(instance_id)
+        container_id = self._container_id_or_label(instance_id)
         self._docker_cmd(["stop", "-t", "30", container_id], timeout=60)
         return {"success": True, "instance_id": instance_id}
 
     def destroy_instance(self, instance_id: int) -> Dict[str, Any]:
-        container_id = self._container_id(instance_id)
+        container_id = self._container_id_or_label(instance_id)
         try:
             self._docker_cmd(["rm", "-f", "-v", container_id], timeout=60)
         except LocalProviderError:
@@ -395,6 +423,85 @@ class LocalProvider(Provider):
         if not info:
             raise LocalProviderError(f"instance {instance_id} not found")
         return info["container_id"]
+
+    def _container_id_or_label(self, instance_id: int) -> str:
+        """Resolve an instance id to a container, including unregistered orphans."""
+        try:
+            return self._container_id(instance_id)
+        except LocalProviderError:
+            orphan = self._find_container_by_instance_id(instance_id)
+            if orphan:
+                return orphan
+            raise LocalProviderError(f"instance {instance_id} not found")
+
+    def _find_container_by_instance_id(self, instance_id: int) -> Optional[str]:
+        """Return a container id whose ``hostai.instance_id`` label matches."""
+        try:
+            result = self._docker_cmd(
+                [
+                    "ps",
+                    "-a",
+                    "--no-trunc",
+                    "--filter",
+                    f"label=hostai.instance_id={instance_id}",
+                    "--format",
+                    "{{.ID}}",
+                ],
+                timeout=30,
+            )
+        except LocalProviderError:
+            return None
+        for line in result.stdout.splitlines():
+            cid = line.strip()
+            if cid:
+                return cid
+        return None
+
+    def _find_hostai_containers(self, *, exclude: Optional[set] = None) -> List[str]:
+        """Every docker container carrying the hostai provider label."""
+        try:
+            result = self._docker_cmd(
+                ["ps", "-a", "--no-trunc", "--filter", f"label={_DOCKER_LABEL}", "--format", "{{.ID}}"],
+                timeout=30,
+            )
+        except LocalProviderError:
+            return []
+        skip = exclude or set()
+        return [cid.strip() for cid in result.stdout.splitlines() if cid.strip() and cid.strip() not in skip]
+
+    def _inspect_orphan(self, container_id: str) -> Optional[Dict[str, Any]]:
+        """Build a Vast-shaped row for a labeled container missing from the registry."""
+        try:
+            result = utils.run(
+                [self._docker, "inspect", "--format={{json .}}", container_id],
+                capture=True,
+                check=True,
+                timeout=30,
+            )
+            data = json.loads(result.stdout)
+        except Exception:
+            return None
+        state = data.get("State", {}).get("Status", "unknown")
+        status = self._map_status(state)
+        config = data.get("Config", {})
+        labels = config.get("Labels", {}) or {}
+        raw_id = labels.get("hostai.instance_id")
+        ssh_port = self._container_ssh_port(container_id)
+        return {
+            "id": int(raw_id) if raw_id and str(raw_id).isdigit() else None,
+            "actual_status": status,
+            "status": status,
+            "ssh_host": "127.0.0.1",
+            "ssh_port": ssh_port,
+            "ssh_user": "root",
+            "public_ipaddr": "127.0.0.1",
+            "gpu_name": "local container",
+            "dph_total": 0.0,
+            "image": config.get("Image", ""),
+            "container_id": container_id,
+            "container_name": str(data.get("Name", "")).lstrip("/"),
+            "untracked": True,
+        }
 
     def _container_ssh_port(self, container_id: str) -> Optional[int]:
         try:

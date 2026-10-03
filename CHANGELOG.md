@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-03
+
+- Added `hostai info`: shows provider account ground truth — remaining credit balance (`Provider.get_account_info`, Vast `/users/current`) and every instance on the account (`Provider.list_instances`, Vast `/api/v1/instances/`), with the local tracked name next to each id, per-instance status/GPU/$-per-hour/SSH/age, and a running burn-rate total. Untracked instances are flagged with a `hostai down --id <id>` hint.
+- Added `hostai down --id <provider-id>` (repeatable) for destroying/pausing instances by raw provider id — including machines with no local hostai state (e.g. listed by `hostai info`). Ids matching a tracked instance run the normal full shutdown path; untracked ids go through the new `down_remote_instance`, which skips cache save, telemetry archive, and daemon cleanup. `--id` conflicts with `--all`/`--name`.
+- `LocalProvider` parity: `list_instances` merges the shared registry with labeled docker containers so orphans appear in `info`; `get_instance`/`start`/`stop`/`destroy` resolve the `hostai.instance_id=<id>` docker label when the registry entry was lost.
+
 ## 2026-10-01
 
 - Multiple parallel instances: `hostai up --name <name>` provisions an additional deployment that runs alongside the default one.

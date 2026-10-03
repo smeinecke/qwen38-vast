@@ -5,6 +5,7 @@ from hostai.commands.bench import cmd_bench
 from hostai.commands.cache_cmd import cmd_cache_copy, cmd_cache_setup
 from hostai.commands.cost import cmd_cost, cmd_volume_break_even
 from hostai.commands.down import cmd_down
+from hostai.commands.info import cmd_info
 from hostai.commands.log import cmd_log
 from hostai.commands.lookup import cmd_lookup
 from hostai.commands.monitor import (
@@ -52,6 +53,7 @@ cli.add_command(cmd_results, name="results")
 cli.add_command(cmd_up, name="up")
 cli.add_command(cmd_down, name="down")
 cli.add_command(cmd_status, name="status")
+cli.add_command(cmd_info, name="info")
 cli.add_command(cmd_bench, name="bench")
 cli.add_command(cmd_proxy, name="proxy")
 cli.add_command(cmd_log, name="log")
