@@ -638,8 +638,7 @@ def _resolve_client_port(
     if user_set:
         if desired in claimed:
             raise click.ClickException(
-                f"client port {desired} is already claimed by another hostai instance; "
-                "choose another with --local-port"
+                f"client port {desired} is already claimed by another hostai instance; choose another with --local-port"
             )
         raise click.ClickException(f"client port {desired} is already in use; choose another with --local-port")
 
@@ -1073,9 +1072,7 @@ def _write_env_file(config: Config, state: State, api_url: str, base_url: str) -
 
     if config.proxy.tokenized_only:
         socket_path = (
-            Path(config.proxy.socket_path)
-            if config.proxy.socket_path
-            else state.state_file.parent / "proxy.sock"
+            Path(config.proxy.socket_path) if config.proxy.socket_path else state.state_file.parent / "proxy.sock"
         )
         lines += [
             f"export HOSTAI_PROXY_SOCKET='{socket_path}'",
@@ -1988,9 +1985,7 @@ def _do_restart(
 
     state.data["instance_name"] = instance
     state.unsecure = unsecure
-    resolved = _resolve_client_port(
-        config, user_port=local_port, state_port=state.local_port, instance=instance
-    )
+    resolved = _resolve_client_port(config, user_port=local_port, state_port=state.local_port, instance=instance)
     if resolved != state.local_port:
         state.local_port = resolved
         state.save()

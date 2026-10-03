@@ -51,17 +51,14 @@ def resolve_state(
     if selector is None:
         if not states:
             if required:
-                raise click.ClickException(
-                    "no hostai instances are tracked; run 'hostai up' to create one"
-                )
+                raise click.ClickException("no hostai instances are tracked; run 'hostai up' to create one")
             return state_mod.DEFAULT_INSTANCE, State(
                 state_mod.instance_state_file(config.root_dir, state_mod.DEFAULT_INSTANCE)
             )
         if len(states) > 1:
             names = ", ".join(states)
             raise click.ClickException(
-                f"multiple hostai instances are tracked ({names}); "
-                "use --name <name|id> to select one"
+                f"multiple hostai instances are tracked ({names}); use --name <name|id> to select one"
             )
         name = next(iter(states))
         return name, State.load(states[name])
@@ -430,8 +427,7 @@ def daemon_status_line(config: Config, name: str, instance: Optional[str] = None
         return f"[{name}{tag}] not running"
     if daemon_running(config, name, instance):
         return (
-            f"[{name}{tag}] running (pid {pid_file.read_text().strip()}) "
-            f"log={daemon_log_file(config, name, instance)}"
+            f"[{name}{tag}] running (pid {pid_file.read_text().strip()}) log={daemon_log_file(config, name, instance)}"
         )
     pid_file.unlink(missing_ok=True)
     return f"[{name}{tag}] not running (stale pid file)"

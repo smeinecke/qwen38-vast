@@ -244,8 +244,14 @@ def _status_overview(config: Config, states: Dict[str, Path]) -> None:
                     remote_status = "gone"
             except Exception:
                 pass
-        elapsed_s = utils.format_duration(max(0, utils.now_epoch() - state.started_epoch)) if state.started_epoch else "-"
-        cost = f"${utils.format_cost(max(0, utils.now_epoch() - state.started_epoch), state.dph):.4f}" if state.started_epoch else "-"
+        elapsed_s = (
+            utils.format_duration(max(0, utils.now_epoch() - state.started_epoch)) if state.started_epoch else "-"
+        )
+        cost = (
+            f"${utils.format_cost(max(0, utils.now_epoch() - state.started_epoch), state.dph):.4f}"
+            if state.started_epoch
+            else "-"
+        )
         table.add_row(
             name,
             str(state.instance_id or "-"),
@@ -258,7 +264,9 @@ def _status_overview(config: Config, states: Dict[str, Path]) -> None:
             cost,
         )
     console.print(table)
-    click.echo("\nUse 'hostai status --name <name>' for details, '--logs' to tail logs, 'hostai down --name <name>' to stop.")
+    click.echo(
+        "\nUse 'hostai status --name <name>' for details, '--logs' to tail logs, 'hostai down --name <name>' to stop."
+    )
 
 
 @click.command("status", help="Show instance status (all instances when several are tracked).")
@@ -268,7 +276,9 @@ def _status_overview(config: Config, states: Dict[str, Path]) -> None:
 @click.option("--follow", is_flag=True, help="Follow the log stream (uses local ssh client).")
 @click.option("--no-save", is_flag=True, help="Do not append --logs output to run_dir/server-live.log.")
 @click.pass_obj
-def cmd_status(config: Config, instance_name: Optional[str], logs: bool, lines: int, follow: bool, no_save: bool) -> None:
+def cmd_status(
+    config: Config, instance_name: Optional[str], logs: bool, lines: int, follow: bool, no_save: bool
+) -> None:
     states = state_mod.find_instance_states(config.root_dir)
 
     if not states:

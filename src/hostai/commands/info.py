@@ -111,9 +111,7 @@ def _print_instances(rows: List[Dict[str, Any]], tracked: Dict[int, str]) -> int
     if rows:
         click.echo(f"running burn: ${burn:.4f}/h")
     if untracked:
-        click.echo(
-            f"{untracked} instance(s) not tracked by local state; use 'hostai down --id <id>' to destroy them."
-        )
+        click.echo(f"{untracked} instance(s) not tracked by local state; use 'hostai down --id <id>' to destroy them.")
     return untracked
 
 

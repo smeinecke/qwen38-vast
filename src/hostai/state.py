@@ -330,8 +330,7 @@ def validate_instance_name(name: str) -> str:
     """Validate an explicit instance name; raises ValueError on bad input."""
     if not name or not _INSTANCE_NAME_RE.fullmatch(name) or name == DEFAULT_INSTANCE:
         raise ValueError(
-            f"invalid instance name '{name}' "
-            "(use letters, digits, '.', '_' or '-'; 'default' is reserved)"
+            f"invalid instance name '{name}' (use letters, digits, '.', '_' or '-'; 'default' is reserved)"
         )
     return name
 

@@ -141,7 +141,11 @@ def _decide_shutdown(
             )
             return "max-runtime"
         if activity_state == "inactive":
-            _log(config, f"max runtime reached but only {consecutive_inactive} inactive observation(s); waiting", instance)
+            _log(
+                config,
+                f"max runtime reached but only {consecutive_inactive} inactive observation(s); waiting",
+                instance,
+            )
         elif activity_state == "active":
             _log(config, "max runtime reached but request still active; waiting", instance)
         else:
