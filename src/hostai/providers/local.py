@@ -8,6 +8,8 @@ container as a synthetic Vast host.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -16,7 +18,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 from hostai import utils
 from hostai.config import Config
@@ -216,7 +218,8 @@ class LocalProvider(Provider):
         if not offer:
             raise LocalProviderError(f"unknown local offer {offer_id}")
 
-        instance_id = self._next_instance_id()
+        with self._state_mutation():
+            instance_id = self._next_instance_id()
         test_label = self._test_label()
 
         run_image = self._resolve_image(image)
@@ -264,14 +267,14 @@ class LocalProvider(Provider):
         if not ssh_port:
             raise LocalProviderError(f"could not find mapped SSH port for {container_id}")
 
-        self._state["containers"][str(instance_id)] = {
-            "container_id": container_id,
-            "container_name": container_name,
-            "created_at": time.time(),
-            "offer_id": offer_id,
-            "test_label": test_label,
-        }
-        self._save_state()
+        with self._state_mutation() as st:
+            st["containers"][str(instance_id)] = {
+                "container_id": container_id,
+                "container_name": container_name,
+                "created_at": time.time(),
+                "offer_id": offer_id,
+                "test_label": test_label,
+            }
 
         return {
             "success": True,
@@ -293,6 +296,7 @@ class LocalProvider(Provider):
         }
 
     def get_instance(self, instance_id: int) -> Optional[Dict[str, Any]]:
+        self._refresh_state()
         info = self._state["containers"].get(str(instance_id))
         if not info:
             return None
@@ -315,8 +319,8 @@ class LocalProvider(Provider):
             self._docker_cmd(["rm", "-f", "-v", container_id], timeout=60)
         except LocalProviderError:
             pass
-        self._state["containers"].pop(str(instance_id), None)
-        self._save_state()
+        with self._state_mutation() as st:
+            st["containers"].pop(str(instance_id), None)
         return {"success": True, "instance_id": instance_id, "destroy_outcome": "destroyed"}
 
     def get_logs(
@@ -386,6 +390,7 @@ class LocalProvider(Provider):
         return parts
 
     def _container_id(self, instance_id: int) -> str:
+        self._refresh_state()
         info = self._state["containers"].get(str(instance_id))
         if not info:
             raise LocalProviderError(f"instance {instance_id} not found")
@@ -440,9 +445,12 @@ class LocalProvider(Provider):
         offer = next((o for o in _LOCAL_OFFERS if o["id"] == offer_id), _LOCAL_OFFERS[0])
 
         ssh_port = self._container_ssh_port(container_id) or info.get("ssh_port")
-        if ssh_port:
+        if ssh_port and ssh_port != info.get("ssh_port"):
             info["ssh_port"] = ssh_port
-            self._save_state()
+            with self._state_mutation() as st:
+                entry = st["containers"].get(str(instance_id))
+                if entry is not None:
+                    entry["ssh_port"] = ssh_port
 
         return {
             "id": instance_id,
@@ -494,6 +502,31 @@ class LocalProvider(Provider):
     def _save_state(self) -> None:
         self._state_file.parent.mkdir(parents=True, exist_ok=True)
         self._state_file.write_text(json.dumps(self._state, indent=2, default=str))
+
+    def _refresh_state(self) -> None:
+        """Re-read the shared registry so parallel `up`/`down` runs see each other."""
+        self._state = self._load_state()
+
+    @contextlib.contextmanager
+    def _state_mutation(self) -> Iterator[Dict[str, Any]]:
+        """Serialize read-modify-write of the shared container registry.
+
+        Several hostai instances share ``local-provider.json``; without this
+        lock a ``down`` racing another instance's ``up`` could save a stale
+        copy and silently drop the sibling's container entry.
+        """
+        self._state_file.parent.mkdir(parents=True, exist_ok=True)
+        fd = open(self._state_file.parent / ".local-provider.lock", "a")
+        try:
+            fcntl.flock(fd.fileno(), fcntl.LOCK_EX)
+            self._refresh_state()
+            yield self._state
+            self._save_state()
+        finally:
+            try:
+                fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+            finally:
+                fd.close()
 
     def _ensure_ssh_key(self) -> tuple[Path, str]:
         key_dir = utils.mkdir_private(self.config.root_dir / ".hostai-vast" / "ssh")

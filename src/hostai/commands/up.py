@@ -17,6 +17,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple
 import click
 
 from hostai import cache, market, ssh, tls, utils
+from hostai import state as state_mod
 from hostai.api import LlamaClient
 from hostai.commands import _common
 from hostai.commands.monitor import maybe_start_monitor
@@ -125,6 +126,14 @@ def _resolve_session_seconds(config: Config, expected_session: Optional[str]) ->
 @click.option("--dry-run", is_flag=True, help="Search and print the chosen offer without renting.")
 @click.option("--scoring-mode", help="Override market scoring mode (dph, perf, session).")
 @click.option(
+    "-n",
+    "--name",
+    "instance_name",
+    envvar="HOSTAI_INSTANCE",
+    default=None,
+    help="Name for this instance; lets multiple instances run in parallel.",
+)
+@click.option(
     "--allow-unvalidated",
     is_flag=True,
     help="Skip the production-validation gate when [vast].require_production_validation is true.",
@@ -153,12 +162,17 @@ def cmd_up(
     expected_session: Optional[str],
     dry_run: bool,
     scoring_mode: Optional[str],
+    instance_name: Optional[str],
     allow_unvalidated: bool,
 ):
     chosen_profile = profile or profile_opt or config.hostai.default_profile
     if not chosen_profile:
         raise click.ClickException("no profile specified and no default profile configured")
     _validate_up_options(local_port, max_price, bid, scoring_mode)
+    try:
+        instance = state_mod.validate_instance_name(instance_name) if instance_name else state_mod.DEFAULT_INSTANCE
+    except ValueError as exc:
+        raise click.ClickException(str(exc))
     exclusions = market.OfferExclusions(machines=skip_machines, offers=skip_offers, countries=skip_countries)
     if offer is not None and offer in exclusions.offers:
         raise click.ClickException(f"--offer {offer} conflicts with --skip-offer {offer}")
@@ -175,9 +189,11 @@ def cmd_up(
     bid_price = _resolve_bid_price(config, interruptible, bid, max_price)
     session_seconds = _resolve_session_seconds(config, expected_session)
 
-    # A second concurrent `up`/`--restart` would race `_check_for_live_instance`
-    # and rent (or restart) a duplicate instance; serialize on a flock.
-    with _common.lifecycle_lock(config, "up --restart" if restart else "up"):
+    # A second concurrent `up`/`--restart` for the same instance would race
+    # `_check_for_live_instance` and rent (or restart) a duplicate; serialize
+    # per instance on a flock.  Different names lock different files so
+    # parallel instances provision concurrently.
+    with _common.lifecycle_lock(config, "up --restart" if restart else "up", instance=instance):
         if restart:
             for flag, values in (
                 ("--skip-machine", exclusions.machines),
@@ -186,10 +202,19 @@ def cmd_up(
             ):
                 if values:
                     _log(f"[up] {flag} is ignored for --restart (existing instance)", err=True)
-            _do_restart(config, chosen_profile, local_port, unsecure, no_cache, allow_unvalidated=allow_unvalidated)
+            _do_restart(
+                config,
+                instance,
+                chosen_profile,
+                local_port,
+                unsecure,
+                no_cache,
+                allow_unvalidated=allow_unvalidated,
+            )
         else:
             _do_fresh(
                 config,
+                instance,
                 chosen_profile,
                 cache_session,
                 local_port,
@@ -577,13 +602,15 @@ def _resolve_client_port(
     *,
     user_port: Optional[int] = None,
     state_port: Optional[int] = None,
+    instance: Optional[str] = None,
 ) -> int:
     """Return a local client port that is free on 127.0.0.1.
 
     Honors the user-specified port (``--local-port`` or ``[proxy].port``) and
     fails early if that exact port is in use.  For the default port the helper
     searches for the next free port instead of starting a rental that will
-    later fail to bind.
+    later fail to bind.  Ports recorded in other instances' state files count
+    as taken even when not currently bound (e.g. a sibling mid-provisioning).
     """
     user_set = False
     if user_port is not None:
@@ -600,24 +627,47 @@ def _resolve_client_port(
     if not (1 <= desired <= 65535):
         raise click.ClickException("client port must be between 1 and 65535")
 
-    if utils.port_is_free(desired, host="127.0.0.1"):
+    claimed = _common.claimed_local_ports(config, exclude_instance=instance)
+
+    if desired not in claimed and utils.port_is_free(desired, host="127.0.0.1"):
         config.ssh.local_port = desired
         if user_port is not None:
             config.proxy.port = desired
         return desired
 
     if user_set:
+        if desired in claimed:
+            raise click.ClickException(
+                f"client port {desired} is already claimed by another hostai instance; "
+                "choose another with --local-port"
+            )
         raise click.ClickException(f"client port {desired} is already in use; choose another with --local-port")
 
     _log(f"[up] client port {desired} is in use; searching for a free port", err=True)
-    try:
-        free_port = utils.find_free_port(start=desired)
-    except RuntimeError:
+    free_port = _find_unclaimed_port(desired, claimed)
+    if free_port is None:
         raise click.ClickException("no free localhost port found")
 
     _log(f"[up] using client port {free_port}", err=True)
     config.ssh.local_port = free_port
     return free_port
+
+
+def _find_unclaimed_port(start: int, claimed: Set[int]) -> Optional[int]:
+    """First free port >= ``start`` that is also not claimed by a sibling instance."""
+    candidate = start
+    for _ in range(100):
+        if candidate in claimed:
+            candidate += 1
+            continue
+        try:
+            port = utils.find_free_port(start=candidate, host="127.0.0.1")
+        except RuntimeError:
+            return None
+        if port not in claimed:
+            return port
+        candidate = port + 1
+    return None
 
 
 def _env_model_overrides(config: Config, profile: Any, env: Dict[str, str]) -> None:
@@ -991,7 +1041,12 @@ PY"""
 
 
 def _write_env_file(config: Config, state: State, api_url: str, base_url: str) -> None:
-    env_path = state_dir(config.root_dir) / "env"
+    env_path = state.state_file.parent / "env"
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        env_path.parent.chmod(0o700)
+    except OSError:
+        pass
 
     client_base: Optional[str]
     if config.proxy.tokenized_only and config.proxy.port:
@@ -1000,10 +1055,12 @@ def _write_env_file(config: Config, state: State, api_url: str, base_url: str) -
     else:
         client_base = base_url
 
+    instance_name = state.data.get("instance_name") or state_mod.instance_name_for_state_file(state.state_file)
     lines = [
         f"export OPENAI_API_KEY='{state.api_key}'",
         f"export HOSTAI_MODEL='{state.data.get('model')}'",
         f"export HOSTAI_PROFILE='{state.data.get('profile')}'",
+        f"export HOSTAI_INSTANCE='{instance_name}'",
         f"export HOSTAI_VAST_INSTANCE_ID='{state.instance_id}'",
         f"export HOSTAI_BASE_URL='{base_url}'",
         f"export HOSTAI_API_URL='{api_url}'",
@@ -1015,7 +1072,11 @@ def _write_env_file(config: Config, state: State, api_url: str, base_url: str) -
         ]
 
     if config.proxy.tokenized_only:
-        socket_path = Path(config.proxy.socket_path) if config.proxy.socket_path else _default_proxy_socket(config)
+        socket_path = (
+            Path(config.proxy.socket_path)
+            if config.proxy.socket_path
+            else state.state_file.parent / "proxy.sock"
+        )
         lines += [
             f"export HOSTAI_PROXY_SOCKET='{socket_path}'",
             "export HOSTAI_TOKENIZED_ONLY=1",
@@ -1071,7 +1132,12 @@ def _start_proxy(config: Config, state: State, client_api_scheme: str = "http") 
     if not config.proxy.tokenized_only:
         return None
 
+    instance_name = state.data.get("instance_name") or state_mod.instance_name_for_state_file(state.state_file)
+    claimed = _common.claimed_local_ports(config, exclude_instance=instance_name)
     port = config.proxy.port or config.ssh.local_port or 0
+    if port and port in claimed:
+        _log(f"[proxy] WARNING: configured port {port} is claimed by another instance; skipping", err=True)
+        return None
     if port and not utils.port_is_free(port, host="127.0.0.1"):
         # The port may be held by a stale hostai proxy from a previous run —
         # those can be killed safely (a foreign process must not be touched).
@@ -1089,10 +1155,9 @@ def _start_proxy(config: Config, state: State, client_api_scheme: str = "http") 
             _log(f"[proxy] WARNING: configured port {port} is in use; skipping", err=True)
             return None
     if not port:
-        try:
-            port = utils.find_free_port(start=18083, host="127.0.0.1")
-        except RuntimeError as exc:
-            _log(f"[proxy] WARNING: no free TCP port: {exc}; skipping", err=True)
+        port = _find_unclaimed_port(18083, claimed) or 0
+        if not port:
+            _log("[proxy] WARNING: no free TCP port; skipping", err=True)
             return None
     config.proxy.port = port
 
@@ -1112,7 +1177,7 @@ def _start_proxy(config: Config, state: State, client_api_scheme: str = "http") 
     try:
         with open(log_path, "a", encoding="utf-8") as log_file:
             proc = subprocess.Popen(
-                [str(proxy_bin), "proxy"],
+                [str(proxy_bin), "proxy", "--name", instance_name],
                 env=env,
                 start_new_session=True,
                 stdout=log_file,
@@ -1204,10 +1269,9 @@ class _FreshOffer(NamedTuple):
     exclusions: market.OfferExclusions
 
 
-def _check_for_live_instance(config: Config) -> None:
-    """Refuse to proceed if a previous state still references a live instance."""
-    sdir = state_dir(config.root_dir)
-    existing = sdir / "state.json"
+def _check_for_live_instance(config: Config, instance: str = state_mod.DEFAULT_INSTANCE) -> None:
+    """Refuse to proceed if this instance's state still references a live remote."""
+    existing = state_mod.instance_state_file(config.root_dir, instance)
     if not existing.exists():
         return
     old = State.load(existing)
@@ -1219,7 +1283,14 @@ def _check_for_live_instance(config: Config) -> None:
         # Could not reach provider to verify; proceed rather than hard-block.
         inst = None
     if inst and (inst.get("actual_status") or inst.get("status")) not in ("exited", "offline"):
-        raise click.ClickException(f"state file already references instance {old.instance_id}; run hostai down first")
+        if instance == state_mod.DEFAULT_INSTANCE:
+            raise click.ClickException(
+                f"state file already references instance {old.instance_id}; run hostai down first"
+            )
+        raise click.ClickException(
+            f"instance '{instance}' already references live instance {old.instance_id}; "
+            f"run 'hostai down --name {instance}' first or pick another --name"
+        )
 
 
 def _resolve_fresh_offer(
@@ -1233,9 +1304,10 @@ def _resolve_fresh_offer(
     bid_price: Optional[float],
     session_seconds: Optional[int],
     allow_unvalidated: bool,
+    instance: str = state_mod.DEFAULT_INSTANCE,
 ) -> _FreshOffer:
     """Resolve profile, search query and select a market offer."""
-    local_port = _resolve_client_port(config, user_port=local_port)
+    local_port = _resolve_client_port(config, user_port=local_port, instance=instance)
     profiles, profile, image = _resolve_profile(config, profile_name)
     ctx_size = config.hostai.ctx_size_override if config.hostai.ctx_size_override else profile.ctx_size
     model = config.model.model
@@ -1329,6 +1401,7 @@ def _fresh_metadata(
     unsecure: bool,
     run_id: str,
     run_started: str,
+    instance: str = state_mod.DEFAULT_INSTANCE,
 ) -> Dict[str, Any]:
     profile = offer.profile
     return {
@@ -1336,6 +1409,7 @@ def _fresh_metadata(
         "run_id": run_id,
         "status": "provisioning",
         "started_at": run_started,
+        "instance_name": instance,
         "profile": profile.name,
         "monitor_group": profile.monitor_group or "",
         "gpu_query": offer.query,
@@ -1380,10 +1454,12 @@ def _fill_fresh_state(
     run_epoch: int,
     no_cache: bool,
     unsecure: bool,
+    instance: str = state_mod.DEFAULT_INSTANCE,
 ) -> None:
     profile = offer.profile
     state.instance_id = int(instance_id)
     state.status = "provisioning"
+    state.data["instance_name"] = instance
     state.offer_id = offer.offer_id
     state.data["machine_id"] = offer.machine_id
     # Exclusions stick to the deployment: the monitor merges them from state
@@ -1433,13 +1509,14 @@ def _fill_fresh_state(
 
 def _create_fresh_instance(
     config: Config,
+    instance: str,
     offer: _FreshOffer,
     cache_session: Optional[str],
     no_cache: bool,
     unsecure: bool,
 ) -> State:
     """Create the provider instance and initialize a fresh ``State``."""
-    sdir = state_dir(config.root_dir)
+    sdir = state_mod.instance_state_dir(config.root_dir, instance)
     profile = offer.profile
     image = offer.image
     run_id = utils.make_run_id(profile.name)
@@ -1449,13 +1526,16 @@ def _create_fresh_instance(
     api_key = config.secrets.get("MODEL_API_KEY") or utils.make_api_key()
     session = cache_session or config.cache.session
 
-    metadata = _fresh_metadata(config, offer, session, no_cache, unsecure, run_id, run_started)
+    metadata = _fresh_metadata(config, offer, session, no_cache, unsecure, run_id, run_started, instance)
     (run_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, default=str))
     (run_dir / "metadata.json").chmod(0o600)
 
     env = _env_dict(config, profile, image, offer.model, offer.ctx_size, api_key, unsecure, no_cache, session)
     extra = _extra_args(config, no_cache=no_cache)
-    label = f"hostai-{profile.name}-{_now_epoch()}"
+    if instance == state_mod.DEFAULT_INSTANCE:
+        label = f"hostai-{profile.name}-{_now_epoch()}"
+    else:
+        label = f"hostai-{instance}-{profile.name}-{_now_epoch()}"
 
     volume_info: Optional[Dict[str, Any]] = None
     if config.vast.volume_id and config.vast.volume_mount_path:
@@ -1500,6 +1580,7 @@ def _create_fresh_instance(
         run_epoch,
         no_cache,
         unsecure,
+        instance=instance,
     )
 
     provider = _provider(config)
@@ -1514,6 +1595,7 @@ def _create_fresh_instance(
 
 def _do_fresh(
     config: Config,
+    instance: str,
     profile_name: str,
     cache_session: Optional[str],
     local_port: Optional[int],
@@ -1530,25 +1612,31 @@ def _do_fresh(
     dry_run: bool = False,
     allow_unvalidated: bool = False,
 ) -> None:
-    _check_for_live_instance(config)
-    plan = _resolve_fresh_offer(
-        config,
-        profile_name,
-        local_port,
-        max_price,
-        unverified,
-        offer,
-        exclusions or market.OfferExclusions(),
-        bid_price,
-        session_seconds,
-        allow_unvalidated,
-    )
+    # The allocation lock serializes the claim phase (live-instance check,
+    # client-port choice, provider create, state write) so two parallel `up`
+    # runs cannot pick the same name or local port.  The slow boot afterwards
+    # runs outside the lock.
+    with _common.allocation_lock(config):
+        _check_for_live_instance(config, instance)
+        plan = _resolve_fresh_offer(
+            config,
+            profile_name,
+            local_port,
+            max_price,
+            unverified,
+            offer,
+            exclusions or market.OfferExclusions(),
+            bid_price,
+            session_seconds,
+            allow_unvalidated,
+            instance,
+        )
 
-    if dry_run:
-        _log("\nDRY RUN: not creating an instance")
-        return
+        if dry_run:
+            _log("\nDRY RUN: not creating an instance")
+            return
 
-    state = _create_fresh_instance(config, plan, cache_session, no_cache, unsecure)
+        state = _create_fresh_instance(config, instance, plan, cache_session, no_cache, unsecure)
 
     try:
         _do_fresh_core(config, state, plan.image, no_cache, abort_if_shm_too_small)
@@ -1655,8 +1743,18 @@ def _do_fresh_core(
                 f"[disk] telemetry: {len(telemetry['records'])} stages, free={telemetry['records'][-1]['free_bytes'] / 1e9:.2f}GB"
             )
 
+    instance_name = state.data.get("instance_name") or state_mod.instance_name_for_state_file(state.state_file)
+    env_path = state.state_file.parent / "env"
+    try:
+        env_display = env_path.relative_to(config.root_dir)
+    except ValueError:
+        env_display = env_path
+    name_flag = "" if instance_name == state_mod.DEFAULT_INSTANCE else f" --name {instance_name}"
+
     _log("\nREADY")
     _log(f"  Profile:   {state.profile} (sm_{image.cuda_arch})")
+    if instance_name != state_mod.DEFAULT_INSTANCE:
+        _log(f"  Name:      {instance_name}")
     _log(f"  Image:     {state.image}")
     _log(f"  GPU:       {state.gpu}")
     _log(f"  Cost:      ${float(state.dph):.4f}/h")
@@ -1668,8 +1766,8 @@ def _do_fresh_core(
     _log(f"  Run log:   {run_dir}")
     if cache_enabled:
         _log(f"  Slot cache: session={state.slot_cache_session} remote={cache_remote}")
-    _log("\nRun: source .hostai-vast/env")
-    _log("Stop: hostai down")
+    _log(f"\nRun: source {env_display}")
+    _log(f"Stop: hostai down{name_flag}")
 
     maybe_start_watchdog(config, state)
     maybe_start_monitor(config, state)
@@ -1680,10 +1778,13 @@ def _deliver_tls_cert(config: Config, state: State, known_hosts: Path) -> str:
     if state.unsecure:
         return "http"
     tls_dir = tls.ensure_local_tls_dir(config.root_dir)
-    if tls.cert_needs_regeneration(tls_dir):
-        if (tls_dir / "server.crt").exists():
-            _log("[tls] certificate expired or near expiry; regenerating")
-        tls.generate_cert(tls_dir)
+    # Regeneration mutates a shared on-disk cert pair — serialize it so two
+    # parallel `up` runs cannot interleave writes and ship a mismatched pair.
+    with _common.allocation_lock(config):
+        if tls.cert_needs_regeneration(tls_dir):
+            if (tls_dir / "server.crt").exists():
+                _log("[tls] certificate expired or near expiry; regenerating")
+            tls.generate_cert(tls_dir)
     _log("[tls] delivering certificates to container")
     tls_deadline = time.monotonic() + min(120.0, float(config.ssh.start_timeout or 1200))
     last_alive_check = 0.0
@@ -1871,6 +1972,7 @@ def _start_instance_runtime(
 
 def _do_restart(
     config: Config,
+    instance: str,
     profile_name: str,
     local_port: Optional[int],
     unsecure: bool,
@@ -1879,13 +1981,16 @@ def _do_restart(
     allow_unvalidated: bool = False,
 ) -> None:
     _check_production_validation(config, allow_unvalidated)
-    sdir = state_dir(config.root_dir)
-    state = State.load(sdir / "state.json")
+    state = State.load(state_mod.instance_state_file(config.root_dir, instance))
     if not state.instance_id:
-        raise click.ClickException("no state to restart; run hostai up first")
+        flag = "" if instance == state_mod.DEFAULT_INSTANCE else f" --name {instance}"
+        raise click.ClickException(f"no state to restart for instance '{instance}'; run 'hostai up{flag}' first")
 
+    state.data["instance_name"] = instance
     state.unsecure = unsecure
-    resolved = _resolve_client_port(config, user_port=local_port, state_port=state.local_port)
+    resolved = _resolve_client_port(
+        config, user_port=local_port, state_port=state.local_port, instance=instance
+    )
     if resolved != state.local_port:
         state.local_port = resolved
         state.save()
@@ -1933,6 +2038,8 @@ def _do_restart(
 
     _log("\nREADY")
     _log(f"  Profile:   {state.profile}")
+    if instance != state_mod.DEFAULT_INSTANCE:
+        _log(f"  Name:      {instance}")
     _log(f"  API:       {client_base_url}")
     _log(f"  Instance:  {state.instance_id}")
     if state.data.get("machine_id") is not None:

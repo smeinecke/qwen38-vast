@@ -473,8 +473,16 @@ class UnixTLSConnector(aiohttp.UnixConnector):
         return proto
 
 
-def _content_log_path(config: Config) -> Path:
-    return config.root_dir / ".hostai-cache" / "proxy-content.jsonl"
+def _instance_tag(instance: Optional[str]) -> str:
+    """Filename suffix for per-instance proxy artifacts ('' for default)."""
+    from hostai import state as state_mod
+
+    resolved = state_mod.normalize_instance_name(instance)
+    return "" if resolved == state_mod.DEFAULT_INSTANCE else f"-{resolved}"
+
+
+def _content_log_path(config: Config, instance: Optional[str] = None) -> Path:
+    return config.root_dir / ".hostai-cache" / f"proxy-content{_instance_tag(instance)}.jsonl"
 
 
 class _ContentLog:
@@ -537,7 +545,7 @@ class TokenizedProxy:
         self.app.on_cleanup.append(self._on_cleanup)
         self.content_log: Optional[_ContentLog] = None
         if config.proxy.log_content:
-            self.content_log = _ContentLog(_content_log_path(config))
+            self.content_log = _ContentLog(_content_log_path(config, _proxy_instance_name(state)))
             _logger.warning(
                 "content logging enabled; prompts and responses are written to %s",
                 self.content_log.path,
@@ -1380,17 +1388,24 @@ async def _bootstrap_proxy(
     _logger.info("proxy ready")
 
 
-def _proxy_log_file(config: Config) -> Path:
-    return config.root_dir / ".hostai-cache" / "proxy.log"
+def _proxy_instance_name(state: State) -> str:
+    """Instance name owning this state ('default' for the legacy layout)."""
+    from hostai import state as state_mod
+
+    return state.data.get("instance_name") or state_mod.instance_name_for_state_file(state.state_file)
 
 
-def _configure_proxy_logging(config: Config) -> Path:
+def _proxy_log_file(config: Config, instance: Optional[str] = None) -> Path:
+    return config.root_dir / ".hostai-cache" / f"proxy{_instance_tag(instance)}.log"
+
+
+def _configure_proxy_logging(config: Config, instance: Optional[str] = None) -> Path:
     """Attach a file handler so proxy activity is logged locally.
 
     Only operational metadata is logged (token counts, timings, warnings) —
     never prompt or generated content.
     """
-    log_file = _proxy_log_file(config)
+    log_file = _proxy_log_file(config, instance)
     log_file.parent.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("hostai")
     existing = [
@@ -1414,8 +1429,9 @@ async def run_proxy(config: Config, state: State) -> None:
     connection alive as long as it is running. When tokenized-only is enabled it
     tokenizes /v1/chat/completions; otherwise it passes traffic through.
     """
-    log_file = _configure_proxy_logging(config)
-    _logger.info("proxy starting, logging to %s", log_file)
+    instance_name = _proxy_instance_name(state)
+    log_file = _configure_proxy_logging(config, instance_name)
+    _logger.info("proxy starting (instance %s), logging to %s", instance_name, log_file)
 
     # A second `hostai proxy` would unlink the running proxy's socket file and
     # overwrite proxy_pid in state, orphaning the first daemon — refuse early.

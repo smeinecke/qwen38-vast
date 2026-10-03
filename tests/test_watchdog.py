@@ -101,9 +101,9 @@ def test_maybe_start_watchdog_launches(config, project_dir, running_state):
     config.vast.idle_timeout_seconds = 60
     running_state.instance_id = 12345
 
-    def fake_callback(config):
-        watchdog._watchdog_pid_file(config).parent.mkdir(parents=True, exist_ok=True)
-        watchdog._watchdog_pid_file(config).write_text("12345")
+    def fake_callback(config, instance="default"):
+        watchdog._watchdog_pid_file(config, instance).parent.mkdir(parents=True, exist_ok=True)
+        watchdog._watchdog_pid_file(config, instance).write_text("12345")
 
     with mock.patch.object(watchdog, "_start_watchdog", fake_callback):
         watchdog.maybe_start_watchdog(config, running_state)

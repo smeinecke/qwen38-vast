@@ -35,6 +35,16 @@
 - `start.sh` now logs per-stage disk usage (`after-preflight`, `after-main-model`, `after-draft-model`, `before-serve`) to `/dev/shm/qwen38/log/disk-usage.log`. `hostai up` copies this plus a final snapshot to `run-*/disk-telemetry.json` after a successful cold start.
 - The container image must be rebuilt after changes to `start.sh`.
 
+## Multiple instances
+
+- `hostai up --name <n>` provisions a parallel deployment under `.hostai-vast/instances/<n>/`; the reserved name `default` maps to the legacy `.hostai-vast/` layout (`state.json`, `env`, `known_hosts`, `proxy.sock`, `proxy.pid`, `.lifecycle.lock`, …).
+- All instance-bound commands accept `-n/--name` (env `HOSTAI_INSTANCE`); a numeric provider instance id also resolves via `state.resolve_instance_selector`. `status` shows a fleet table when several are tracked; `down --all` stops all.
+- Locks: `.lifecycle.lock` per instance dir (serializes `up`/`restart` for that name only) plus `.hostai-vast/.allocate.lock` (short global lock covering the live-instance check, port claim, provider create and initial state write).
+- Ports: `claimed_local_ports`/`_sibling_claimed_ports` treat ports recorded in sibling `state.json` files as taken even before they are bound.
+- Daemons: monitor/watchdog pid+log files get a `-<name>` suffix in `.hostai-cache/` (`monitor-foo.pid`, `watchdog-foo.log`); proxy uses `proxy-<name>.log`/`proxy-content-<name>.jsonl`. Daemon argv always ends in `--name <instance>` so identity-checked signaling never stops a sibling's daemon.
+- `LocalProvider` serializes its shared `.hostai-vast/local-provider.json` registry under `.local-provider.lock` (`_state_mutation`) and re-reads it on each access.
+- TLS: `.hostai-cache/tls` is shared; regeneration is serialized under the allocation lock.
+
 ## Local provider and integration tests
 
 - Set `HOSTAI_PROVIDER=local` to run `hostai up`/`down` against a local Docker container instead of Vast.

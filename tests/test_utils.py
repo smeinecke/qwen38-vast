@@ -80,3 +80,12 @@ def test_mkdir_private(tmp_path):
     assert result == p
     assert result.exists()
     assert (result.stat().st_mode & 0o777) == 0o700
+
+
+def test_format_duration():
+    assert utils.format_duration(0) == "00:00:00"
+    assert utils.format_duration(59) == "00:00:59"
+    assert utils.format_duration(3661.9) == "01:01:01"
+    assert utils.format_duration(10946) == "03:02:26"
+    assert utils.format_duration(90061) == "25:01:01"
+    assert utils.format_duration(-5) == "00:00:00"

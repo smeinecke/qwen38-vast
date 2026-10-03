@@ -312,6 +312,21 @@ curl "$OPENAI_BASE_URL/chat/completions" \
 `hostai bench` does not support tokenized-only mode yet; disable the toggle to
 run benchmarks.
 
+## 12. Multiple instances in parallel
+
+```bash
+uv run hostai up 5090-128k --name cheap   # second deployment next to the default one
+uv run hostai status                      # overview of all tracked instances
+uv run hostai status --name cheap         # detail for one
+uv run hostai down --name cheap --yes     # stop only that one
+uv run hostai down --all --yes            # stop all of them
+```
+
+`-n/--name` (or `HOSTAI_INSTANCE`) selects the instance on `up`, `down`,
+`status`, `proxy`, `log`, `bench`, `monitor`, `watchdog`, `cache copy` and
+`cost`.  Named instances keep their own `state.json`, `env`, `known_hosts`
+and proxy sockets under `.hostai-vast/instances/<name>/`.
+
 ## Common `.env` overrides
 
 ```dotenv
@@ -335,6 +350,7 @@ Traffic costs are controlled purely by `HOSTAI_MAX_INET_DOWN_COST` and
 ├── .env                  # secrets + initial config (keep 0600)
 ├── hostai.toml           # migrated from .env on first run
 ├── .hostai-vast/         # state, known_hosts, env, monitor-alert.json
+│   └── instances/<name>/ # same set of files per named instance
 ├── .hostai-runs/         # per-run telemetry + benchmarks
 └── .hostai-cache/        # cache key and local TLS material
 ```

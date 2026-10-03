@@ -66,6 +66,7 @@ def test_cache_copy_no_instance(config, project_dir):
 
 def test_cache_copy_cache_disabled(config, running_state):
     running_state.slot_cache_enabled = False
+    running_state.save()
     with mock.patch("hostai.commands.cache_cmd.State.load", return_value=running_state):
         runner = CliRunner()
         result = runner.invoke(cmd_cache_copy, [], obj=config)
@@ -75,6 +76,7 @@ def test_cache_copy_cache_disabled(config, running_state):
 
 
 def test_cache_copy_happy_path(config, running_state, project_dir):
+    running_state.save()
     run_dir = project_dir / ".hostai-runs" / "copy-1"
     run_dir.mkdir(parents=True)
     (run_dir / "cache-save.json").write_text(json.dumps({"n_written": 1024}))

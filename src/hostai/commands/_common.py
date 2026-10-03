@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import json
 import os
 import shutil
 import signal
@@ -11,14 +12,87 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 import click
 
 from hostai import ssh
+from hostai import state as state_mod
 from hostai.config import Config
 from hostai.providers import get_provider
 from hostai.state import State, state_dir
+
+
+def instance_option(fn):
+    """Shared ``-n/--name`` selector for commands bound to one instance."""
+    return click.option(
+        "-n",
+        "--name",
+        "instance_name",
+        envvar="HOSTAI_INSTANCE",
+        default=None,
+        help="Instance name (or instance id) to target; default when only one is tracked.",
+    )(fn)
+
+
+def resolve_state(
+    config: Config,
+    selector: Optional[str] = None,
+    *,
+    required: bool = True,
+) -> Tuple[str, State]:
+    """Resolve an instance selector to ``(instance_name, State)``.
+
+    Without a selector, a single tracked instance wins; multiple tracked
+    instances raise (the caller wants one).  With ``required=False`` an empty
+    State bound to the resolved file is returned instead of raising.
+    """
+    states = state_mod.find_instance_states(config.root_dir)
+    if selector is None:
+        if not states:
+            if required:
+                raise click.ClickException(
+                    "no hostai instances are tracked; run 'hostai up' to create one"
+                )
+            return state_mod.DEFAULT_INSTANCE, State(
+                state_mod.instance_state_file(config.root_dir, state_mod.DEFAULT_INSTANCE)
+            )
+        if len(states) > 1:
+            names = ", ".join(states)
+            raise click.ClickException(
+                f"multiple hostai instances are tracked ({names}); "
+                "use --name <name|id> to select one"
+            )
+        name = next(iter(states))
+        return name, State.load(states[name])
+    try:
+        name = state_mod.resolve_instance_selector(config.root_dir, selector)
+    except ValueError as exc:
+        known = ", ".join(states) or "none"
+        raise click.ClickException(f"{exc} (tracked instances: {known})")
+    return name, State.load(state_mod.instance_state_file(config.root_dir, name))
+
+
+def claimed_local_ports(config: Config, exclude_instance: Optional[str] = None) -> Set[int]:
+    """Local ports claimed by other tracked instances (live instance_id + port)."""
+    exclude = state_mod.normalize_instance_name(exclude_instance)
+    ports: Set[int] = set()
+    for name, sf in state_mod.find_instance_states(config.root_dir).items():
+        if name == exclude:
+            continue
+        try:
+            data = json.loads(sf.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not data.get("instance_id"):
+            continue
+        try:
+            port = int(data.get("local_port") or 0)
+        except (TypeError, ValueError):
+            continue
+        if port:
+            ports.add(port)
+    return ports
 
 
 def resolve_cache_enabled(cache: bool, no_cache: bool, default: bool) -> bool:
@@ -201,15 +275,32 @@ def daemon_pid_running(pid_file: Path, *needles: bytes) -> bool:
 # --- background daemon helpers (watchdog, monitor) ---------------------------
 #
 # Both daemons share the same lifecycle: detached subprocess, pid file and log
-# under .hostai-cache, identity-checked start/stop/status.
+# under .hostai-cache, identity-checked start/stop/status.  Each instance gets
+# its own daemon; named instances suffix the pid/log files with the instance
+# name and the daemon argv always ends in ``--name <instance>`` so identity
+# checks can match on it.
 
 
-def daemon_pid_file(config: Config, name: str) -> Path:
-    return config.root_dir / ".hostai-cache" / f"{name}.pid"
+def _daemon_tag(instance: Optional[str]) -> str:
+    resolved = state_mod.normalize_instance_name(instance)
+    return "" if resolved == state_mod.DEFAULT_INSTANCE else f"-{resolved}"
 
 
-def daemon_log_file(config: Config, name: str) -> Path:
-    return config.root_dir / ".hostai-cache" / f"{name}.log"
+def daemon_pid_file(config: Config, name: str, instance: Optional[str] = None) -> Path:
+    return config.root_dir / ".hostai-cache" / f"{name}{_daemon_tag(instance)}.pid"
+
+
+def daemon_log_file(config: Config, name: str, instance: Optional[str] = None) -> Path:
+    return config.root_dir / ".hostai-cache" / f"{name}{_daemon_tag(instance)}.log"
+
+
+def _daemon_needles(name: str, instance: Optional[str]) -> Tuple[bytes, ...]:
+    # Daemons are spawned as `hostai <name> <sub> ... --name <instance>`; the
+    # NUL-delimited needle requires an exact argv token match so a stale pid
+    # file can never make one instance's daemon look like another's (nor a
+    # prefix-named one: 'foo' does not match 'foo2').
+    resolved = state_mod.normalize_instance_name(instance)
+    return (b"hostai", name.encode(), b"\x00" + resolved.encode() + b"\x00")
 
 
 def pid_is_running(pid: int) -> bool:
@@ -225,21 +316,27 @@ def hostai_executable() -> str:
     return exe if exe else sys.argv[0]
 
 
-def daemon_running(config: Config, name: str) -> bool:
+def daemon_running(config: Config, name: str, instance: Optional[str] = None) -> bool:
     """True when the pid file points at a live, identity-verified daemon."""
-    return daemon_pid_running(daemon_pid_file(config, name), b"hostai", name.encode())
+    return daemon_pid_running(daemon_pid_file(config, name, instance), *_daemon_needles(name, instance))
 
 
-def daemon_log(config: Config, name: str, message: str) -> None:
-    log_file = daemon_log_file(config, name)
+def daemon_log(config: Config, name: str, message: str, instance: Optional[str] = None) -> None:
+    log_file = daemon_log_file(config, name, instance)
     log_file.parent.mkdir(parents=True, exist_ok=True)
     with log_file.open("a", encoding="utf-8") as f:
         f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {message}\n")
 
 
-def spawn_daemon(config: Config, name: str, argv: List[str], banner: Optional[str] = None) -> int:
+def spawn_daemon(
+    config: Config,
+    name: str,
+    argv: List[str],
+    banner: Optional[str] = None,
+    instance: Optional[str] = None,
+) -> int:
     """Start a detached daemon process, record its pid file, return the pid."""
-    log_file = daemon_log_file(config, name)
+    log_file = daemon_log_file(config, name, instance)
     log_file.parent.mkdir(parents=True, exist_ok=True)
     with log_file.open("a", encoding="utf-8") as log:
         if banner:
@@ -252,43 +349,44 @@ def spawn_daemon(config: Config, name: str, argv: List[str], banner: Optional[st
             start_new_session=True,
             close_fds=True,
         )
-    daemon_pid_file(config, name).write_text(str(proc.pid))
+    daemon_pid_file(config, name, instance).write_text(str(proc.pid))
     return proc.pid
 
 
-def stop_daemon(config: Config, name: str, *, echo: bool = False) -> None:
+def stop_daemon(config: Config, name: str, instance: Optional[str] = None, *, echo: bool = False) -> None:
     """SIGTERM the recorded daemon (SIGKILL if it lingers); remove the pid file."""
-    pid_file = daemon_pid_file(config, name)
+    tag = _daemon_tag(instance)
+    pid_file = daemon_pid_file(config, name, instance)
     if not pid_file.exists():
         if echo:
-            click.echo(f"[{name}] not running")
+            click.echo(f"[{name}{tag}] not running")
         return
     try:
         pid = int(pid_file.read_text().strip())
     except (ValueError, OSError):
         pid_file.unlink(missing_ok=True)
         if echo:
-            click.echo(f"[{name}] not running")
+            click.echo(f"[{name}{tag}] not running")
         return
 
     if not pid_is_running(pid):
         pid_file.unlink(missing_ok=True)
         if echo:
-            click.echo(f"[{name}] not running")
+            click.echo(f"[{name}{tag}] not running")
         return
 
-    if not pid_cmdline_contains(pid, b"hostai", name.encode()):
+    if not pid_cmdline_contains(pid, *_daemon_needles(name, instance)):
         # PID was reused by an unrelated process — never signal it.
         pid_file.unlink(missing_ok=True)
         if echo:
-            click.echo(f"[{name}] pid file was stale (pid reused); removed")
+            click.echo(f"[{name}{tag}] pid file was stale (pid reused); removed")
         return
 
     try:
         os.kill(pid, signal.SIGTERM)
     except Exception as exc:
         if echo:
-            click.echo(f"[{name}] could not stop daemon: {exc}", err=True)
+            click.echo(f"[{name}{tag}] could not stop daemon: {exc}", err=True)
         return
 
     # Wait briefly for the process to exit.
@@ -302,33 +400,38 @@ def stop_daemon(config: Config, name: str, *, echo: bool = False) -> None:
             os.kill(pid, signal.SIGKILL)
         except Exception as exc:
             if echo:
-                click.echo(f"[{name}] could not kill daemon: {exc}", err=True)
+                click.echo(f"[{name}{tag}] could not kill daemon: {exc}", err=True)
 
     pid_file.unlink(missing_ok=True)
     if echo:
-        click.echo(f"[{name}] stopped")
+        click.echo(f"[{name}{tag}] stopped")
 
 
-def daemon_status_line(config: Config, name: str) -> str:
-    pid_file = daemon_pid_file(config, name)
+def daemon_status_line(config: Config, name: str, instance: Optional[str] = None) -> str:
+    tag = _daemon_tag(instance)
+    pid_file = daemon_pid_file(config, name, instance)
     if not pid_file.exists():
-        return f"[{name}] not running"
-    if daemon_running(config, name):
-        return f"[{name}] running (pid {pid_file.read_text().strip()}) log={daemon_log_file(config, name)}"
+        return f"[{name}{tag}] not running"
+    if daemon_running(config, name, instance):
+        return (
+            f"[{name}{tag}] running (pid {pid_file.read_text().strip()}) "
+            f"log={daemon_log_file(config, name, instance)}"
+        )
     pid_file.unlink(missing_ok=True)
-    return f"[{name}] not running (stale pid file)"
+    return f"[{name}{tag}] not running (stale pid file)"
 
 
 @contextlib.contextmanager
-def lifecycle_lock(config: Config, command: str) -> Iterator[None]:
-    """Advisory flock so only one mutating lifecycle command runs at a time.
+def lifecycle_lock(config: Config, command: str, instance: Optional[str] = None) -> Iterator[None]:
+    """Advisory flock so only one mutating lifecycle command per instance runs.
 
     ``up``/``restart`` hold this for the whole provisioning run; a second
-    invocation fails fast instead of renting a duplicate instance.  ``down``
-    intentionally does not take it — it must stay usable to interrupt a
-    stuck provisioning run.
+    invocation for the same instance fails fast instead of renting a
+    duplicate.  Different instance names lock different files so parallel
+    instances can be provisioned concurrently.  ``down`` intentionally does
+    not take it — it must stay usable to interrupt a stuck provisioning run.
     """
-    sd = state_dir(config.root_dir)
+    sd = state_mod.instance_state_dir(config.root_dir, instance)
     sd.mkdir(parents=True, exist_ok=True)
     fd = open(sd / ".lifecycle.lock", "a")
     try:
@@ -336,6 +439,27 @@ def lifecycle_lock(config: Config, command: str) -> Iterator[None]:
             fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise click.ClickException(f"another hostai lifecycle command is in progress ({command} blocked)")
+        yield
+    finally:
+        try:
+            fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+        finally:
+            fd.close()
+
+
+@contextlib.contextmanager
+def allocation_lock(config: Config) -> Iterator[None]:
+    """Short global flock around instance creation (port claims + state write).
+
+    Provisioning runs in parallel across instances, but selecting a local
+    port, checking for an existing instance and writing the new state file
+    must not interleave with another concurrent creation.
+    """
+    sd = state_dir(config.root_dir)
+    sd.mkdir(parents=True, exist_ok=True)
+    fd = open(sd / ".allocate.lock", "a")
+    try:
+        fcntl.flock(fd.fileno(), fcntl.LOCK_EX)
         yield
     finally:
         try:

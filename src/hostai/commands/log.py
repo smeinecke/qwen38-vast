@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterator
 
 import click
 
+from hostai.commands import _common
 from hostai.config import Config
 from hostai.proxy import _content_log_path, _proxy_log_file
 
@@ -251,10 +252,18 @@ def _follow_records(path: Path, lines: int, follow: bool) -> None:
     help="Keep watching for new records (Ctrl-C to stop).",
 )
 @click.option("--ops", is_flag=True, help="Tail the operational proxy.log instead (raw output).")
+@click.option(
+    "--name",
+    "instance_name",
+    envvar="HOSTAI_INSTANCE",
+    default=None,
+    help="Instance name (or id) whose proxy log to show.",
+)
 @click.pass_obj
-def cmd_log(config: Config, lines: int, follow: bool, ops: bool) -> None:
+def cmd_log(config: Config, lines: int, follow: bool, ops: bool, instance_name: str) -> None:
+    name, _state = _common.resolve_state(config, instance_name, required=False)
     if ops:
-        path = _proxy_log_file(config)
+        path = _proxy_log_file(config, name)
         if not path.exists():
             raise click.ClickException(f"{path} not found; run 'hostai proxy' first")
         try:
@@ -264,7 +273,7 @@ def cmd_log(config: Config, lines: int, follow: bool, ops: bool) -> None:
             return
         return
 
-    path = _content_log_path(config)
+    path = _content_log_path(config, name)
     if not path.exists():
         raise click.ClickException(
             f"{path} not found; enable content logging with 'log_content = true' in [proxy] "

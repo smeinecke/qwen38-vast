@@ -1,16 +1,28 @@
-"""Runtime state persistence (.hostai-vast/state.json and run metadata)."""
+"""Runtime state persistence (.hostai-vast/state.json and run metadata).
+
+The default instance stores its state in `.hostai-vast/state.json`. Additional
+parallel instances (created with `hostai up --name <n>`) live under
+`.hostai-vast/instances/<n>/state.json`; each instance directory holds its own
+state, known_hosts, proxy pid/socket files and env file.
+"""
 
 from __future__ import annotations
 
 import json
 import os
+import re
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterator, Optional, Tuple
 
 from hostai import utils
 
 SENSITIVE_KEYS = ("api_key", "tunnel_pid")
+
+DEFAULT_INSTANCE = "default"
+"""Reserved instance name; maps to the legacy `.hostai-vast/state.json`."""
+
+_INSTANCE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
 
 class State:
@@ -305,3 +317,103 @@ def runs_dir(root_dir: Path) -> Path:
 
 def cache_dir(root_dir: Path) -> Path:
     return utils.mkdir_private(root_dir / ".hostai-cache")
+
+
+def normalize_instance_name(name: Optional[str]) -> str:
+    """Normalize a --name selector; empty means the default instance."""
+    if name is None or str(name).strip() in ("", DEFAULT_INSTANCE):
+        return DEFAULT_INSTANCE
+    return str(name).strip()
+
+
+def validate_instance_name(name: str) -> str:
+    """Validate an explicit instance name; raises ValueError on bad input."""
+    if not name or not _INSTANCE_NAME_RE.fullmatch(name) or name == DEFAULT_INSTANCE:
+        raise ValueError(
+            f"invalid instance name '{name}' "
+            "(use letters, digits, '.', '_' or '-'; 'default' is reserved)"
+        )
+    return name
+
+
+def instance_state_dir(root_dir: Path, instance: Optional[str]) -> Path:
+    """State directory for an instance name; 'default' is `.hostai-vast` itself."""
+    if normalize_instance_name(instance) == DEFAULT_INSTANCE:
+        return state_dir(root_dir)
+    return utils.mkdir_private(state_dir(root_dir) / "instances" / normalize_instance_name(instance))
+
+
+def instance_state_file(root_dir: Path, instance: Optional[str]) -> Path:
+    return instance_state_dir(root_dir, instance) / "state.json"
+
+
+def find_instance_states(root_dir: Path) -> Dict[str, Path]:
+    """Return {instance_name: state.json path} for all tracked instances.
+
+    The default instance (`.hostai-vast/state.json`) is always first.
+    Directories without a `state.json` are ignored.
+    """
+    found: Dict[str, Path] = {}
+    root = Path(root_dir) / ".hostai-vast"
+    legacy = root / "state.json"
+    if legacy.is_file():
+        found[DEFAULT_INSTANCE] = legacy
+    inst_root = root / "instances"
+    if inst_root.is_dir():
+        for entry in sorted(inst_root.iterdir()):
+            if entry.name == DEFAULT_INSTANCE:
+                continue
+            sf = entry / "state.json"
+            if entry.is_dir() and sf.is_file():
+                found[entry.name] = sf
+    return found
+
+
+def state_root_for(state_file: Path) -> Path:
+    """Derive the `.hostai-vast` root from a state file path (any layout)."""
+    parent = Path(state_file).parent
+    if parent.parent.name == "instances":
+        return parent.parent.parent
+    return parent
+
+
+def sibling_state_files(state_file: Path) -> Iterator[Tuple[str, Path]]:
+    """Yield (instance_name, state_file) for every instance sharing a root."""
+    yield from find_instance_states(state_root_for(state_file).parent).items()
+
+
+def instance_name_for_state_file(state_file: Path) -> str:
+    """Name of the instance owning this state file ('default' for the legacy path)."""
+    parent = Path(state_file).parent
+    if parent.parent.name == "instances":
+        return parent.name
+    return DEFAULT_INSTANCE
+
+
+def resolve_instance_selector(root_dir: Path, selector: Optional[str]) -> str:
+    """Resolve a --name selector (name or numeric instance id) to an instance name.
+
+    None/'default' select the default instance. A selector that is not a known
+    name is matched against the recorded instance ids.
+    """
+    states = find_instance_states(root_dir)
+    sel = normalize_instance_name(selector)
+    if sel == DEFAULT_INSTANCE or sel in states:
+        return sel
+    if str(sel).isdigit():
+        target_id = int(sel)
+        matches = []
+        for name, sf in states.items():
+            try:
+                data = json.loads(sf.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if data.get("instance_id") == target_id:
+                matches.append(name)
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise ValueError(f"instance id {target_id} matches multiple instances: {', '.join(matches)}")
+        raise ValueError(f"no instance with instance id {target_id}")
+    validate_instance_name(sel)
+    raise ValueError(f"no instance named '{sel}'")

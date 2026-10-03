@@ -15,10 +15,11 @@ from typing import Any, Dict, Optional
 import click
 
 from hostai import api
+from hostai import state as state_mod
 from hostai.commands import _common
 from hostai.commands.down import down_instance
 from hostai.config import Config
-from hostai.state import State, state_dir
+from hostai.state import State
 
 _WATCHDOG_METRICS = (
     "llamacpp:prompt_tokens_total",
@@ -28,16 +29,20 @@ _WATCHDOG_METRICS = (
 )
 
 
-def _watchdog_pid_file(config: Config) -> Path:
-    return _common.daemon_pid_file(config, "watchdog")
+def _watchdog_pid_file(config: Config, instance: Optional[str] = None) -> Path:
+    return _common.daemon_pid_file(config, "watchdog", instance)
 
 
-def _watchdog_log_file(config: Config) -> Path:
-    return _common.daemon_log_file(config, "watchdog")
+def _watchdog_log_file(config: Config, instance: Optional[str] = None) -> Path:
+    return _common.daemon_log_file(config, "watchdog", instance)
 
 
-def _log(config: Config, message: str) -> None:
-    _common.daemon_log(config, "watchdog", message)
+def _log(config: Config, message: str, instance: Optional[str] = None) -> None:
+    _common.daemon_log(config, "watchdog", message, instance)
+
+
+def _state_instance_name(state: State) -> str:
+    return state.data.get("instance_name") or state_mod.instance_name_for_state_file(state.state_file)
 
 
 # Number of consecutive successful "inactive" observations required before an
@@ -98,6 +103,7 @@ def _decide_shutdown(
     trigger: str,
     now: float,
     last_activity_epoch: float,
+    instance: Optional[str] = None,
 ) -> Optional[str]:
     """Return a shutdown reason if the trigger should now stop the instance.
 
@@ -113,30 +119,33 @@ def _decide_shutdown(
             _log(
                 config,
                 f"idle for {now - last_activity_epoch:.0f}s ({consecutive_inactive} consecutive inactive observations); destroying instance {state.instance_id}",
+                instance,
             )
             return "idle-timeout"
         if activity_state == "inactive":
             _log(
                 config,
                 f"idle timeout reached but only {consecutive_inactive} inactive observation(s); waiting for {MIN_IDLE_OBSERVATIONS}",
+                instance,
             )
         elif activity_state == "active":
-            _log(config, "idle timeout reached but request still active; waiting")
+            _log(config, "idle timeout reached but request still active; waiting", instance)
         else:
-            _log(config, "idle timeout reached but activity state unknown; waiting")
+            _log(config, "idle timeout reached but activity state unknown; waiting", instance)
     else:  # max-runtime
         if is_idle:
             _log(
                 config,
                 f"max runtime reached and idle ({consecutive_inactive} observations); destroying instance {state.instance_id}",
+                instance,
             )
             return "max-runtime"
         if activity_state == "inactive":
-            _log(config, f"max runtime reached but only {consecutive_inactive} inactive observation(s); waiting")
+            _log(config, f"max runtime reached but only {consecutive_inactive} inactive observation(s); waiting", instance)
         elif activity_state == "active":
-            _log(config, "max runtime reached but request still active; waiting")
+            _log(config, "max runtime reached but request still active; waiting", instance)
         else:
-            _log(config, "max runtime reached but activity state unknown; waiting")
+            _log(config, "max runtime reached but activity state unknown; waiting", instance)
     return None
 
 
@@ -148,6 +157,7 @@ def _run_once(
     max_runtime_deadline: Optional[float],
     consecutive_failures: int = 0,
     consecutive_inactive: int = 0,
+    instance: Optional[str] = None,
 ) -> tuple[Dict[str, Any], float, bool, int, int]:
     """Single watchdog iteration.
 
@@ -169,7 +179,11 @@ def _run_once(
         # an instance just because the metrics endpoint is unreachable.
         last_activity_epoch = now
         if consecutive_failures == 1 or consecutive_failures % 5 == 0:
-            _log(config, f"activity state unknown ({consecutive_failures} consecutive failures); treating as not-idle")
+            _log(
+                config,
+                f"activity state unknown ({consecutive_failures} consecutive failures); treating as not-idle",
+                instance,
+            )
         # A preempted/destroyed instance reports "unknown" forever — after a
         # few misses, confirm via the provider (twice, fail-open) and clean up
         # instead of spinning until the process is killed.
@@ -188,11 +202,11 @@ def _run_once(
 
     if not reason and idle_elapsed:
         reason = _decide_shutdown(
-            config, state, activity_state, consecutive_inactive, "idle-timeout", now, last_activity_epoch
+            config, state, activity_state, consecutive_inactive, "idle-timeout", now, last_activity_epoch, instance
         )
     elif not reason and max_runtime_elapsed:
         reason = _decide_shutdown(
-            config, state, activity_state, consecutive_inactive, "max-runtime", now, last_activity_epoch
+            config, state, activity_state, consecutive_inactive, "max-runtime", now, last_activity_epoch, instance
         )
 
     if reason:
@@ -206,30 +220,30 @@ def _run_once(
                 reason=reason,
                 skip_confirm=True,
             )
-            _watchdog_pid_file(config).unlink(missing_ok=True)
+            _watchdog_pid_file(config, instance).unlink(missing_ok=True)
         except Exception as exc:
-            _log(config, f"down_instance failed: {exc}")
+            _log(config, f"down_instance failed: {exc}", instance)
         return current, last_activity_epoch, True, consecutive_failures, consecutive_inactive
 
     return current, last_activity_epoch, False, consecutive_failures, consecutive_inactive
 
 
-def run_watchdog(config: Config) -> None:
-    """Foreground watchdog loop."""
-    state_file = state_dir(config.root_dir) / "state.json"
+def run_watchdog(config: Config, instance: str = state_mod.DEFAULT_INSTANCE) -> None:
+    """Foreground watchdog loop bound to one instance name."""
+    state_file = state_mod.instance_state_file(config.root_dir, instance)
     if not state_file.exists():
-        _log(config, "no state file; exiting")
+        _log(config, f"no state file for instance '{instance}'; exiting", instance)
         return
 
     state = State.load(state_file)
     if not state.instance_id:
-        _log(config, "no instance in state; exiting")
+        _log(config, "no instance in state; exiting", instance)
         return
 
-    # Bind to the instance seen at startup.  If a surviving watchdog notices
-    # state.json now points at a *different* instance, it must exit — its
-    # max-runtime deadline and idle clock belong to the old instance and
-    # acting on them would destroy the new one.
+    # Bind to the instance id seen at startup.  If the state file now points
+    # at a *different* remote instance, exit — the max-runtime deadline and
+    # idle clock belong to the old one and acting on them would destroy the
+    # new one.
     watched_id = state.instance_id
 
     interval = max(5, config.vast.idle_poll_interval_seconds or 60)
@@ -240,8 +254,9 @@ def run_watchdog(config: Config) -> None:
 
     _log(
         config,
-        f"watchdog started for instance {state.instance_id}; "
+        f"watchdog started for instance '{instance}' (id {state.instance_id}); "
         f"idle={config.vast.idle_timeout_seconds}s max_runtime={max_runtime}s poll={interval}s",
+        instance,
     )
 
     previous_metrics: Dict[str, Any] = {}
@@ -253,12 +268,13 @@ def run_watchdog(config: Config) -> None:
         while True:
             state = State.load(state_file)
             if not state.instance_id:
-                _log(config, "state cleared; exiting")
+                _log(config, "state cleared; exiting", instance)
                 break
             if state.instance_id != watched_id:
                 _log(
                     config,
                     f"state now points at instance {state.instance_id} (was {watched_id}); exiting",
+                    instance,
                 )
                 break
 
@@ -270,13 +286,14 @@ def run_watchdog(config: Config) -> None:
                 max_runtime_deadline,
                 consecutive_failures,
                 consecutive_inactive,
+                instance,
             )
             if done:
                 break
 
             time.sleep(interval)
     except KeyboardInterrupt:
-        _log(config, "interrupted; exiting")
+        _log(config, "interrupted; exiting", instance)
 
 
 @click.group("watchdog", help="Idle and maximum-runtime instance safeguards.")
@@ -286,42 +303,56 @@ def cmd_watchdog(config: Config):
 
 
 @cmd_watchdog.command("run", help="Run the foreground watchdog loop.")
+@_common.instance_option
 @click.pass_obj
-def cmd_watchdog_run(config: Config):
-    run_watchdog(config)
+def cmd_watchdog_run(config: Config, instance_name: Optional[str]):
+    name, _state = _common.resolve_state(config, instance_name, required=False)
+    run_watchdog(config, name)
 
 
-def _start_watchdog(config: Config) -> None:
-    """Launch the watchdog daemon in a detached subprocess."""
-    pid = _common.spawn_daemon(config, "watchdog", [_common.hostai_executable(), "watchdog", "run"], banner="\n")
-    click.echo(f"[watchdog] started daemon (pid {pid}) logging to {_watchdog_log_file(config)}")
+def _start_watchdog(config: Config, instance: str = state_mod.DEFAULT_INSTANCE) -> None:
+    """Launch the watchdog daemon in a detached subprocess for one instance."""
+    argv = [_common.hostai_executable(), "watchdog", "run", "--name", instance]
+    pid = _common.spawn_daemon(config, "watchdog", argv, banner="\n", instance=instance)
+    click.echo(f"[watchdog] started daemon (pid {pid}) logging to {_watchdog_log_file(config, instance)}")
 
 
-def _stop_watchdog(config: Config, echo: bool = False) -> None:
+def _stop_watchdog(config: Config, instance: Optional[str] = None, echo: bool = False) -> None:
     """Kill the watchdog daemon and remove its pid file."""
-    _common.stop_daemon(config, "watchdog", echo=echo)
+    _common.stop_daemon(config, "watchdog", instance, echo=echo)
 
 
 @cmd_watchdog.command("start", help="Start the watchdog daemon.")
+@_common.instance_option
 @click.pass_obj
-def cmd_watchdog_start(config: Config):
-    if _common.daemon_running(config, "watchdog"):
-        pid = _watchdog_pid_file(config).read_text().strip()
-        click.echo(f"[watchdog] already running (pid {pid})")
+def cmd_watchdog_start(config: Config, instance_name: Optional[str]):
+    name, _state = _common.resolve_state(config, instance_name, required=False)
+    if _common.daemon_running(config, "watchdog", name):
+        pid = _watchdog_pid_file(config, name).read_text().strip()
+        click.echo(f"[watchdog] already running for '{name}' (pid {pid})")
         return
-    _start_watchdog(config)
+    _start_watchdog(config, name)
 
 
 @cmd_watchdog.command("stop", help="Stop the watchdog daemon.")
+@_common.instance_option
 @click.pass_obj
-def cmd_watchdog_stop(config: Config):
-    _stop_watchdog(config, echo=True)
+def cmd_watchdog_stop(config: Config, instance_name: Optional[str]):
+    name, _state = _common.resolve_state(config, instance_name, required=False)
+    _stop_watchdog(config, name, echo=True)
 
 
 @cmd_watchdog.command("status", help="Show watchdog daemon status.")
+@_common.instance_option
 @click.pass_obj
-def cmd_watchdog_status(config: Config):
-    click.echo(_common.daemon_status_line(config, "watchdog"))
+def cmd_watchdog_status(config: Config, instance_name: Optional[str]):
+    states = state_mod.find_instance_states(config.root_dir)
+    if instance_name is None and len(states) > 1:
+        for name in states:
+            click.echo(_common.daemon_status_line(config, "watchdog", name))
+        return
+    name, _state = _common.resolve_state(config, instance_name, required=False)
+    click.echo(_common.daemon_status_line(config, "watchdog", name))
 
 
 def maybe_start_watchdog(config: Config, state: State) -> None:
@@ -332,15 +363,16 @@ def maybe_start_watchdog(config: Config, state: State) -> None:
         return
     if not state.instance_id:
         return
-    if _common.daemon_running(config, "watchdog"):
-        # A watchdog is already alive — spawning a second would leave an
-        # unmanaged daemon that could act on a future instance.
-        _log(config, f"watchdog already running; not starting another for instance {state.instance_id}")
+    instance = _state_instance_name(state)
+    if _common.daemon_running(config, "watchdog", instance):
+        # A watchdog for this instance is already alive — spawning a second
+        # would leave an unmanaged daemon.
+        _log(config, f"watchdog already running; not starting another for instance {state.instance_id}", instance)
         return
-    _log(config, f"auto-starting watchdog for instance {state.instance_id}")
-    _start_watchdog(config)
+    _log(config, f"auto-starting watchdog for instance {state.instance_id}", instance)
+    _start_watchdog(config, instance)
 
 
-def stop_watchdog(config: Config) -> None:
-    """Stop the watchdog daemon, if running."""
-    _stop_watchdog(config, echo=False)
+def stop_watchdog(config: Config, instance: Optional[str] = None) -> None:
+    """Stop the watchdog daemon for one instance, if running."""
+    _stop_watchdog(config, instance, echo=False)

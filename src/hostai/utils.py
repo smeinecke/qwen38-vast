@@ -31,6 +31,14 @@ def format_dph(value: float) -> str:
     return f"{value:.4f}"
 
 
+def format_duration(seconds: float) -> str:
+    """Format a duration as ``hh:mm:ss`` (hours are not capped at 24)."""
+    total = max(0, int(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
 def safe_label(label: str) -> str:
     """Turn a user label into a filesystem-safe string."""
     label = re.sub(r"[\s/]+", "-", label)

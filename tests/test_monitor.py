@@ -314,9 +314,9 @@ def test_maybe_start_monitor_launches_daemon(config, project_dir, running_state)
     config.monitor.auto_start = True
     running_state.instance_id = 12345
 
-    def fake_callback(config, profile, group, interval, threshold):
-        _monitor_pid_file(config).parent.mkdir(parents=True, exist_ok=True)
-        _monitor_pid_file(config).write_text("12345")
+    def fake_callback(config, profile, group, interval, threshold, exclusions=None, instance="default"):
+        _monitor_pid_file(config, instance).parent.mkdir(parents=True, exist_ok=True)
+        _monitor_pid_file(config, instance).write_text("12345")
 
     with mock.patch("hostai.commands.monitor._start_monitor", fake_callback):
         maybe_start_monitor(config, running_state)
@@ -417,9 +417,9 @@ def test_maybe_start_monitor_inside_click_context(config, project_dir, running_s
     def inner(cfg):
         maybe_start_monitor(cfg, running_state)
 
-    def fake_start(cfg, profile, group, interval, threshold):
-        _monitor_pid_file(cfg).parent.mkdir(parents=True, exist_ok=True)
-        _monitor_pid_file(cfg).write_text("12345")
+    def fake_start(cfg, profile, group, interval, threshold, exclusions=None, instance="default"):
+        _monitor_pid_file(cfg, instance).parent.mkdir(parents=True, exist_ok=True)
+        _monitor_pid_file(cfg, instance).write_text("12345")
 
     with mock.patch("hostai.commands.monitor._start_monitor", fake_start):
         runner = CliRunner()

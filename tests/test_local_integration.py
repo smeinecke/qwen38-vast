@@ -260,3 +260,49 @@ def test_local_up_socket_timeout_regression(project_dir, local_env, monkeypatch,
 
     # Cleanup should remove the container.
     assert container_count() == before
+
+
+@pytest.mark.skipif(not _has_docker(), reason="docker not available")
+@pytest.mark.skipif(
+    not _image_exists(_integration_image()), reason=f"integration image {_integration_image()} not built"
+)
+def test_local_two_named_instances_in_parallel(project_dir, local_env, monkeypatch, container_count):
+    """Two named deployments run side by side: separate state dirs, ports, teardown."""
+    runner = CliRunner(env=local_env)
+    monkeypatch.chdir(project_dir)
+
+    before = container_count()
+    api_ports = []
+    for name in ("alpha", "beta"):
+        result = runner.invoke(
+            cli,
+            ["up", "--unsecure", "--no-cache", "v100-128k", "--name", name],
+            catch_exceptions=False,
+            obj=None,
+        )
+        assert result.exit_code == 0, (name, result.output)
+        assert "READY" in result.output
+        state_file = project_dir / ".hostai-vast" / "instances" / name / "state.json"
+        assert state_file.is_file()
+        api_line = [line for line in result.output.splitlines() if "API:" in line][0]
+        api_ports.append(api_line.split()[-1])
+
+    # No default-instance state was created.
+    assert not (project_dir / ".hostai-vast" / "state.json").exists()
+    # Distinct local ports.
+    assert api_ports[0] != api_ports[1]
+    assert container_count() == before + 2
+
+    # Fleet overview lists both instances.
+    status = runner.invoke(cli, ["status"], catch_exceptions=False, obj=None, env=dict(local_env, COLUMNS="160"))
+    assert status.exit_code == 0, status.output
+    assert "alpha" in status.output and "beta" in status.output
+
+    # Tearing down one leaves the other running.
+    down_a = runner.invoke(cli, ["down", "--name", "alpha", "--yes"], catch_exceptions=False, obj=None)
+    assert down_a.exit_code == 0, down_a.output
+    assert container_count() == before + 1
+
+    down_b = runner.invoke(cli, ["down", "--name", "beta", "--yes"], catch_exceptions=False, obj=None)
+    assert down_b.exit_code == 0, down_b.output
+    assert container_count() == before

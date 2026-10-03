@@ -627,6 +627,35 @@ Both safeguards always wait for the current request to finish before invoking
 `hostai down`, so they reuse the normal cache-save/telemetry-archive path.
 Manual `hostai down` also stops the watchdog automatically.
 
+## Multiple parallel instances
+
+`hostai up --name <name>` provisions an additional deployment that runs in
+parallel with any existing ones:
+
+```bash
+uv run hostai up a6000-128k                   # default instance
+uv run hostai up 5090-128k --name cheap       # second, named instance
+uv run hostai status                          # fleet overview (all instances)
+uv run hostai status --name cheap             # detail for one
+uv run hostai down --name cheap --yes         # stop just that one
+uv run hostai down --all --yes                # stop everything
+```
+
+`-n/--name` (or `HOSTAI_INSTANCE=...`) is understood by `up`, `down`,
+`status`, `bench`, `cache copy`, `cost volume-break-even`, `proxy`, `log`,
+`monitor` and `watchdog`.  A numeric Vast instance id also works as the
+selector.  When exactly one instance is tracked the selector is optional;
+with several, commands that act on a single instance ask for `--name`.
+
+The default instance keeps the legacy `.hostai-vast/` layout (`state.json`,
+`env`, `known_hosts`, `proxy.sock`, …).  Named instances get
+`.hostai-vast/instances/<name>/` with the same set of files, so no two
+deployments share sockets, pid files or logs.  Monitor/watchdog daemons and
+proxy logs get a `-<name>` suffix under `.hostai-cache/` (e.g.
+`monitor-cheap.pid`, `proxy-cheap.log`).  Local ports are claimed per
+instance: a port recorded in a sibling's state file is skipped even before
+that sibling has bound it, so `up` and the SSH tunnels can never collide.
+
 ## Interruptible / bid instances
 
 `hostai up` accepts `--interruptible` and `--bid <dph>` to rent Vast.ai

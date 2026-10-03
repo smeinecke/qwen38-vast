@@ -20,18 +20,19 @@ from typing import Any, Dict, List, Optional, Tuple
 import click
 
 from hostai import market
+from hostai import state as state_mod
 from hostai.commands import _common
 from hostai.config import Config
 from hostai.profiles import Profile, Profiles
-from hostai.state import State, state_dir
+from hostai.state import State
 
 
-def _monitor_pid_file(config: Config) -> Path:
-    return _common.daemon_pid_file(config, "monitor")
+def _monitor_pid_file(config: Config, instance: Optional[str] = None) -> Path:
+    return _common.daemon_pid_file(config, "monitor", instance)
 
 
-def _monitor_log_file(config: Config) -> Path:
-    return _common.daemon_log_file(config, "monitor")
+def _monitor_log_file(config: Config, instance: Optional[str] = None) -> Path:
+    return _common.daemon_log_file(config, "monitor", instance)
 
 
 @click.group("monitor", help="Monitor Vast prices for cheaper offers.")
@@ -220,18 +221,20 @@ def _skip_options(func):
 @cmd_monitor.command("once", help="Run a single price check.")
 @click.option("--profile", help="Profile to monitor.")
 @click.option("--group", help="Monitor group to search.")
+@_common.instance_option
 @_skip_options
 @click.pass_obj
 def cmd_monitor_once(
     config: Config,
     profile: Optional[str],
     group: Optional[str],
+    instance_name: Optional[str],
     skip_machines: Tuple[int, ...],
     skip_offers: Tuple[int, ...],
     skip_countries: Tuple[str, ...],
 ):
     profiles = Profiles.from_file(config.root_dir / config.hostai.profiles_file)
-    current = State.load(state_dir(config.root_dir) / "state.json")
+    _name, current = _common.resolve_state(config, instance_name, required=False)
     targets = _resolve_monitor_targets(config, profiles, profile, group, current)
     current_dph = current.dph if current.exists else None
     exclusions = _monitor_skips(
@@ -260,6 +263,7 @@ def cmd_monitor_once(
 @click.option("--group", help="Monitor group to search.")
 @click.option("--interval", type=int, default=None, help="Seconds between checks.")
 @click.option("--threshold", type=float, default=None, help="Pct saving before alerting.")
+@_common.instance_option
 @_skip_options
 @click.pass_obj
 def cmd_monitor_watch(
@@ -268,6 +272,7 @@ def cmd_monitor_watch(
     group: Optional[str],
     interval: Optional[int],
     threshold: Optional[float],
+    instance_name: Optional[str],
     skip_machines: Tuple[int, ...],
     skip_offers: Tuple[int, ...],
     skip_countries: Tuple[str, ...],
@@ -275,13 +280,14 @@ def cmd_monitor_watch(
     sec = interval if interval is not None else config.monitor.interval
     pct = threshold if threshold is not None else config.monitor.threshold_pct
     profiles = Profiles.from_file(config.root_dir / config.hostai.profiles_file)
-    current = State.load(state_dir(config.root_dir) / "state.json")
+    name, current = _common.resolve_state(config, instance_name, required=False)
+    state_file = state_mod.instance_state_file(config.root_dir, name)
     targets = _resolve_monitor_targets(config, profiles, profile, group, current)
     label = group or ", ".join(p.name for p in targets)
-    click.echo(f"[monitor] watching '{label}' every {sec}s (threshold {pct}%)")
+    click.echo(f"[monitor] watching '{label}' every {sec}s (threshold {pct}%) instance='{name}'")
     try:
         while True:
-            current = State.load(state_dir(config.root_dir) / "state.json")
+            current = State.load(state_file)
             # Re-resolve targets each round: a new instance may run a
             # different profile/ctx than when the watch started.
             try:
@@ -327,8 +333,9 @@ def _start_monitor(
     interval: Optional[int],
     threshold: Optional[float],
     exclusions: Optional[market.OfferExclusions] = None,
+    instance: str = state_mod.DEFAULT_INSTANCE,
 ) -> None:
-    """Launch the monitor daemon in a detached subprocess."""
+    """Launch the monitor daemon in a detached subprocess for one instance."""
     sec = interval if interval is not None else config.monitor.interval
     pct = threshold if threshold is not None else config.monitor.threshold_pct
     target_label = profile or group or config.monitor.profile or config.monitor.group or config.hostai.default_profile
@@ -339,16 +346,23 @@ def _start_monitor(
     if group:
         cmd.extend(["--group", group])
     cmd.extend((exclusions or market.OfferExclusions()).cli_args())
+    # Always last: the daemon identity check matches on `--name <instance>`
+    # being a trailing argv token.
+    cmd.extend(["--name", instance])
 
     pid = _common.spawn_daemon(
-        config, "monitor", cmd, banner=f"\n# monitor start {target_label} interval={sec}s threshold={pct}%\n"
+        config,
+        "monitor",
+        cmd,
+        banner=f"\n# monitor start {target_label} interval={sec}s threshold={pct}% instance={instance}\n",
+        instance=instance,
     )
-    click.echo(f"[monitor] started daemon (pid {pid}) logging to {_monitor_log_file(config)}")
+    click.echo(f"[monitor] started daemon (pid {pid}) logging to {_monitor_log_file(config, instance)}")
 
 
-def _stop_monitor(config: Config, echo: bool = False) -> None:
+def _stop_monitor(config: Config, instance: Optional[str] = None, echo: bool = False) -> None:
     """Kill the monitor daemon and remove its pid file."""
-    _common.stop_daemon(config, "monitor", echo=echo)
+    _common.stop_daemon(config, "monitor", instance, echo=echo)
 
 
 @cmd_monitor.command("start", help="Start the price monitor daemon.")
@@ -356,6 +370,7 @@ def _stop_monitor(config: Config, echo: bool = False) -> None:
 @click.option("--group", help="Monitor group to search.")
 @click.option("--interval", type=int, default=None, help="Seconds between checks.")
 @click.option("--threshold", type=float, default=None, help="Pct saving before alerting.")
+@_common.instance_option
 @_skip_options
 @click.pass_obj
 def cmd_monitor_start(
@@ -364,13 +379,15 @@ def cmd_monitor_start(
     group: Optional[str],
     interval: Optional[int],
     threshold: Optional[float],
+    instance_name: Optional[str],
     skip_machines: Tuple[int, ...],
     skip_offers: Tuple[int, ...],
     skip_countries: Tuple[str, ...],
 ):
-    if _common.daemon_running(config, "monitor"):
-        pid = _monitor_pid_file(config).read_text().strip()
-        click.echo(f"[monitor] already running (pid {pid})")
+    name, _state = _common.resolve_state(config, instance_name, required=False)
+    if _common.daemon_running(config, "monitor", name):
+        pid = _monitor_pid_file(config, name).read_text().strip()
+        click.echo(f"[monitor] already running for '{name}' (pid {pid})")
         return
     _start_monitor(
         config,
@@ -379,19 +396,29 @@ def cmd_monitor_start(
         interval,
         threshold,
         market.OfferExclusions(machines=skip_machines, offers=skip_offers, countries=skip_countries),
+        instance=name,
     )
 
 
 @cmd_monitor.command("stop", help="Stop the price monitor daemon.")
+@_common.instance_option
 @click.pass_obj
-def cmd_monitor_stop(config: Config):
-    _stop_monitor(config, echo=True)
+def cmd_monitor_stop(config: Config, instance_name: Optional[str]):
+    name, _state = _common.resolve_state(config, instance_name, required=False)
+    _stop_monitor(config, name, echo=True)
 
 
 @cmd_monitor.command("status", help="Show monitor daemon status.")
+@_common.instance_option
 @click.pass_obj
-def cmd_monitor_status(config: Config):
-    click.echo(_common.daemon_status_line(config, "monitor"))
+def cmd_monitor_status(config: Config, instance_name: Optional[str]):
+    states = state_mod.find_instance_states(config.root_dir)
+    if instance_name is None and len(states) > 1:
+        for name in states:
+            click.echo(_common.daemon_status_line(config, "monitor", name))
+        return
+    name, _state = _common.resolve_state(config, instance_name, required=False)
+    click.echo(_common.daemon_status_line(config, "monitor", name))
 
 
 def maybe_start_monitor(config: Config, state: State) -> None:
@@ -400,26 +427,29 @@ def maybe_start_monitor(config: Config, state: State) -> None:
         return
     if not state.instance_id:
         return
-    if _common.daemon_running(config, "monitor"):
+    instance = state.data.get("instance_name") or state_mod.instance_name_for_state_file(state.state_file)
+    if _common.daemon_running(config, "monitor", instance):
         return
-    _log_monitor(config, f"auto-starting monitor for instance {state.instance_id}")
-    _start_monitor(config, profile=None, group=None, interval=None, threshold=None)
+    _log_monitor(config, f"auto-starting monitor for instance {state.instance_id}", instance)
+    _start_monitor(config, profile=None, group=None, interval=None, threshold=None, instance=instance)
 
 
-def stop_monitor(config: Config) -> None:
-    """Stop the monitor daemon if it is running."""
-    _stop_monitor(config, echo=False)
+def stop_monitor(config: Config, instance: Optional[str] = None) -> None:
+    """Stop the monitor daemon for one instance if it is running."""
+    _stop_monitor(config, instance, echo=False)
 
 
-def _log_monitor(config: Config, message: str) -> None:
-    _common.daemon_log(config, "monitor", message)
+def _log_monitor(config: Config, message: str, instance: Optional[str] = None) -> None:
+    _common.daemon_log(config, "monitor", message, instance)
 
 
 @cmd_monitor.command("logs", help="Tail the monitor daemon log.")
 @click.option("--lines", type=int, default=50, help="Number of lines to show.")
+@_common.instance_option
 @click.pass_obj
-def cmd_monitor_logs(config: Config, lines: int):
-    log_file = _monitor_log_file(config)
+def cmd_monitor_logs(config: Config, lines: int, instance_name: Optional[str]):
+    name, _state = _common.resolve_state(config, instance_name, required=False)
+    log_file = _monitor_log_file(config, name)
     if not log_file.exists():
         click.echo("[monitor] no log file")
         return

@@ -2,6 +2,15 @@
 
 ## 2026-10-01
 
+- Multiple parallel instances: `hostai up --name <name>` provisions an additional deployment that runs alongside the default one.
+  - Named instances store all artifacts under `.hostai-vast/instances/<name>/` (own `state.json`, `env`, `known_hosts`, `proxy.sock`, `upstream.sock`, `proxy.pid`, `proxy.log`, `.lifecycle.lock`); the default instance keeps the legacy `.hostai-vast/` layout untouched.
+  - `-n/--name` (or `HOSTAI_INSTANCE`) selects the instance on `up`, `down`, `status`, `bench`, `cache copy`, `cost volume-break-even`, `proxy`, `log`, `monitor *` and `watchdog *`; a numeric provider instance id also works as the selector. When exactly one instance is tracked the selector is optional.
+  - `hostai status` without `--name` prints a fleet overview table when more than one instance is tracked; `hostai down --all` tears every tracked instance down.
+  - Local ports are claimed per instance: `up`, `ensure_tunnel` and proxy startup skip ports recorded in sibling state files even when the sibling has not bound them yet.
+  - Lifecycle locking is per instance (`.lifecycle.lock` inside each instance directory); a short global `.allocate.lock` serializes the live-instance check, port claim, provider create and initial state write.
+  - Monitor, watchdog and proxy daemons are scoped per instance (`monitor-<name>.pid`, `proxy-<name>.log`, `proxy-content-<name>.jsonl`) and carry `--name <instance>` in their argv, so identity-checked pid-file signaling can never stop a sibling's daemon.
+  - `LocalProvider` serializes its shared `.hostai-vast/local-provider.json` container registry under `.local-provider.lock` and re-reads it on each access, so parallel local `up`/`down` runs cannot drop each other's entries.
+  - TLS certificate regeneration is serialized under the allocation lock so concurrent `up` runs cannot produce a mismatched cert/key pair.
 - Expanded cheap single-GPU coverage after a Vast market scan (all reuse existing images):
   - New `turing` image (SM75) + `turing-128k` profile for the Quadro RTX 8000 48 GB — roughly V100 money (~$0.26/h) with 1.4x the VRAM. Built on the default CUDA 12.8 bases (Turing is still supported there; only Volta needs the 12.2 pin).
   - New `5000ada-128k` profile (SM89 `ada` image) for the 32 GB Ada value tier: RTX 5000 Ada (~$0.34/h) and modded RTX 4080S 32 GB. Same ctx/cache settings as `5090-128k`, which proves 128k fits in ~32 GB.
@@ -20,6 +29,7 @@
 - Fixed `--skip-country` never matching real Vast offers: `geolocation` is reported as `"Region/City, CC"` (e.g. `"Arizona, US"`, `"Jiangsu, CN"`); the normalizer now extracts the trailing alpha-2 code.
 - `hostai proxy` now self-heals after the SSH upstream tunnel dies: a steady-state supervisor re-establishes the unix (or TCP) tunnel, flips `ready` so clients get a clean 503 while the model restarts instead of a bare 500, and exits once the provider confirms the instance is gone. `_chat` also maps upstream connect failures to 502 instead of an unhandled 500.
 - `ssh.run_remote` reports the exception class name when `str(exc)` is empty (e.g. `TimeoutError`), and the `up` llama-server preflight error now shows the return code and falls back to stdout.
+- `hostai status` renders `Elapsed` as `hh:mm:ss` (hours not capped at 24) via the new `utils.format_duration` instead of raw seconds.
 
 ## 2026-09-27
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import json
 import shlex
 import socket
 import threading
@@ -19,6 +20,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import asyncssh
 
+from hostai import state as state_mod
 from hostai import utils
 from hostai.config import Config
 from hostai.state import State
@@ -631,6 +633,41 @@ def _verify_remote_socket(
     _boot_log("remote-socket", socket_elapsed, f"{remote_dest} present")
 
 
+def _sibling_claimed_ports(state: State) -> set:
+    """Local ports recorded by other instances sharing this state root.
+
+    A sibling mid-provisioning has reserved its ``local_port`` but not bound it
+    yet, so ``port_is_free`` alone is not enough to avoid collisions.
+    """
+    claimed: set = set()
+    for _name, sf in state_mod.sibling_state_files(state.state_file):
+        if sf == state.state_file:
+            continue
+        try:
+            data = json.loads(sf.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not data.get("instance_id"):
+            continue
+        try:
+            port = int(data.get("local_port") or 0)
+        except (TypeError, ValueError):
+            continue
+        if port:
+            claimed.add(port)
+    return claimed
+
+
+def _find_free_unclaimed_port(start: int, claimed: set) -> int:
+    """First port >= ``start`` that is bound-free and not claimed by a sibling."""
+    for candidate in range(start, min(start + 100, 65535) + 1):
+        if candidate in claimed:
+            continue
+        if utils.port_is_free(candidate):
+            return candidate
+    raise RuntimeError("no free local port available")
+
+
 def _tunnel_is_running(state: State) -> bool:
     if state.local_port and state.local_port in _TUNNELS:
         return True
@@ -688,10 +725,11 @@ def ensure_tunnel(
         stop_tunnel(state)
 
     local_port = state.local_port or config.ssh.local_port
-    if not utils.port_is_free(local_port):
+    claimed = _sibling_claimed_ports(state)
+    if local_port in claimed or not utils.port_is_free(local_port):
         if not config.ssh.local_port_auto:
             raise RuntimeError(f"local port {local_port} is in use and local_port_auto is disabled")
-        local_port = utils.find_free_port(start=local_port + 1)
+        local_port = _find_free_unclaimed_port(local_port + 1, claimed)
 
     thread, stop, identity, known_hosts, start = _start_ssh_forward(
         config,

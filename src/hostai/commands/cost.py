@@ -10,8 +10,9 @@ from typing import Any, Dict, Optional, Tuple
 import click
 
 from hostai import market
+from hostai.commands import _common
 from hostai.config import Config
-from hostai.state import State, runs_dir, state_dir
+from hostai.state import runs_dir
 
 
 def _count_starts_per_month(config: Config, months: int = 1) -> Dict[str, int]:
@@ -36,16 +37,14 @@ def _count_starts_per_month(config: Config, months: int = 1) -> Dict[str, int]:
     return dict(sorted(counts.items()))
 
 
-def _get_current_offer_params(config: Config) -> tuple[float, float, float]:
-    """Try to read dph, inet_down, and disk_bw from the current state."""
-    state_file = state_dir(config.root_dir) / "state.json"
-    if state_file.exists():
-        state = State.load(state_file)
-        if state.instance_id:
-            dph = float(state.dph or config.market.max_dph)
-            inet_down = float(state.inet_down or 500)
-            disk_bw = float(state.disk_bw or 200)
-            return dph, inet_down, disk_bw
+def _get_current_offer_params(config: Config, instance: Optional[str] = None) -> tuple[float, float, float]:
+    """Try to read dph, inet_down, and disk_bw from the selected instance state."""
+    _name, state = _common.resolve_state(config, instance, required=False)
+    if state.exists and state.instance_id:
+        dph = float(state.dph or config.market.max_dph)
+        inet_down = float(state.inet_down or 500)
+        disk_bw = float(state.disk_bw or 200)
+        return dph, inet_down, disk_bw
     return config.market.max_dph, 500.0, 200.0
 
 
@@ -97,6 +96,7 @@ def cmd_cost(config: Config):
     "--inet-down-cost", type=float, default=None, help="Download traffic cost in $/GB (default from state/market)."
 )
 @click.option("--starts-per-month", type=int, default=None, help="Override starts/month estimate.")
+@_common.instance_option
 @click.pass_obj
 def cmd_volume_break_even(
     config: Config,
@@ -107,6 +107,7 @@ def cmd_volume_break_even(
     disk_bw: Optional[float],
     inet_down_cost: Optional[float],
     starts_per_month: Optional[int],
+    instance_name: Optional[str],
 ):
     """Estimate whether a persistent model volume is cheaper than re-downloading.
 
@@ -121,7 +122,7 @@ def cmd_volume_break_even(
     if volume_gb <= 0 or volume_cost_month < 0:
         raise click.ClickException("--volume-gb must be positive and --volume-cost-month non-negative")
 
-    default_dph, default_inet, default_disk = _get_current_offer_params(config)
+    default_dph, default_inet, default_disk = _get_current_offer_params(config, instance_name)
     dph = dph if dph is not None else default_dph
     inet_down = inet_down if inet_down is not None else default_inet
     disk_bw = disk_bw if disk_bw is not None else default_disk

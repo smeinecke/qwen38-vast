@@ -807,7 +807,7 @@ def test_do_restart_no_cache_unsecure(config, project_dir):
                                         with mock.patch("hostai.commands.up._wait_for_api"):
                                             with mock.patch("hostai.commands.up.maybe_start_watchdog"):
                                                 with mock.patch("hostai.commands.up.maybe_start_monitor"):
-                                                    up._do_restart(config, "test", None, True, no_cache=True)
+                                                    up._do_restart(config, "default", "test", None, True, no_cache=True)
     assert state.status == "running"
     provider.start_instance.assert_called_once()
 
@@ -870,6 +870,7 @@ def test_do_restart_with_cache_and_tls(config, project_dir):
                                                                                 ):
                                                                                     up._do_restart(
                                                                                         config,
+                                                                                        "default",
                                                                                         "test",
                                                                                         None,
                                                                                         False,

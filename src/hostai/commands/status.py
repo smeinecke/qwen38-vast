@@ -12,10 +12,11 @@ from rich.console import Console
 from rich.table import Table
 
 from hostai import api, ssh, utils
+from hostai import state as state_mod
 from hostai.commands import _common
 from hostai.config import Config
 from hostai.providers import get_provider
-from hostai.state import State, state_dir
+from hostai.state import State
 
 
 def _provider(config: Config):
@@ -168,6 +169,8 @@ def _print_status(
         api_url = "not assigned"
 
     table.add_row("Instance ID", str(state.instance_id))
+    instance_name = state.data.get("instance_name") or state_mod.instance_name_for_state_file(state.state_file)
+    table.add_row("Name", instance_name)
     table.add_row("Profile", state.profile)
     table.add_row("Image", state.image)
     table.add_row("GPU", state.gpu)
@@ -197,7 +200,7 @@ def _print_status(
     if state.started_epoch:
         elapsed = max(0, utils.now_epoch() - state.started_epoch)
         cost = utils.format_cost(elapsed, state.dph)
-        table.add_row("Elapsed", f"{elapsed}s")
+        table.add_row("Elapsed", utils.format_duration(elapsed))
         table.add_row("Est. cost", f"${cost:.4f}")
 
     console.print(table)
@@ -216,21 +219,71 @@ def _print_status(
             click.echo(f"  {name}: {value}")
 
 
-@click.command("status", help="Show the current instance status.")
+def _status_overview(config: Config, states: Dict[str, Path]) -> None:
+    """Render one row per tracked instance (provider status when reachable)."""
+    console = Console()
+    table = Table(title="hostai instances", show_header=True, header_style="bold")
+    for col in ("Name", "ID", "Profile", "GPU", "Status", "$/h", "Port", "Elapsed", "Est. cost"):
+        table.add_column(col)
+
+    provider = None
+    for name, sf in states.items():
+        state = State.load(sf)
+        remote_status = state.status
+        if provider is None and state.instance_id:
+            try:
+                provider = _provider(config)
+            except Exception:
+                provider = False  # type: ignore[assignment]
+        if provider and state.instance_id:
+            try:
+                inst = provider.get_instance(state.instance_id)  # type: ignore[union-attr]
+                if inst:
+                    remote_status = inst.get("actual_status") or inst.get("status") or "unknown"
+                else:
+                    remote_status = "gone"
+            except Exception:
+                pass
+        elapsed_s = utils.format_duration(max(0, utils.now_epoch() - state.started_epoch)) if state.started_epoch else "-"
+        cost = f"${utils.format_cost(max(0, utils.now_epoch() - state.started_epoch), state.dph):.4f}" if state.started_epoch else "-"
+        table.add_row(
+            name,
+            str(state.instance_id or "-"),
+            state.profile,
+            state.gpu,
+            str(remote_status),
+            f"{state.dph:.4f}",
+            str(state.local_port or "-"),
+            elapsed_s,
+            cost,
+        )
+    console.print(table)
+    click.echo("\nUse 'hostai status --name <name>' for details, '--logs' to tail logs, 'hostai down --name <name>' to stop.")
+
+
+@click.command("status", help="Show instance status (all instances when several are tracked).")
+@_common.instance_option
 @click.option("--logs", is_flag=True, help="Tail the remote llama-server log.")
 @click.option("--lines", type=int, default=100, help="Number of log lines to show.")
 @click.option("--follow", is_flag=True, help="Follow the log stream (uses local ssh client).")
 @click.option("--no-save", is_flag=True, help="Do not append --logs output to run_dir/server-live.log.")
 @click.pass_obj
-def cmd_status(config: Config, logs: bool, lines: int, follow: bool, no_save: bool) -> None:
-    sd = state_dir(config.root_dir)
-    state_file = sd / "state.json"
+def cmd_status(config: Config, instance_name: Optional[str], logs: bool, lines: int, follow: bool, no_save: bool) -> None:
+    states = state_mod.find_instance_states(config.root_dir)
 
-    if not state_file.exists():
+    if not states:
         click.echo("No local hostai Vast state found.")
         return
 
-    state = State.load(state_file)
+    if instance_name is None and len(states) > 1:
+        if logs:
+            raise click.ClickException(
+                f"multiple hostai instances are tracked ({', '.join(states)}); use --name <name|id> with --logs"
+            )
+        _status_overview(config, states)
+        return
+
+    _name, state = _common.resolve_state(config, instance_name)
     if not state.instance_id:
         raise click.ClickException("no running instance; run hostai up first")
 

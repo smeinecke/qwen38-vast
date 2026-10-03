@@ -16,8 +16,9 @@ from hostai.cache import (
     rclone_remote_name,
     remote_cache_dir,
 )
+from hostai.commands import _common
 from hostai.config import Config
-from hostai.state import State, runs_dir, state_dir
+from hostai.state import State, runs_dir
 
 
 def _setup_rclone_cache(config: Config) -> None:
@@ -127,10 +128,11 @@ def _persist_copy_result(state: State, remote_dir: str, n_written: int, run_dir:
 
 @click.command("copy", help="Save the current slot and upload it to the cache server.")
 @click.option("--slot", type=int, default=None, help="Slot ID to save (default from config).")
+@_common.instance_option
 @click.pass_obj
-def cmd_cache_copy(config: Config, slot: Optional[int]):
+def cmd_cache_copy(config: Config, slot: Optional[int], instance_name: Optional[str]):
     """Trigger a slot save on the running instance and upload it."""
-    state = State.load(state_dir(config.root_dir) / "state.json")
+    _name, state = _common.resolve_state(config, instance_name, required=False)
     if not state.instance_id:
         raise click.ClickException("no running instance; run hostai up first")
 

@@ -13,11 +13,12 @@ import click
 import requests
 
 from hostai import api, cache, ssh, utils
+from hostai import state as state_mod
 from hostai.commands import _common
 from hostai.commands.monitor import stop_monitor
 from hostai.config import Config
 from hostai.providers import get_provider
-from hostai.state import State, init_run_dir, runs_dir, state_dir
+from hostai.state import State, init_run_dir, runs_dir
 
 _refresh_ssh_state = _common.refresh_ssh_state
 _stop_remote_model = _common.stop_remote_model
@@ -393,7 +394,9 @@ def down_instance(
     return outcome
 
 
-@click.command("down", help="Stop, save cache, and destroy/pause the current instance.")
+@click.command("down", help="Stop, save cache, and destroy/pause instances.")
+@_common.instance_option
+@click.option("--all", "all_instances", is_flag=True, help="Apply to every tracked instance.")
 @click.option("--yes", is_flag=True, help="Skip confirmation.")
 @click.option("--no-archive", is_flag=True, help="Skip telemetry archive.")
 @click.option("--cache", is_flag=True, help="Save/upload the slot cache for this shutdown.")
@@ -404,6 +407,8 @@ def down_instance(
 @click.pass_obj
 def cmd_down(
     config: Config,
+    instance_name: Optional[str],
+    all_instances: bool,
     yes: bool,
     no_archive: bool,
     cache: bool,
@@ -412,33 +417,53 @@ def cmd_down(
     reason: Optional[str],
     skip_llama: bool,
 ) -> None:
-    sd = state_dir(config.root_dir)
-    state_file = sd / "state.json"
+    if all_instances and instance_name:
+        raise click.ClickException("cannot combine --all with --name")
 
-    if not state_file.exists():
+    states = state_mod.find_instance_states(config.root_dir)
+    if not states:
         click.echo("No local hostai Vast state found.")
         return
 
-    state = State.load(state_file)
-    if not state.instance_id:
+    if all_instances:
+        targets = [(name, State.load(path)) for name, path in states.items()]
+    else:
+        name, state = _common.resolve_state(config, instance_name)
+        targets = [(name, state)]
+
+    targets = [(n, s) for n, s in targets if s.instance_id]
+    if not targets:
         click.echo("No Vast instance id in local state.")
         return
 
     cache_enabled = _common.resolve_cache_enabled(cache, no_cache, config.cache.enabled)
-    if cache_enabled:
-        state.set("slot_cache_enabled", True)
 
-    down_instance(
-        config,
-        state,
-        pause=pause,
-        no_archive=no_archive,
-        no_cache=not cache_enabled,
-        reason=reason,
-        skip_confirm=yes,
-        skip_llama=skip_llama,
-    )
     from hostai.commands.watchdog import stop_watchdog
 
-    stop_watchdog(config)
-    stop_monitor(config)
+    errors: list = []
+    for name, state in targets:
+        if len(targets) > 1:
+            click.echo(f"\n=== instance '{name}' ===")
+        if cache_enabled:
+            state.set("slot_cache_enabled", True)
+        try:
+            outcome = down_instance(
+                config,
+                state,
+                pause=pause,
+                no_archive=no_archive,
+                no_cache=not cache_enabled,
+                reason=reason,
+                skip_confirm=yes,
+                skip_llama=skip_llama,
+            )
+        except click.ClickException as exc:
+            errors.append(f"{name}: {exc.message or exc}")
+            click.echo(f"[down] instance '{name}' failed: {exc.message or exc}", err=True)
+            continue
+        if outcome != "cancelled":
+            stop_watchdog(config, instance=name)
+            stop_monitor(config, instance=name)
+
+    if errors:
+        raise click.ClickException("; ".join(errors))

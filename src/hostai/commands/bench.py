@@ -11,8 +11,9 @@ import click
 
 from hostai import ssh, utils
 from hostai.api import LlamaClient
+from hostai.commands import _common
 from hostai.config import Config
-from hostai.state import State, state_dir
+from hostai.state import State
 
 _DEFAULT_PROMPT = """\
 You are reviewing a performance-sensitive Python service. Analyze the code below as if this were a real production code review. Identify correctness, concurrency, resource-management and performance problems, then propose a concrete refactor. Be precise and include revised code for the most important section.
@@ -183,6 +184,7 @@ def _stream_chat(
 @click.option("--max-tokens", type=int, default=None, help="Max tokens to generate.")
 @click.option("--timeout", type=int, default=None, help="HTTP timeout in seconds.")
 @click.option("--save-prompt", is_flag=True, help="Copy the prompt into the benchmark directory.")
+@_common.instance_option
 @click.pass_obj
 def cmd_bench(
     config: Config,
@@ -191,8 +193,9 @@ def cmd_bench(
     max_tokens: Optional[int],
     timeout: Optional[int],
     save_prompt: bool,
+    instance_name: Optional[str],
 ) -> None:
-    state = State.load(state_dir(config.root_dir) / "state.json")
+    _name, state = _common.resolve_state(config, instance_name, required=False)
     if not state.exists or not state.instance_id:
         raise click.ClickException("no running instance; run hostai up first")
 
