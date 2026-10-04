@@ -53,6 +53,12 @@ The model weights are downloaded at instance startup, not baked into the image.
   stream early. EOS and `n_predict` limits still stop generation remotely.
 - Proxy activity is logged to `.hostai-cache/proxy.log` (metadata only — token
   counts, timings, and warnings; never prompt or output content).
+- Opt-in content logging (`[proxy] log_content` or `HOSTAI_PROXY_LOG_CONTENT=1`)
+  writes one JSON record per request/delta/response to
+  `.hostai-cache/proxy-content.jsonl`. `hostai log` renders it as a live chat
+  transcript; `hostai log --ops` tails the operational `proxy.log`.
+- If the upstream SSH tunnel dies, the proxy re-establishes it automatically
+  and returns 503 until the model is reachable again, then resumes serving.
 
 This makes prompt and output extraction from the remote VM more difficult
 because plaintext never crosses the remote HTTP API. The feature is **not**
@@ -72,9 +78,24 @@ can request a local TCP port as well:
 HOSTAI_PROXY_PORT=18081
 ```
 
+`hostai up -l/--local-port <port>` overrides the configured proxy port for a
+single run.
+
+Requests that set neither `max_tokens` nor `max_completion_tokens` inherit
+`[proxy] default_max_tokens`, which defaults to `-1`: generation runs to EOS or
+the context limit instead of a fixed cap. The same value is forwarded to the
+remote as llama-server's `--n-predict` default, so passthrough mode and direct
+`/completion` calls behave identically:
+
+```toml
+[proxy]
+default_max_tokens = -1   # or HOSTAI_PROXY_DEFAULT_MAX_TOKENS
+```
+
 The proxy tokenizer is pinned to the Qwen3.8-27B base model at a known-good
-revision so tokenization stays reproducible.  Override it only when you have
-verified a new revision with `hostai test-tokenizer` or the golden tests:
+revision so tokenization stays reproducible.  Override it only after verifying a
+new revision against the tokenizer golden tests
+(`uv run pytest tests/test_tokenize.py`):
 
 ```dotenv
 HOSTAI_PROXY_TOKENIZER_REVISION=1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0
@@ -356,6 +377,12 @@ HOSTAI_MONITOR_MAX_RESULTS=5
 HOSTAI_MONITOR_AUTO_START=0
 ```
 
+`hostai up` and `monitor once|watch|start` accept `--skip-machine`,
+`--skip-offer` and `--skip-country` (all repeatable) to exclude specific Vast
+machine IDs, offer IDs or countries from the search. Exclusions given to `up`
+are recorded in `state.json`, so a running or auto-started monitor never
+recommends a host you already ruled out.
+
 For a compatible profile switch, preserve the external slot cache normally:
 
 ```bash
@@ -378,8 +405,8 @@ image in normal `args`/entrypoint mode and only maps container port 22 to a
 random public port. `hostai up` discovers that mapping from the instance JSON and
 creates the same local API tunnel as before.
 
-Before each CI Docker build `scripts/prepare-authorized-keys` creates
-`ssh/authorized_keys.generated`.
+Before each CI Docker build `scripts/prepare-authorized-keys` (or
+`uv run hostai ssh prepare`) creates `ssh/authorized_keys.generated`.
 
 By default it downloads the public SSH keys of the GitHub repository owner from:
 
@@ -476,6 +503,15 @@ Model revision:
 
 The image contains no model weights or private credentials. It does contain the
 configured **public** SSH key(s).
+
+Weights are downloaded from Hugging Face inside the container at boot. When
+`huggingface.co` is unreachable (e.g. CN hosts with DNS poisoning/SNI resets)
+`start.sh` falls back to `HF_MIRROR_ENDPOINT` (default `https://hf-mirror.com`)
+and sets `HF_HUB_DISABLE_XET=1` since xet CAS is not mirrored. Set
+`HOSTAI_HF_ENDPOINT` to skip the reachability probe entirely (e.g. a private
+mirror). To keep mirror downloads trustworthy, pin `model_sha256` /
+`draft_sha256` in `[model]` (env `MODEL_SHA256` / `DRAFT_SHA256`): `start.sh`
+verifies each downloaded blob and refuses to serve on mismatch.
 
 ## GitHub Actions builds
 
@@ -577,6 +613,15 @@ Example Europe-only override:
 GPU_QUERY_OVERRIDE='num_gpus=1 gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_down>=800 disk_bw>=300 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1 geolocation in [DE,NL,FR,SE,FI]'
 ```
 
+`hostai lookup` searches Vast offers for a profile without renting
+(`'*'` searches all profiles; `--max-price`, `--unverified`, `--max-results`,
+`--json`, `--csv`):
+
+```bash
+uv run hostai lookup 5090-128k --max-price 0.55
+uv run hostai lookup '*' --csv
+```
+
 After a successful `hostai up`, `run-*/disk-telemetry.json` records per-stage
 `df` and `du` data so you can verify the real container disk requirement and
 adjust `disk_gb` if needed.
@@ -655,6 +700,12 @@ proxy logs get a `-<name>` suffix under `.hostai-cache/` (e.g.
 `monitor-cheap.pid`, `proxy-cheap.log`).  Local ports are claimed per
 instance: a port recorded in a sibling's state file is skipped even before
 that sibling has bound it, so `up` and the SSH tunnels can never collide.
+
+`hostai info` shows provider ground truth: account balance/credit and every
+instance on the account, with the locally tracked name next to each id and a
+running $/h burn total. `hostai down --id <provider-id>` (repeatable) destroys
+an instance by raw provider id — including machines with no local state — and
+cannot be combined with `--all`/`--name`.
 
 ## Interruptible / bid instances
 

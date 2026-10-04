@@ -182,8 +182,11 @@ uv run hostai status --logs
 uv run hostai status --logs --follow
 ```
 
-`hostai status` also re-creates the local API tunnel if it disappeared, and it
-surfaces any monitor alerts.
+`hostai status` also shows average decode/prompt tok/s (and MTP draft-accept
+rate) in its `Perf` row, re-creates the local API tunnel if it disappeared, and
+surfaces any monitor alerts. With the proxy running, `hostai log` follows the
+client-side request/response transcript (requires `[proxy] log_content = true`);
+`hostai log --ops` tails the operational proxy log instead.
 
 ## 7. Benchmarks
 
@@ -249,11 +252,23 @@ uv run hostai monitor stop
 destroying the instance. Set `HOSTAI_MONITOR_AUTO_START=1` to start the monitor
 automatically after a successful `hostai up`.
 
+`hostai up` and `monitor once|watch|start` accept `--skip-machine`,
+`--skip-offer` and `--skip-country` (repeatable) to exclude hosts, offers or
+countries from the search; exclusions passed to `up` carry over to the monitor.
+
 ## 9. Stop billing
 
 ```bash
 # Save slot 0, upload it to the cache, then destroy the instance
 uv run hostai down --yes
+```
+
+`uv run hostai info` lists every instance on the provider account (plus account
+balance and total burn), including ones with no local state. Those can be
+destroyed directly by provider id:
+
+```bash
+uv run hostai down --id 54135996 --yes
 ```
 
 Emergency opt-out to avoid a cache upload:
@@ -288,6 +303,10 @@ local `hostai proxy` tokenizes the prompt before sending it.
 HOSTAI_TOKENIZED_ONLY=1
 HOSTAI_PROXY_PORT=18081
 ```
+
+Requests without an explicit `max_tokens` (or `max_completion_tokens`) are
+uncapped by default — set `[proxy] default_max_tokens` (or
+`HOSTAI_PROXY_DEFAULT_MAX_TOKENS`) to a positive value to enforce one.
 
 If `HOSTAI_PROXY_PORT` is not set, the proxy listens on a Unix socket
 (`$HOSTAI_PROXY_SOCKET` in `.hostai-vast/env`) and `OPENAI_BASE_URL` is omitted
