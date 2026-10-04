@@ -226,6 +226,7 @@ class ProxySection:
     socket_path: str = ""
     port: int = 0
     log_content: bool = False
+    default_max_tokens: int = -1
     tokenizer_model: str = "Qwen/Qwen3.8-27B"
     tokenizer_revision: str = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
     cache_dir: str = ""
@@ -338,6 +339,7 @@ ENV_MAP: Dict[str, tuple[str, str, Optional[Type[Any]]]] = {
     "HOSTAI_PROXY_SOCKET": ("proxy", "socket_path", str),
     "HOSTAI_PROXY_PORT": ("proxy", "port", int),
     "HOSTAI_PROXY_LOG_CONTENT": ("proxy", "log_content", bool),
+    "HOSTAI_PROXY_DEFAULT_MAX_TOKENS": ("proxy", "default_max_tokens", int),
     "HOSTAI_PROXY_TOKENIZER_MODEL": ("proxy", "tokenizer_model", str),
     "HOSTAI_PROXY_TOKENIZER_REVISION": ("proxy", "tokenizer_revision", str),
     "HOSTAI_PROXY_CACHE_DIR": ("proxy", "cache_dir", str),

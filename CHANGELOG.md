@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-04
+
+- Requests without `max_tokens` are no longer silently capped at 512 (`bench.max_tokens`). The proxy now sends `n_predict` from the new `[proxy] default_max_tokens` option (env `HOSTAI_PROXY_DEFAULT_MAX_TOKENS`, default `-1` = run to EOS/context end), and `max_completion_tokens` is accepted as an alias for `max_tokens`. The same value is forwarded to the remote as `N_PREDICT` so `start.sh` passes it as `llama-server --n-predict`, keeping passthrough mode and direct `/completion` calls consistent.
+
 ## 2026-10-03
 
 - Added `hostai info`: shows provider account ground truth — remaining credit balance (`Provider.get_account_info`, Vast `/users/current`) and every instance on the account (`Provider.list_instances`, Vast `/api/v1/instances/`), with the local tracked name next to each id, per-instance status/GPU/$-per-hour/SSH/age, and a running burn-rate total. Untracked instances are flagged with a `hostai down --id <id>` hint.
@@ -38,6 +42,10 @@
 - `hostai proxy` now self-heals after the SSH upstream tunnel dies: a steady-state supervisor re-establishes the unix (or TCP) tunnel, flips `ready` so clients get a clean 503 while the model restarts instead of a bare 500, and exits once the provider confirms the instance is gone. `_chat` also maps upstream connect failures to 502 instead of an unhandled 500.
 - `ssh.run_remote` reports the exception class name when `str(exc)` is empty (e.g. `TimeoutError`), and the `up` llama-server preflight error now shows the return code and falls back to stdout.
 - `hostai status` renders `Elapsed` as `hh:mm:ss` (hours not capped at 24) via the new `utils.format_duration` instead of raw seconds.
+
+## 2026-09-30
+
+- Fixed `hostai up -l/--local-port` silently losing to a configured `[proxy] port`: `_resolve_client_port` stored the CLI port only in `ssh.local_port`, so `_start_proxy` re-derived `proxy.port || ssh.local_port` and bound the stale configured port. An explicit `--local-port` now overrides the proxy port for that run.
 
 ## 2026-09-27
 

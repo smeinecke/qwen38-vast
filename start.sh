@@ -21,6 +21,9 @@ DEPTH="${DEPTH:-3}"
 BATCH_SIZE="${BATCH_SIZE:-2048}"
 UBATCH_SIZE="${UBATCH_SIZE:-512}"
 REASONING_EFFORT="${REASONING_EFFORT:-xhigh}"
+# Default generation cap for requests that do not set one: -1 = request-defined
+# (run until EOS or context end), matching llama-server semantics.
+N_PREDICT="${N_PREDICT:--1}"
 USE_FASTMTP="${USE_FASTMTP:-1}"
 HOSTAI_PROFILE="${HOSTAI_PROFILE:-custom}"
 
@@ -205,6 +208,7 @@ server_args=(
   --parallel 1
   --batch-size "$BATCH_SIZE"
   --ubatch-size "$UBATCH_SIZE"
+  --n-predict "$N_PREDICT"
   --n-gpu-layers all
   --split-mode none
   --flash-attn on

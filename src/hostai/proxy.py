@@ -601,9 +601,18 @@ class TokenizedProxy:
         if not messages or not isinstance(messages, list):
             raise web.HTTPBadRequest(reason="request must contain a non-empty messages list")
 
-        max_tokens = body.get("max_tokens", self.config.bench.max_tokens)
-        if not isinstance(max_tokens, int) or max_tokens <= 0:
+        max_tokens = body.get("max_tokens", body.get("max_completion_tokens"))
+        if max_tokens is None:
+            # No explicit limit: use the configured default (-1 = request-
+            # defined, run to EOS / context end).
+            default = self.config.proxy.default_max_tokens
+            if not isinstance(default, int) or isinstance(default, bool) or default == 0:
+                default = -1
+            n_predict = default
+        elif not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
             raise web.HTTPBadRequest(reason="max_tokens must be a positive integer")
+        else:
+            n_predict = max_tokens
 
         temperature = body.get("temperature", self.config.bench.temperature)
         if not isinstance(temperature, (int, float)):
@@ -640,13 +649,13 @@ class TokenizedProxy:
             messages=messages,
             tools=tools,
             stream=stream,
-            max_tokens=max_tokens,
+            max_tokens=n_predict,
             temperature=temperature,
             stop=stop_strings,
             prompt_tokens=len(token_ids),
         )
 
-        payload = self.build_completion_payload(token_ids, max_tokens, temperature, stream, body)
+        payload = self.build_completion_payload(token_ids, n_predict, temperature, stream, body)
 
         try:
             upstream_response = await self.session.post(
@@ -687,7 +696,7 @@ class TokenizedProxy:
     @staticmethod
     def build_completion_payload(
         token_ids: List[int],
-        max_tokens: int,
+        n_predict: int,
         temperature: float,
         stream: bool,
         body: Dict[str, Any],
@@ -695,7 +704,7 @@ class TokenizedProxy:
         """Build a native /completion payload from an OpenAI chat request."""
         payload: Dict[str, Any] = {
             "prompt": token_ids,
-            "n_predict": max_tokens,
+            "n_predict": n_predict,
             "temperature": temperature,
             "stream": stream,
             # Ask the upstream to return raw token ids (and, on patched images,

@@ -130,6 +130,10 @@ temperature = 0.7
 tokenized_only = false
 socket_path = ""
 port = 0
+# Generation cap applied when a request does not set max_tokens (or
+# max_completion_tokens). -1 = request-defined (run to EOS / context end).
+# Also forwarded to the remote as llama-server's --n-predict default.
+default_max_tokens = -1
 tokenizer_model = "Qwen/Qwen3.8-27B"
 # Pinned tokenizer revision (commit SHA). Pin this to a known-good commit so
 # tokenization stays reproducible across Hugging Face updates.

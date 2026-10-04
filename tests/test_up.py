@@ -96,6 +96,19 @@ def test_env_dict_default_reasoning_effort(config):
     assert env["REASONING_EFFORT"] == "medium"
 
 
+def test_env_dict_n_predict(config):
+    profile = mock.Mock(name="p", image="img", cache_ram=None, ctx_checkpoints=None)
+    image = mock.Mock(name="img")
+    env = up._env_dict(config, profile, image, "model", 32768, "apikey", False, False, "session")
+    assert env["N_PREDICT"] == "-1"
+    config.proxy.default_max_tokens = 256
+    env = up._env_dict(config, profile, image, "model", 32768, "apikey", False, False, "session")
+    assert env["N_PREDICT"] == "256"
+    config.proxy.default_max_tokens = 0
+    env = up._env_dict(config, profile, image, "model", 32768, "apikey", False, False, "session")
+    assert env["N_PREDICT"] == "-1"
+
+
 def test_resolve_client_port_free(config, project_dir):
     config.root_dir = project_dir
     config.ssh.local_port = None

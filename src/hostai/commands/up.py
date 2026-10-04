@@ -734,6 +734,10 @@ def _env_dict(
         "HOSTAI_TOKENIZED_ONLY": "1" if config.proxy.tokenized_only else "0",
         "SLOT_SAVE_PATH": slot_dir,
     }
+    n_predict = config.proxy.default_max_tokens
+    env["N_PREDICT"] = str(
+        n_predict if isinstance(n_predict, int) and not isinstance(n_predict, bool) and n_predict != 0 else -1
+    )
     hf_token = config.secrets.get("HF_TOKEN") or config.secrets.get("HUGGING_FACE_HUB_TOKEN")
     if hf_token:
         env["HF_TOKEN"] = hf_token
