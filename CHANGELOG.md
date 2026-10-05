@@ -2,6 +2,8 @@
 
 ## 2026-10-05
 
+- `monitor watch` actually sends a desktop notification on ALERT again — `notify.py` existed but was never wired into the Python rewrite (alerts only landed in the daemon log). Deduped per distinct offer/price so a persistent deal doesn't re-ping every interval.
+- `hostai monitor once|watch|start` accept `--max-price <$/h>` (same option as `up`/`lookup`). A running instance already caps searches at its own dph; `--max-price` can only tighten that cap further — it never surfaces offers pricier than the current deployment. `monitor start` forwards the cap into the spawned daemon argv.
 - Added `hostai down --force`: skips every remote-dependent step (provider status check, SSH tunnel, slot-cache save/upload, remote telemetry, remote llama stop) and goes straight to the provider destroy/pause call; local daemon cleanup and state bookkeeping still run. Useful when the remote is wedged mid-boot (e.g. a stalled model download) and the graceful path would wait on dead timeouts.
 
 ## 2026-10-04

@@ -10,11 +10,13 @@ from hostai.commands import _common
 from hostai.commands.monitor import (
     _monitor_log_file,
     _monitor_pid_file,
+    _monitor_price_cap,
     cmd_monitor_logs,
     cmd_monitor_start,
     cmd_monitor_status,
     cmd_monitor_stop,
 )
+from hostai.state import State
 
 
 def test_monitor_pid_and_log_files(config):
@@ -45,6 +47,43 @@ def test_monitor_start(config):
     popen.assert_called_once()
     cmd = popen.call_args.args[0]
     assert cmd[:4] == ["hostai", "monitor", "watch", "--interval"]
+
+
+def test_monitor_price_cap_merges_running_dph(project_dir):
+    state_file = project_dir / ".hostai-vast" / "state.json"
+    running = State(state_file, {"instance_id": 1, "dph": 0.5})
+    running.save()
+
+    assert _monitor_price_cap(running, None) == 0.5
+    assert _monitor_price_cap(running, 0.3) == 0.3  # tightens the running cap
+    assert _monitor_price_cap(running, 0.9) == 0.5  # never exceeds current dph
+
+    absent = State(project_dir / ".hostai-vast" / "other" / "state.json")
+    assert _monitor_price_cap(absent, 0.7) == 0.7
+    assert _monitor_price_cap(absent, None) is None
+
+
+def test_monitor_start_max_price_forwarded(config):
+    log_file = _monitor_log_file(config)
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    fake_proc = mock.Mock(pid=12345)
+    with mock.patch("hostai.commands._common.subprocess.Popen", return_value=fake_proc) as popen:
+        with mock.patch("hostai.commands._common.hostai_executable", return_value="hostai"):
+            runner = CliRunner()
+            result = runner.invoke(cmd_monitor_start, ["--profile", "test", "--max-price", "0.4"], obj=config)
+
+    assert result.exit_code == 0, result.output
+    cmd = popen.call_args.args[0]
+    assert cmd[cmd.index("--max-price") + 1] == "0.4"
+    assert cmd[-2:] == ["--name", "default"]  # daemon identity stays the last token
+
+
+def test_monitor_start_rejects_negative_max_price(config):
+    runner = CliRunner()
+    result = runner.invoke(cmd_monitor_start, ["--max-price", "-1"], obj=config)
+    assert result.exit_code != 0
+    assert "non-negative" in result.output
 
 
 def test_monitor_start_already_running(config):

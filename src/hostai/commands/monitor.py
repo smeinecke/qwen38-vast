@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import click
 
-from hostai import market
+from hostai import market, notify
 from hostai import state as state_mod
 from hostai.commands import _common
 from hostai.config import Config
@@ -112,24 +112,39 @@ def _monitor_skips(current: State, exclusions: Optional[market.OfferExclusions] 
     return market.OfferExclusions.from_state(current.data).merged(exclusions or market.OfferExclusions())
 
 
+def _monitor_price_cap(current: State, max_price: Optional[float]) -> Optional[float]:
+    """Merge ``--max-price`` with the running instance's own dph cap.
+
+    A tracked instance already constrains searches to its current dph — only
+    cheaper offers are interesting — so an explicit cap can only tighten it.
+    ``None`` means "fall back to [market].max_dph" inside the search layer.
+    """
+    cap = (
+        current.dph
+        if (current.exists and current.instance_id and current.dph is not None and current.dph > 0)
+        else None
+    )
+    if max_price is not None:
+        cap = min(cap, max_price) if cap is not None else max_price
+    return cap
+
+
 def _search_profiles(
     config: Config,
     profiles: Profiles,
     targets: List[Profile],
     current: State,
+    *,
+    max_price: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """Search a list of profiles and merge the results.
 
     If a running instance is active, its bid price and current dph constrain
     the search so the monitor only compares against offers that could actually
-    be rented at the same economics.
+    be rented at the same economics.  ``max_price`` further tightens that cap.
     """
     bid_price = current.bid_price if (current.exists and current.bid_price is not None) else None
-    max_price = (
-        current.dph
-        if (current.exists and current.instance_id and current.dph is not None and current.dph > 0)
-        else None
-    )
+    max_price = _monitor_price_cap(current, max_price)
     offer_type = "bid" if bid_price is not None else "on-demand"
 
     all_offers: List[Dict[str, Any]] = []
@@ -167,6 +182,7 @@ def _ranked_best_for_monitor(
     candidates: List[Dict[str, Any]],
     *,
     exclusions: Optional[market.OfferExclusions] = None,
+    max_price: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
     """Return the cheapest offer that is an economic/performance upgrade."""
     if not candidates:
@@ -177,6 +193,8 @@ def _ranked_best_for_monitor(
         max_dph = current.dph
     else:
         max_dph = config.market.max_dph
+    if max_price is not None:
+        max_dph = min(max_dph, max_price)
 
     # The context/profile comparison is guaranteed by selecting the right local
     # profile(s) above.  Still enforce an exact-context check when the Vast
@@ -221,6 +239,7 @@ def _skip_options(func):
 @cmd_monitor.command("once", help="Run a single price check.")
 @click.option("--profile", help="Profile to monitor.")
 @click.option("--group", help="Monitor group to search.")
+@click.option("--max-price", type=float, default=None, help="Maximum all-in $/h to consider.")
 @_common.instance_option
 @_skip_options
 @click.pass_obj
@@ -228,11 +247,14 @@ def cmd_monitor_once(
     config: Config,
     profile: Optional[str],
     group: Optional[str],
+    max_price: Optional[float],
     instance_name: Optional[str],
     skip_machines: Tuple[int, ...],
     skip_offers: Tuple[int, ...],
     skip_countries: Tuple[str, ...],
 ):
+    if max_price is not None and max_price < 0:
+        raise click.ClickException("--max-price must be non-negative")
     profiles = Profiles.from_file(config.root_dir / config.hostai.profiles_file)
     _name, current = _common.resolve_state(config, instance_name, required=False)
     targets = _resolve_monitor_targets(config, profiles, profile, group, current)
@@ -241,8 +263,10 @@ def cmd_monitor_once(
         current, market.OfferExclusions(machines=skip_machines, offers=skip_offers, countries=skip_countries)
     )
 
-    all_offers = _search_profiles(config, profiles, targets, current)
-    best = _ranked_best_for_monitor(config, profiles, current, all_offers, exclusions=exclusions)
+    all_offers = _search_profiles(config, profiles, targets, current, max_price=max_price)
+    best = _ranked_best_for_monitor(
+        config, profiles, current, all_offers, exclusions=exclusions, max_price=max_price
+    )
     if best is None:
         click.echo("no matching offers")
         return
@@ -263,6 +287,7 @@ def cmd_monitor_once(
 @click.option("--group", help="Monitor group to search.")
 @click.option("--interval", type=int, default=None, help="Seconds between checks.")
 @click.option("--threshold", type=float, default=None, help="Pct saving before alerting.")
+@click.option("--max-price", type=float, default=None, help="Maximum all-in $/h to consider.")
 @_common.instance_option
 @_skip_options
 @click.pass_obj
@@ -272,11 +297,14 @@ def cmd_monitor_watch(
     group: Optional[str],
     interval: Optional[int],
     threshold: Optional[float],
+    max_price: Optional[float],
     instance_name: Optional[str],
     skip_machines: Tuple[int, ...],
     skip_offers: Tuple[int, ...],
     skip_countries: Tuple[str, ...],
 ):
+    if max_price is not None and max_price < 0:
+        raise click.ClickException("--max-price must be non-negative")
     sec = interval if interval is not None else config.monitor.interval
     pct = threshold if threshold is not None else config.monitor.threshold_pct
     profiles = Profiles.from_file(config.root_dir / config.hostai.profiles_file)
@@ -285,6 +313,7 @@ def cmd_monitor_watch(
     targets = _resolve_monitor_targets(config, profiles, profile, group, current)
     label = group or ", ".join(p.name for p in targets)
     click.echo(f"[monitor] watching '{label}' every {sec}s (threshold {pct}%) instance='{name}'")
+    last_alert_key: Optional[Tuple[Any, float]] = None
     try:
         while True:
             current = State.load(state_file)
@@ -300,8 +329,10 @@ def cmd_monitor_watch(
             exclusions = _monitor_skips(
                 current, market.OfferExclusions(machines=skip_machines, offers=skip_offers, countries=skip_countries)
             )
-            all_offers = _search_profiles(config, profiles, targets, current)
-            best = _ranked_best_for_monitor(config, profiles, current, all_offers, exclusions=exclusions)
+            all_offers = _search_profiles(config, profiles, targets, current, max_price=max_price)
+            best = _ranked_best_for_monitor(
+                config, profiles, current, all_offers, exclusions=exclusions, max_price=max_price
+            )
             if best:
                 best_dph = best.get("dph_total", 0)
                 machine = best.get("machine_id", "?")
@@ -309,10 +340,18 @@ def cmd_monitor_watch(
                 if current_dph and current_dph > 0 and current_dph > best_dph:
                     saving = (current_dph - best_dph) / current_dph * 100
                     if saving >= pct:
-                        click.echo(
-                            f"[monitor] ALERT: {best.get('gpu_name')} ${best_dph:.4f}/h "
-                            f"is {saving:.1f}% cheaper (machine={machine} loc={loc})"
+                        msg = (
+                            f"{best.get('gpu_name')} ${best_dph:.4f}/h is {saving:.1f}% cheaper "
+                            f"(machine={machine} loc={loc})"
                         )
+                        click.echo(f"[monitor] ALERT: {msg}")
+                        # The daemon's stdout goes to the log file; the desktop
+                        # notification is the only visible channel for alerts.
+                        # Notify once per distinct offer/price, not every tick.
+                        alert_key = (best.get("id") or best.get("ask_contract_id"), round(best_dph, 4))
+                        if alert_key != last_alert_key:
+                            notify.notify(f"hostai monitor '{label}'", msg)
+                            last_alert_key = alert_key
                     else:
                         click.echo(
                             f"[monitor] best ${best_dph:.4f}/h (saving {saving:.1f}%, machine={machine} loc={loc})"
@@ -333,6 +372,7 @@ def _start_monitor(
     interval: Optional[int],
     threshold: Optional[float],
     exclusions: Optional[market.OfferExclusions] = None,
+    max_price: Optional[float] = None,
     instance: str = state_mod.DEFAULT_INSTANCE,
 ) -> None:
     """Launch the monitor daemon in a detached subprocess for one instance."""
@@ -345,6 +385,8 @@ def _start_monitor(
         cmd.extend(["--profile", profile])
     if group:
         cmd.extend(["--group", group])
+    if max_price is not None:
+        cmd.extend(["--max-price", str(max_price)])
     cmd.extend((exclusions or market.OfferExclusions()).cli_args())
     # Always last: the daemon identity check matches on `--name <instance>`
     # being a trailing argv token.
@@ -370,6 +412,7 @@ def _stop_monitor(config: Config, instance: Optional[str] = None, echo: bool = F
 @click.option("--group", help="Monitor group to search.")
 @click.option("--interval", type=int, default=None, help="Seconds between checks.")
 @click.option("--threshold", type=float, default=None, help="Pct saving before alerting.")
+@click.option("--max-price", type=float, default=None, help="Maximum all-in $/h to consider.")
 @_common.instance_option
 @_skip_options
 @click.pass_obj
@@ -379,11 +422,14 @@ def cmd_monitor_start(
     group: Optional[str],
     interval: Optional[int],
     threshold: Optional[float],
+    max_price: Optional[float],
     instance_name: Optional[str],
     skip_machines: Tuple[int, ...],
     skip_offers: Tuple[int, ...],
     skip_countries: Tuple[str, ...],
 ):
+    if max_price is not None and max_price < 0:
+        raise click.ClickException("--max-price must be non-negative")
     name, _state = _common.resolve_state(config, instance_name, required=False)
     if _common.daemon_running(config, "monitor", name):
         pid = _monitor_pid_file(config, name).read_text().strip()
@@ -396,6 +442,7 @@ def cmd_monitor_start(
         interval,
         threshold,
         market.OfferExclusions(machines=skip_machines, offers=skip_offers, countries=skip_countries),
+        max_price=max_price,
         instance=name,
     )
 
