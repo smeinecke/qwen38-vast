@@ -264,9 +264,7 @@ def cmd_monitor_once(
     )
 
     all_offers = _search_profiles(config, profiles, targets, current, max_price=max_price)
-    best = _ranked_best_for_monitor(
-        config, profiles, current, all_offers, exclusions=exclusions, max_price=max_price
-    )
+    best = _ranked_best_for_monitor(config, profiles, current, all_offers, exclusions=exclusions, max_price=max_price)
     if best is None:
         click.echo("no matching offers")
         return
