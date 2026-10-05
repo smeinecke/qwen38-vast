@@ -1099,3 +1099,28 @@ def test_new_profiles_resolve():
     assert gb10_img.platform == "linux/arm64"
     assert "13.3.1" in gb10_img.builder_base
     assert "13.3.1" in gb10_img.runtime_base
+
+
+def test_resurrect_dead_server_relaunches(config, state):
+    state.ssh_url = "ssh://root@10.0.0.1:22"
+    probe = mock.Mock(returncode=0, stdout="dead-70\n")
+    relaunch = mock.Mock(returncode=0, stdout="relaunched\n")
+    with mock.patch("hostai.commands.up.ssh.run_remote", side_effect=[probe, relaunch]) as rr:
+        up._resurrect_dead_server(config, state, Path("/nonexistent"))
+    assert rr.call_count == 2
+    assert "start.sh" in rr.call_args_list[1].args[1]
+
+
+def test_resurrect_dead_server_skips_alive(config, state):
+    state.ssh_url = "ssh://root@10.0.0.1:22"
+    alive = mock.Mock(returncode=0, stdout="alive\n")
+    with mock.patch("hostai.commands.up.ssh.run_remote", return_value=alive) as rr:
+        up._resurrect_dead_server(config, state, Path("/nonexistent"))
+    rr.assert_called_once()
+
+
+def test_resurrect_dead_server_no_ssh_url(config, state):
+    state.ssh_url = None
+    with mock.patch("hostai.commands.up.ssh.run_remote") as rr:
+        up._resurrect_dead_server(config, state, Path("/nonexistent"))
+    rr.assert_not_called()

@@ -167,7 +167,7 @@ def _search_profiles(
                 max_dph=max_dph,
                 offer=None,
                 offer_type=offer_type,
-                limit=10,
+                limit=config.monitor.max_results or 10,
             )
         except Exception:
             continue

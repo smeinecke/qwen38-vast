@@ -180,6 +180,10 @@ def cmd_up(
     if scoring_mode:
         config.market.scoring_mode = scoring_mode
 
+    # [image] unsecure is a config-level default; the CLI flag always wins.
+    if config.image.unsecure:
+        unsecure = True
+
     no_cache = not _common.resolve_cache_enabled(cache, no_cache, config.cache.enabled)
 
     if keep_on_failure:
@@ -729,7 +733,9 @@ def _env_dict(
         "CTX_SIZE": str(ctx_size),
         "USE_FASTMTP": str(int(config.model.use_fastmtp)),
         "REASONING_EFFORT": config.model.reasoning_effort,
+        "HF_REPO": config.model.hf_repo,
         "HF_REVISION": config.model.hf_revision,
+        "DRAFT": config.model.draft,
         "HOSTAI_UNSECURE": "1" if unsecure else "0",
         "HOSTAI_TOKENIZED_ONLY": "1" if config.proxy.tokenized_only else "0",
         "SLOT_SAVE_PATH": slot_dir,
@@ -1982,6 +1988,41 @@ def _start_instance_runtime(
     return client_base_url, cache_remote, cache_enabled
 
 
+def _resurrect_dead_server(config: Config, state: State, known_hosts: Path) -> None:
+    """Re-launch start.sh inside a running container when it died earlier.
+
+    The entrypoint keeps the container (and sshd) alive after start.sh exits
+    so the box can be diagnosed — but Vast still reports the instance as
+    "running", so ``up --restart`` would otherwise wait for a /health that can
+    never appear.  ``hf download`` resumes partial files, so a retry is cheap.
+    """
+    if not state.ssh_url:
+        return
+    probe = (
+        "if pgrep -f 'bin/start.sh|llama-server' >/dev/null 2>&1; then echo alive; "
+        "elif [ -f /run/qwen38/start.exitcode ]; then echo dead-$(cat /run/qwen38/start.exitcode 2>/dev/null); "
+        "else echo unknown; fi"
+    )
+    res = ssh.run_remote(state.ssh_url, probe, known_hosts=known_hosts, config=config, state=state, timeout=15)
+    verdict = (res.stdout or "").strip().splitlines()
+    if not verdict or not verdict[-1].startswith("dead"):
+        return
+    rc = verdict[-1].partition("-")[2] or "?"
+    _log(f"[restart] start.sh exited earlier (rc={rc}); relaunching inside the container")
+
+    # /proc/1/environ still carries the original docker env (LLAMA_API_KEY,
+    # model paths, tokenized-only flags); the relaunched script appends to
+    # server.log so the health wait keeps tailing it.
+    relaunch = (
+        "setsid nohup bash -c 'set -a; "
+        'while IFS= read -r -d "" kv; do export "$kv"; done < /proc/1/environ; '
+        "set +a; exec /usr/local/bin/start.sh' >> /var/log/qwen38/server.log 2>&1 < /dev/null & echo relaunched"
+    )
+    res2 = ssh.run_remote(state.ssh_url, relaunch, known_hosts=known_hosts, config=config, state=state, timeout=15)
+    if "relaunched" not in (res2.stdout or ""):
+        _log("[restart] relaunch did not confirm; continuing to wait for /health anyway", err=True)
+
+
 def _do_restart(
     config: Config,
     instance: str,
@@ -2029,6 +2070,10 @@ def _do_restart(
     ):
         _ensure_instance_alive(config, state, "SSH wait", stopped_is_dead=False)
         raise click.ClickException("SSH daemon did not become reachable")
+
+    # The instance can be "running" while the container's start.sh already died
+    # (e.g. a failed download); kick it again before waiting for /health.
+    _resurrect_dead_server(config, state, known_hosts)
 
     # GPU memory preflight on restart: if the profile has a minimum, verify it.
     _gpu_preflight_or_fail(config, state, known_hosts, cleanup_on_fail=True)

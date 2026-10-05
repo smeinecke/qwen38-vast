@@ -50,6 +50,9 @@ DRAFT_SHA256="${DRAFT_SHA256:-}"
 HOSTAI_HF_ENDPOINT="${HOSTAI_HF_ENDPOINT:-}"
 HF_MIRROR_ENDPOINT="${HF_MIRROR_ENDPOINT:-https://hf-mirror.com}"
 HF_PROBE_TIMEOUT="${HF_PROBE_TIMEOUT:-8}"
+HOSTAI_DL_STALL_SECONDS="${HOSTAI_DL_STALL_SECONDS:-120}"
+HOSTAI_DL_STALL_RESTARTS="${HOSTAI_DL_STALL_RESTARTS:-3}"
+HOSTAI_DL_STALL_POLL="${HOSTAI_DL_STALL_POLL:-15}"
 
 if [[ -z "${LLAMA_API_KEY:-}" ]]; then
   echo >&2 "ERROR: LLAMA_API_KEY is required."
@@ -99,10 +102,65 @@ if ! /usr/local/bin/llama-server --version >"$LLAMA_VERSION_OUT" 2>"$LLAMA_VERSI
 fi
 cat "$LLAMA_VERSION_OUT"
 
+# One download attempt with a progress watchdog: hf (especially hf_xet) can
+# hang indefinitely on half-broken egress — reachable endpoint but dead CAS
+# hosts — without ever exiting.  Watch /models growth and kill the process
+# when nothing lands for HOSTAI_DL_STALL_SECONDS.
+_download_once() {
+  local filename="$1" hf_pid last cur stalled=0 rc=0
+  hf download "$HF_REPO" "$filename" --revision "$HF_REVISION" --local-dir "$MODEL_DIR" &
+  hf_pid=$!
+  last="$(du -sb "$MODEL_DIR" 2>/dev/null | awk '{print $1}')"
+  last="${last:-0}"
+  while kill -0 "$hf_pid" 2>/dev/null; do
+    sleep "$HOSTAI_DL_STALL_POLL"
+    cur="$(du -sb "$MODEL_DIR" 2>/dev/null | awk '{print $1}')"
+    cur="${cur:-0}"
+    if (( cur == last )); then
+      stalled=$((stalled + HOSTAI_DL_STALL_POLL))
+    else
+      stalled=0
+      last=$cur
+    fi
+    if (( stalled >= HOSTAI_DL_STALL_SECONDS )); then
+      echo >&2 "[download] no progress for ${stalled}s on ${filename}; restarting hf"
+      kill -TERM "$hf_pid" 2>/dev/null || true
+      wait "$hf_pid" 2>/dev/null || true
+      return 75  # stall marker
+    fi
+  done
+  wait "$hf_pid" 2>/dev/null || rc=$?
+  return "$rc"
+}
+
 download_file() {
-  local filename="$1"
+  local filename="$1" attempt=1 rc=0
   echo "[download] ${HF_REPO}/${filename}"
-  hf download "$HF_REPO" "$filename" --revision "$HF_REVISION" --local-dir "$MODEL_DIR"
+  while true; do
+    rc=0
+    # NOTE: "if cmd; then ...; fi" yields 0 when the condition fails without an
+    # else branch, which would hide the real status — use || to capture it.
+    _download_once "$filename" || rc=$?
+    if (( rc == 0 )); then
+      return 0
+    fi
+    if (( rc != 75 || attempt > HOSTAI_DL_STALL_RESTARTS )); then
+      return "$rc"  # hf failed on its own, or the restart budget is exhausted
+    fi
+    attempt=$((attempt + 1))
+    # Layered stall fallbacks: first drop xet (its CAS endpoints are the usual
+    # culprit), then move the whole download to the mirror endpoint.
+    if [[ "${HF_HUB_DISABLE_XET:-0}" != "1" ]]; then
+      export HF_HUB_DISABLE_XET=1
+      echo >&2 "[download] retrying ${filename} without xet"
+    elif [[ "$HF_ENDPOINT" == "https://huggingface.co" ]] &&
+         curl -fsI --max-time "$HF_PROBE_TIMEOUT" -o /dev/null "$HF_MIRROR_ENDPOINT"; then
+      export HF_ENDPOINT="$HF_MIRROR_ENDPOINT"
+      echo >&2 "[download] retrying ${filename} via ${HF_MIRROR_ENDPOINT}"
+    else
+      echo >&2 "[download] retrying ${filename} (attempt ${attempt})"
+    fi
+  done
 }
 
 resolve_hf_endpoint() {
@@ -134,6 +192,10 @@ resolve_hf_endpoint() {
 verify_sha256() {
   local filename="$1" expected="$2"
   [[ -n "$expected" ]] || return 0
+  if [[ ! -f "$MODEL_DIR/$filename" ]]; then
+    echo >&2 "ERROR: expected download $MODEL_DIR/$filename is missing"
+    exit 70
+  fi
   echo "[download] verifying sha256 for $filename"
   local actual
   actual="$(sha256sum "$MODEL_DIR/$filename" | awk '{print $1}')"
