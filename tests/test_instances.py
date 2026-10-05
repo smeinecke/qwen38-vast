@@ -432,6 +432,17 @@ def test_cmd_down_name_selects_one(config):
     assert wd_mock.call_args.kwargs.get("instance") == "bar"
 
 
+def test_cmd_down_force_forwards_flag(config):
+    _save_state(config, None, 100)
+    runner = CliRunner()
+    ctx, (_prov, down_mock, _wd_mock, _mon_mock) = _patch_down_pipeline()
+    with ctx:
+        result = runner.invoke(cmd_down, ["--yes", "--force"], obj=config)
+    assert result.exit_code == 0, result.output
+    down_mock.assert_called_once()
+    assert down_mock.call_args.kwargs.get("force") is True
+
+
 def test_cmd_down_all_with_name_rejected(config):
     _save_state(config, "foo", 1)
     runner = CliRunner()

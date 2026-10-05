@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-05
+
+- Added `hostai down --force`: skips every remote-dependent step (provider status check, SSH tunnel, slot-cache save/upload, remote telemetry, remote llama stop) and goes straight to the provider destroy/pause call; local daemon cleanup and state bookkeeping still run. Useful when the remote is wedged mid-boot (e.g. a stalled model download) and the graceful path would wait on dead timeouts.
+
 ## 2026-10-04
 
 - Requests without `max_tokens` are no longer silently capped at 512 (`bench.max_tokens`). The proxy now sends `n_predict` from the new `[proxy] default_max_tokens` option (env `HOSTAI_PROXY_DEFAULT_MAX_TOKENS`, default `-1` = run to EOS/context end), and `max_completion_tokens` is accepted as an alias for `max_tokens`. The same value is forwarded to the remote as `N_PREDICT` so `start.sh` passes it as `llama-server --n-predict`, keeping passthrough mode and direct `/completion` calls consistent.

@@ -362,14 +362,23 @@ def down_instance(
     reason: Optional[str] = None,
     skip_confirm: bool = False,
     skip_llama: bool = False,
+    force: bool = False,
 ) -> str:
     """Stop, persist cache, archive telemetry, and destroy/pause an instance.
 
     This is the shared lifecycle path used by ``hostai down`` and the watchdog
     daemon.  It records a shutdown reason and shutdown-tail metrics.
+
+    ``force`` skips every remote-dependent step (SSH status check, tunnel,
+    slot-cache save, remote telemetry, llama stop) and goes straight to the
+    provider destroy/pause call — local daemon cleanup and state bookkeeping
+    still run.
     """
     if not state.instance_id:
         raise click.ClickException("state missing instance_id")
+
+    if force and not reason:
+        reason = "force"
 
     action = "Pause" if pause else "Destroy"
     gpu = state.gpu
@@ -392,7 +401,10 @@ def down_instance(
     # Check once whether the instance still exists before spending time on
     # SSH-dependent steps (tunnel, slot cache, remote telemetry).  A gone or
     # terminal instance turns each of those into a dead-timeout wait.
-    remote_ok, instance, inst_reason = _instance_remote_status(config, state)
+    if force:
+        remote_ok, instance, inst_reason = False, None, "forced shutdown"
+    else:
+        remote_ok, instance, inst_reason = _instance_remote_status(config, state)
     if not remote_ok:
         click.echo(
             f"[down] instance {state.instance_id}: {inst_reason}; skipping remote steps",
@@ -479,6 +491,12 @@ def down_instance(
 @click.option("--pause", is_flag=True, help="Pause the instance instead of destroying it.")
 @click.option("--reason", help="Shutdown reason (used by watchdog).")
 @click.option("--skip-llama", is_flag=True, help="Skip the remote llama.cpp shutdown.")
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Skip all remote steps (SSH check, tunnel, slot cache, telemetry, llama stop) "
+    "and destroy/pause the instance immediately.",
+)
 @click.pass_obj
 def cmd_down(
     config: Config,
@@ -492,6 +510,7 @@ def cmd_down(
     pause: bool,
     reason: Optional[str],
     skip_llama: bool,
+    force: bool,
 ) -> None:
     if all_instances and instance_name:
         raise click.ClickException("cannot combine --all with --name")
@@ -546,6 +565,7 @@ def cmd_down(
                 reason=reason,
                 skip_confirm=yes,
                 skip_llama=skip_llama,
+                force=force,
             )
         except click.ClickException as exc:
             errors.append(f"{name}: {exc.message or exc}")
