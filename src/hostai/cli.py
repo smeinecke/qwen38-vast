@@ -18,6 +18,7 @@ from hostai.commands.monitor import (
     cmd_monitor_watch,
 )
 from hostai.commands.proxy import cmd_proxy
+from hostai.commands.replace import cmd_replace
 from hostai.commands.results import cmd_results
 from hostai.commands.ssh_cmd import cmd_ssh_prepare
 from hostai.commands.status import cmd_status
@@ -52,6 +53,7 @@ cli.add_command(cmd_lookup, name="lookup")
 cli.add_command(cmd_results, name="results")
 cli.add_command(cmd_up, name="up")
 cli.add_command(cmd_down, name="down")
+cli.add_command(cmd_replace, name="replace")
 cli.add_command(cmd_status, name="status")
 cli.add_command(cmd_info, name="info")
 cli.add_command(cmd_bench, name="bench")

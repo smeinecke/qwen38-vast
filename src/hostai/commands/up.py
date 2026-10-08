@@ -1232,8 +1232,13 @@ def _start_proxy(config: Config, state: State, client_api_scheme: str = "http") 
         return None
 
     # Record the proxy pid/port in the same state object the caller will keep
-    # writing.  Reloading would create a fresh copy that the next state.save()
-    # in the caller would overwrite.
+    # writing.  The freshly spawned daemon already persisted its own fields
+    # (upstream_socket, proxy_port) before binding; merge them from disk so
+    # this save does not clobber them with a stale copy.
+    disk_state = State.load(state.state_file)
+    for key in ("upstream_socket", "proxy_port"):
+        if disk_state.data.get(key) is not None:
+            state.data[key] = disk_state.data[key]
     state.data["proxy_pid"] = proc.pid
     state.local_port = port
     state.save()
@@ -1276,7 +1281,7 @@ def _prefetch_slot_cache_to_vast(
 class _FreshOffer(NamedTuple):
     """Resolved provisioning inputs before an instance is created."""
 
-    local_port: int
+    local_port: Optional[int]
     profile: Profile
     image: Image
     ctx_size: int
@@ -1334,9 +1339,11 @@ def _resolve_fresh_offer(
     allow_unvalidated: bool,
     instance: str = state_mod.DEFAULT_INSTANCE,
     machine: Optional[int] = None,
+    resolve_client_port: bool = True,
 ) -> _FreshOffer:
     """Resolve profile, search query and select a market offer."""
-    local_port = _resolve_client_port(config, user_port=local_port, instance=instance)
+    if resolve_client_port:
+        local_port = _resolve_client_port(config, user_port=local_port, instance=instance)
     profiles, profile, image = _resolve_profile(config, profile_name)
     ctx_size = config.hostai.ctx_size_override if config.hostai.ctx_size_override else profile.ctx_size
     model = profile.model or config.model.model
@@ -1551,8 +1558,17 @@ def _create_fresh_instance(
     cache_session: Optional[str],
     no_cache: bool,
     unsecure: bool,
+    *,
+    state_file: Optional[Path] = None,
+    api_key: Optional[str] = None,
 ) -> State:
-    """Create the provider instance and initialize a fresh ``State``."""
+    """Create the provider instance and initialize a fresh ``State``.
+
+    ``state_file`` lets `replace` stage the new run under a sidecar file so the
+    live ``state.json`` (and the proxy watching it) only flips at cutover.
+    ``api_key`` lets `replace` reuse the current bearer token so client env and
+    proxy auth stay identical across the swap.
+    """
     sdir = state_mod.instance_state_dir(config.root_dir, instance)
     profile = offer.profile
     image = offer.image
@@ -1560,7 +1576,7 @@ def _create_fresh_instance(
     run_dir = init_run_dir(runs_dir(config.root_dir), profile.name, run_id)
     run_started = _now_rfc()
     run_epoch = _now_epoch()
-    api_key = config.secrets.get("MODEL_API_KEY") or utils.make_api_key()
+    api_key = api_key or config.secrets.get("MODEL_API_KEY") or utils.make_api_key()
     session = cache_session or config.cache.session
 
     metadata = _fresh_metadata(config, offer, session, no_cache, unsecure, run_id, run_started, instance)
@@ -1602,7 +1618,7 @@ def _create_fresh_instance(
     if not instance_id:
         raise click.ClickException(f"create response did not contain an instance ID: {create_raw}")
 
-    state = State.load(sdir / "state.json")
+    state = State.load(state_file or sdir / "state.json")
     _fill_fresh_state(
         state,
         config,

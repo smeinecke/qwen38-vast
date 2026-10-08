@@ -94,8 +94,9 @@ def test_local_provider_offers_match_query(project_dir):
     config = _config(project_dir)
     provider = LocalProvider(config)
     v100_offers = provider.search_offers('gpu_name in ["Tesla V100"]')
-    assert len(v100_offers) == 1
-    assert v100_offers[0]["gpu_name"] == "Tesla V100"
+    assert len(v100_offers) == 2
+    assert all(o["gpu_name"] == "Tesla V100" for o in v100_offers)
+    assert len({o["machine_id"] for o in v100_offers}) == 2
 
     all_offers = provider.search_offers("gpu_name=RTX_4090")
     assert len(all_offers) == 1

@@ -535,10 +535,14 @@ class TokenizedProxy:
         self.ssl_ctx = _ssl_context(state)
         self.session: Optional[aiohttp.ClientSession] = None
         self.ready = False
+        # Set by retarget(); cleared once upstream /health succeeds again and
+        # /props has been re-fetched for the new backend.
+        self.retarget_pending = False
         self.app = web.Application(client_max_size=64 * 1024 * 1024)
         self.app.router.add_post("/v1/chat/completions", self._chat)
         self.app.router.add_get("/v1/models", self._models)
         self.app.router.add_get("/health", self._health)
+        self.app.router.add_get("/_hostai/backend", self._backend)
         # Generic pass-through for all other endpoints (slots, metrics, props, ...).
         self.app.router.add_route("*", "/{path:.*}", self._generic)
         self.app.on_startup.append(self._on_startup)
@@ -559,7 +563,12 @@ class TokenizedProxy:
         except OSError as exc:
             _logger.warning("content log write failed: %s", exc)
 
-    async def _on_startup(self, app: web.Application) -> None:
+    def _build_upstream_session(self) -> aiohttp.ClientSession:
+        """Create the upstream-facing session for the current state.
+
+        The Authorization header and TLS/Unix connector are baked into the
+        session at construction, so retarget() rebuilds it from scratch.
+        """
         if self.upstream_socket:
             connector: aiohttp.BaseConnector = UnixTLSConnector(
                 path=self.upstream_socket, ssl=self.ssl_ctx, limit=20, force_close=True
@@ -569,11 +578,34 @@ class TokenizedProxy:
         headers: Dict[str, str] = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        self.session = aiohttp.ClientSession(
+        return aiohttp.ClientSession(
             connector=connector,
             headers=headers,
             timeout=aiohttp.ClientTimeout(total=None, connect=30, sock_read=900),
         )
+
+    async def _on_startup(self, app: web.Application) -> None:
+        self.session = self._build_upstream_session()
+
+    async def retarget(self, fresh: State) -> None:
+        """Point the proxy at a new upstream instance without dropping listeners.
+
+        Called by the upstream supervisor when ``state.json`` flips under the
+        running proxy (``hostai replace`` writes it atomically at cutover).
+        Client-facing sockets stay bound; only the upstream session and the
+        identity fields move.  In-flight upstream requests are cancelled.
+        """
+        old_id = self.state.instance_id
+        self.state = fresh
+        self.upstream, self.upstream_socket = _resolve_upstream(fresh)
+        self.api_key = fresh.api_key or ""
+        self.ssl_ctx = _ssl_context(fresh)
+        self.ready = False
+        self.retarget_pending = True
+        if self.session is not None:
+            await self.session.close()
+        self.session = self._build_upstream_session()
+        _logger.warning("retargeted upstream to instance %s (was %s)", fresh.instance_id, old_id)
 
     async def _on_cleanup(self, app: web.Application) -> None:
         if self.session:
@@ -1139,6 +1171,20 @@ class TokenizedProxy:
             }
         )
 
+    async def _backend(self, request: web.Request) -> web.Response:
+        """Report which upstream instance the proxy is currently bound to.
+
+        ``hostai replace`` polls this to confirm the hot-retarget landed.
+        """
+        return web.json_response(
+            {
+                "instance_id": self.state.instance_id,
+                "upstream": self.upstream,
+                "upstream_socket": self.upstream_socket,
+                "ready": self.ready,
+            }
+        )
+
     async def _health(self, request: web.Request) -> web.Response:
         if not self.ready or self.session is None:
             raise web.HTTPServiceUnavailable(reason="proxy not ready")
@@ -1303,6 +1349,49 @@ async def _probe_upstream_health(proxy: TokenizedProxy, timeout: float = 10.0) -
         return False
 
 
+def _retarget_tunnel(proxy: TokenizedProxy, old_socket: Optional[str]) -> None:
+    """Drop the SSH forward to the previous host and re-create it for the new one.
+
+    The local path/port stays identical (``hostai replace`` preserves it), so
+    the proxy's connector and client-facing listeners need no changes.  For
+    the TCP case ``stop_tunnel`` must run on the *fresh* state — it is keyed
+    on the same local_port, and saving the stale pre-flip state would race
+    the ``state.json`` cutover.
+    """
+    if old_socket:
+        ssh.stop_unix_tunnel(old_socket)
+    else:
+        ssh.stop_tunnel(proxy.state)
+    if proxy.upstream_socket:
+        local_path = ssh.ensure_unix_tunnel(proxy.config, proxy.state)
+        _logger.info("SSH unix tunnel re-established on %s", local_path)
+    else:
+        ssh.ensure_tunnel(proxy.config, proxy.state)
+        _logger.info("SSH TCP tunnel re-established on :%s", proxy.state.local_port)
+
+
+async def _maybe_retarget(proxy: TokenizedProxy) -> bool:
+    """Reload ``state.json`` and retarget when the instance id changed.
+
+    ``hostai replace`` provisions under a sidecar state file and flips
+    ``state.json`` atomically at cutover — the instance_id swap is the
+    trigger.  Returns True when a retarget happened this cycle.
+    """
+    try:
+        fresh = await asyncio.to_thread(State.load, proxy.state.state_file)
+    except Exception:
+        return False
+    if not fresh.instance_id or fresh.instance_id == proxy.state.instance_id:
+        return False
+    old_socket = proxy.upstream_socket
+    await proxy.retarget(fresh)
+    try:
+        await asyncio.to_thread(_retarget_tunnel, proxy, old_socket)
+    except Exception as exc:
+        _logger.error("upstream tunnel retarget failed: %s", exc)
+    return True
+
+
 async def _upstream_supervisor(
     proxy: TokenizedProxy,
     server_task: asyncio.Task,
@@ -1314,14 +1403,29 @@ async def _upstream_supervisor(
     restarts, and post-bootstrap nothing recreated it — every request then
     failed with a bare 500 forever.  This loop re-establishes the tunnel,
     gates ``proxy.ready`` on upstream /health (clients see a clean 503
-    while the model restarts), and stops the proxy once the provider
+    while the model restarts), follows ``state.json`` instance swaps from
+    ``hostai replace``, and stops the proxy once the provider
     confirms the instance is gone.
     """
     consecutive_failures = 0
     last_dead_check = 0.0
     while not server_task.done():
+        try:
+            await _maybe_retarget(proxy)
+        except Exception as exc:
+            _logger.error("upstream retarget failed: %s", exc)
+
         healthy = await _probe_upstream_health(proxy)
         if healthy:
+            if proxy.retarget_pending:
+                proxy.retarget_pending = False
+                try:
+                    props = await _fetch_props_once(proxy.config, proxy.state)
+                    if props and props.get("chat_template"):
+                        proxy.tokenizer = Tokenizer(proxy.config, chat_template=props["chat_template"])
+                        _logger.info("tokenizer reloaded from remote /props after retarget")
+                except Exception as exc:
+                    _logger.warning("/props refresh after retarget failed: %s", exc)
             if not proxy.ready:
                 proxy.ready = True
                 _logger.info("upstream /health recovered; marking proxy ready")
@@ -1460,6 +1564,9 @@ async def run_proxy(config: Config, state: State) -> None:
     state = State.load(state.state_file)
     state.data["proxy_pid"] = os.getpid()
     state.data["upstream_socket"] = upstream_socket
+    # The client-facing TCP port, distinct from state.local_port which the
+    # unsecure-mode SSH tunnel claims after the proxy already bound its own.
+    state.data["proxy_port"] = port
     state.save()
 
     tokenizer = Tokenizer(config)

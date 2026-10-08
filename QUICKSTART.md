@@ -287,6 +287,16 @@ KEEP_ON_FAILURE=1
 ## 10. Switch to a better GPU
 
 ```bash
+uv run hostai replace 5090-128k --session my-project
+```
+
+`replace` accepts the same selection options as `up` and swaps in a new machine
+while the proxy keeps serving on the same port — the old instance is destroyed
+only after the new backend is healthy (the current `machine_id` is excluded by
+default; override with `--allow-same-machine`, `--machine`, or `--offer`).
+The manual equivalent still works:
+
+```bash
 uv run hostai down --yes
 uv run hostai up 5090-128k --session my-project
 ```

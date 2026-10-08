@@ -8,6 +8,7 @@ The image can be built with:
     docker build -f tests/integration/Dockerfile.test -t hostai-test:latest .
 """
 
+import json
 import os
 import re
 import shutil
@@ -305,4 +306,59 @@ def test_local_two_named_instances_in_parallel(project_dir, local_env, monkeypat
 
     down_b = runner.invoke(cli, ["down", "--name", "beta", "--yes"], catch_exceptions=False, obj=None)
     assert down_b.exit_code == 0, down_b.output
+    assert container_count() == before
+
+
+@pytest.mark.skipif(not _has_docker(), reason="docker not available")
+@pytest.mark.skipif(
+    not _image_exists(_integration_image()), reason=f"integration image {_integration_image()} not built"
+)
+def test_local_replace_lifecycle(project_dir, local_env, monkeypatch, container_count):
+    """hostai replace swaps the container for a different machine, keeps the port."""
+    runner = CliRunner(env=local_env)
+    monkeypatch.chdir(project_dir)
+
+    before = container_count()
+    result = runner.invoke(
+        cli,
+        ["up", "--unsecure", "--no-cache", "v100-128k"],
+        catch_exceptions=False,
+        obj=None,
+    )
+    assert result.exit_code == 0, result.output
+    assert container_count() == before + 1
+
+    state_file = project_dir / ".hostai-vast" / "state.json"
+    old_state = json.loads(state_file.read_text())
+    old_id = old_state["instance_id"]
+    old_machine = old_state["machine_id"]
+
+    rep = runner.invoke(
+        cli,
+        ["replace", "--unsecure", "--no-cache"],
+        catch_exceptions=False,
+        obj=None,
+    )
+    assert rep.exit_code == 0, rep.output
+    assert "READY (replaced)" in rep.output
+    assert f"(was {old_id})" in rep.output
+
+    # The flip state tracks the new machine on the same client endpoint, and
+    # the staging sidecar is gone.
+    new_state = json.loads(state_file.read_text())
+    assert new_state["instance_id"] != old_id
+    assert new_state["machine_id"] != old_machine
+    assert new_state["replaced_from_instance_id"] == old_id
+    assert new_state["local_port"] == old_state["local_port"]
+    assert not (project_dir / ".hostai-vast" / "state.replace.json").exists()
+
+    # Exactly one container remains — the old one was destroyed post-cutover.
+    assert container_count() == before + 1
+
+    status = runner.invoke(cli, ["status"], catch_exceptions=False, obj=None)
+    assert status.exit_code == 0, status.output
+    assert str(new_state["instance_id"]) in status.output
+
+    down_result = runner.invoke(cli, ["down", "--yes"], catch_exceptions=False, obj=None)
+    assert down_result.exit_code == 0, down_result.output
     assert container_count() == before

@@ -222,6 +222,32 @@ uv run hostai down --yes --no-cache
 `--skip-llama` skips the remote `llama-server` shutdown (the instance is still
 destroyed or paused), shaving a few seconds off the shutdown tail.
 
+### Replacing the machine
+
+`hostai replace` swaps the running instance for a freshly provisioned machine
+without dropping the local endpoint:
+
+```bash
+uv run hostai replace                # new machine, same profile & port
+uv run hostai replace --machine 151585   # pin to a specific host
+uv run hostai replace --dry-run      # show the chosen offer only
+```
+
+It accepts the same offer-selection options as `up` (`--offer`, `--machine`,
+`--skip-*`, `--max-price`, `--bid`, `--session`, …). The current `machine_id`
+is excluded by default so the replacement lands on a different host;
+`--allow-same-machine` or an explicit `--machine`/`--offer` overrides that.
+
+The new machine is provisioned under a sidecar state while the old one keeps
+serving; once its remote `/health` answers, `state.json` flips atomically and
+the running proxy hot-retargets upstream (same `proxy.sock`, same TCP port,
+same API key). With the slot cache enabled the old machine's slot is saved
+before provisioning so the replacement can restore it. The old instance is
+destroyed only after the proxy confirms it serves the new backend — a failed
+boot destroys just the staged instance, and a retarget timeout destroys
+nothing (the flipped state already tracks the new machine; the still-running
+old one can be removed with `hostai down --id`).
+
 By default a cache upload failure is logged but the instance is still destroyed
 so a storage outage cannot accidentally keep GPU billing running. Set:
 

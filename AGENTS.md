@@ -31,6 +31,7 @@
 - `hostai up` can auto-start a watchdog when `watchdog_auto_start = true` is set in `[vast]`.
 - `hostai down` records shutdown-tail metrics and reuses the cache-save/telemetery path.
 - `hostai cost volume-break-even` estimates whether a persistent model volume is cheaper than re-downloading.
+- `hostai replace` swaps the running machine for a new one (`up`'s selection options; current `machine_id` auto-excluded unless `--allow-same-machine`/`--machine`/`--offer`). The new run stages under `state.replace.json` and `state.json` flips atomically only after the new machine's remote `/health` answers over SSH; the running proxy watches that file and hot-retargets (`TokenizedProxy.retarget` + tunnel re-create) so `proxy.sock`/port never drop. The old `api_key`/port/upstream-socket path are carried over, and the old instance is destroyed only after `/_hostai/backend` confirms the new id is healthy — a retarget timeout destroys nothing (state tracks the new instance; the old stays up for manual `down --id`).
 
 ## Container disk and model storage
 
