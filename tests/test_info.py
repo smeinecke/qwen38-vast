@@ -130,3 +130,34 @@ def test_info_all_tracked_no_hint(config, project_dir):
     assert result.exit_code == 0, result.output
     assert "not tracked" not in result.output
     assert "down --id" not in result.output
+
+
+def test_info_shows_machine_id(config, project_dir):
+    _write_state(project_dir, instance_id=555, profile="test", machine_id=4242)
+    provider = _provider(
+        account=None,
+        rows=[
+            # Provider payload omits machine_id -> falls back to local state.
+            {"id": 555, "actual_status": "running", "gpu_name": "A", "dph_total": 0.1},
+            # Provider payload wins when it carries machine_id.
+            {"id": 666, "actual_status": "running", "gpu_name": "B", "dph_total": 0.2, "machine_id": 7777},
+        ],
+    )
+    with mock.patch("hostai.commands.info.get_provider", return_value=provider):
+        result = CliRunner().invoke(cmd_info, [], obj=config, env={"COLUMNS": "160"})
+    assert result.exit_code == 0, result.output
+    assert "Machine" in result.output
+    assert "4242" in result.output
+    assert "7777" in result.output
+
+
+def test_info_machine_id_missing_everywhere(config, project_dir):
+    provider = _provider(
+        account=None,
+        rows=[{"id": 111, "actual_status": "running", "gpu_name": "A", "dph_total": 0.1}],
+    )
+    with mock.patch("hostai.commands.info.get_provider", return_value=provider):
+        result = CliRunner().invoke(cmd_info, [], obj=config)
+    assert result.exit_code == 0, result.output
+    assert "Machine" in result.output
+    assert "-" in result.output

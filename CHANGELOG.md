@@ -2,6 +2,7 @@
 
 ## 2026-10-07
 
+- `hostai info` and `hostai status` now show the Vast `machine` id: a `Machine` column in `info` and the fleet overview, and a `Machine` row in single-instance `status` — provider payload first, falling back to `state.data["machine_id"]` recorded by `up`.
 - `hostai up --machine <id>` pins provisioning to a specific Vast machine: `machine_id=N` is added to the server-side search query and enforced client-side in `filter_eligible_offers` (covers the local/fake providers). The `max_dph` cap still applies — the cheapest offer on that machine within budget wins. Conflicts with `--skip-machine`/blocklist entries are rejected, and `--restart` warns that `--machine`/`--offer` are ignored.
 - `hostai replace` hardening from the local end-to-end run: `_resolve_fresh_offer` no longer resolves a client port for `replace` (the running proxy already owns it), and the staged state derives `upstream_socket`/`proxy_port` defaults when the old state lacks them.
 - Fixed a stale-write race in `_start_proxy`: the spawned proxy daemon persists `upstream_socket`/`proxy_port` before binding, but `up` then saved `proxy_pid`/`local_port` from its pre-spawn state copy and could clobber them — leaving `state.json` without the endpoint fields the proxy itself later expects. `up` now merges the daemon-written fields from disk before saving, and `state.json` reliably records the client-facing `proxy_port` (distinct from the unsecure-mode tunnel `local_port`).

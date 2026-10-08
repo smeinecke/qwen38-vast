@@ -129,9 +129,22 @@ def _perf_summary(metrics: Dict[str, float]) -> Optional[str]:
 
 
 def _fetch_gpu_snapshot(ssh_url: str, known_hosts: Path) -> Optional[str]:
+    # On unified-memory parts (e.g. GB10) nvidia-smi reports memory.* as N/A;
+    # fall back to /proc/meminfo for the shared pool and --query-compute-apps
+    # for the total attributed to GPU processes.
+    remote = (
+        "line=$(nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu"
+        " --format=csv,noheader 2>/dev/null); echo \"$line\"; "
+        "if echo \"$line\" | grep -q 'N/A'; then "
+        "awk '/MemTotal/{t=$2}/MemAvailable/{a=$2}END"
+        "{printf \"sys-mem used=%.1f GiB avail=%.1f GiB total=%.1f GiB\\n\", (t-a)/1048576, a/1048576, t/1048576}' /proc/meminfo; "
+        "nvidia-smi --query-compute-apps=used_memory --format=csv,noheader,nounits 2>/dev/null"
+        " | awk '{s+=$1}END{if(s>0) printf \"gpu-procs %.1f GiB\\n\", s/1024}'; "
+        "fi"
+    )
     res = ssh.run_remote(
         ssh_url,
-        "nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu --format=csv,noheader 2>/dev/null",
+        remote,
         known_hosts=known_hosts,
         timeout=30,
     )
@@ -169,6 +182,8 @@ def _print_status(
         api_url = "not assigned"
 
     table.add_row("Instance ID", str(state.instance_id))
+    machine_id = (instance or {}).get("machine_id") or state.data.get("machine_id")
+    table.add_row("Machine", str(machine_id) if machine_id is not None else "-")
     instance_name = state.data.get("instance_name") or state_mod.instance_name_for_state_file(state.state_file)
     table.add_row("Name", instance_name)
     table.add_row("Profile", state.profile)
@@ -223,13 +238,14 @@ def _status_overview(config: Config, states: Dict[str, Path]) -> None:
     """Render one row per tracked instance (provider status when reachable)."""
     console = Console()
     table = Table(title="hostai instances", show_header=True, header_style="bold")
-    for col in ("Name", "ID", "Profile", "GPU", "Status", "$/h", "Port", "Elapsed", "Est. cost"):
+    for col in ("Name", "ID", "Machine", "Profile", "GPU", "Status", "$/h", "Port", "Elapsed", "Est. cost"):
         table.add_column(col)
 
     provider = None
     for name, sf in states.items():
         state = State.load(sf)
         remote_status = state.status
+        machine_id = state.data.get("machine_id")
         if provider is None and state.instance_id:
             try:
                 provider = _provider(config)
@@ -240,6 +256,7 @@ def _status_overview(config: Config, states: Dict[str, Path]) -> None:
                 inst = provider.get_instance(state.instance_id)  # type: ignore[union-attr]
                 if inst:
                     remote_status = inst.get("actual_status") or inst.get("status") or "unknown"
+                    machine_id = inst.get("machine_id") or machine_id
                 else:
                     remote_status = "gone"
             except Exception:
@@ -255,6 +272,7 @@ def _status_overview(config: Config, states: Dict[str, Path]) -> None:
         table.add_row(
             name,
             str(state.instance_id or "-"),
+            str(machine_id) if machine_id is not None else "-",
             state.profile,
             state.gpu,
             str(remote_status),

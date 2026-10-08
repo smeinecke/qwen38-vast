@@ -102,6 +102,54 @@ def test_status_shows_tok_per_s(config, project_dir):
     assert "draft-accept=60%" in result.output
 
 
+def test_status_shows_machine_id_from_state(config, project_dir):
+    state_file = project_dir / ".hostai-vast" / "state.json"
+    state_file.parent.mkdir(parents=True)
+    state_file.write_text(
+        '{"instance_id": 12345, "machine_id": 4242, "profile": "test", "local_port": 18080, "dph": 0.5, "ctx_size": 32768}'
+    )
+
+    with (
+        mock.patch(
+            "hostai.commands.status._provider",
+            return_value=mock.Mock(get_instance=mock.Mock(return_value={"actual_status": "running"})),
+        ),
+        mock.patch("hostai.commands.status.ssh.is_tunnel_healthy", return_value=False),
+        mock.patch("hostai.commands.status._refresh_ssh_state", return_value=False),
+    ):
+        runner = CliRunner()
+        result = runner.invoke(cmd_status, [], obj=config)
+
+    assert result.exit_code == 0, result.output
+    assert "Machine" in result.output
+    assert "4242" in result.output
+
+
+def test_status_machine_id_prefers_provider(config, project_dir):
+    state_file = project_dir / ".hostai-vast" / "state.json"
+    state_file.parent.mkdir(parents=True)
+    state_file.write_text(
+        '{"instance_id": 12345, "machine_id": 4242, "profile": "test", "local_port": 18080, "dph": 0.5, "ctx_size": 32768}'
+    )
+
+    with (
+        mock.patch(
+            "hostai.commands.status._provider",
+            return_value=mock.Mock(
+                get_instance=mock.Mock(return_value={"actual_status": "running", "machine_id": 9999})
+            ),
+        ),
+        mock.patch("hostai.commands.status.ssh.is_tunnel_healthy", return_value=False),
+        mock.patch("hostai.commands.status._refresh_ssh_state", return_value=False),
+    ):
+        runner = CliRunner()
+        result = runner.invoke(cmd_status, [], obj=config)
+
+    assert result.exit_code == 0, result.output
+    assert "9999" in result.output
+    assert "4242" not in result.output
+
+
 def test_perf_summary_none_without_decode():
     assert _perf_summary({}) is None
     assert _perf_summary({"llamacpp:tokens_predicted_total": 10.0}) is None

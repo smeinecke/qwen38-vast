@@ -474,7 +474,7 @@ def test_cmd_down_nothing_tracked(config):
 
 
 def test_cmd_status_overview_lists_instances(config):
-    _save_state(config, None, 100, profile="test", gpu="A100", dph=0.5, local_port=18080)
+    _save_state(config, None, 100, profile="test", gpu="A100", dph=0.5, local_port=18080, machine_id=4242)
     _save_state(config, "foo", 200, profile="test", gpu="RTX 4090", dph=0.3, local_port=19000)
     provider = mock.Mock()
     provider.get_instance.return_value = {"actual_status": "running"}
@@ -484,6 +484,8 @@ def test_cmd_status_overview_lists_instances(config):
     assert result.exit_code == 0, result.output
     assert "default" in result.output
     assert "foo" in result.output
+    assert "Machine" in result.output
+    assert "4242" in result.output
     assert "--name" in result.output
 
 

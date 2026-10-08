@@ -86,6 +86,28 @@ def tracked_instance_ids(root_dir: Path) -> Dict[int, str]:
     return out
 
 
+def tracked_instance_machines(root_dir: Path) -> Dict[int, Any]:
+    """Return ``{provider_instance_id: machine_id}`` recorded in local state.
+
+    Used to fill in the machine column when a provider payload omits
+    ``machine_id`` while the offer it came from was recorded by ``up``.
+    """
+    out: Dict[int, Any] = {}
+    for sf in state_mod.find_instance_states(root_dir).values():
+        try:
+            data = json.loads(sf.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        try:
+            iid = int(data.get("instance_id"))
+        except (TypeError, ValueError):
+            continue
+        machine_id = data.get("machine_id")
+        if machine_id is not None:
+            out[iid] = machine_id
+    return out
+
+
 def claimed_local_ports(config: Config, exclude_instance: Optional[str] = None) -> Set[int]:
     """Local ports claimed by other tracked instances (live instance_id + port)."""
     exclude = state_mod.normalize_instance_name(exclude_instance)

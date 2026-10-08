@@ -66,9 +66,10 @@ def _print_account(provider_name: str, account: Optional[Dict[str, Any]], error:
     Console().print(table)
 
 
-def _print_instances(rows: List[Dict[str, Any]], tracked: Dict[int, str]) -> int:
+def _print_instances(rows: List[Dict[str, Any]], tracked: Dict[int, str], machines: Dict[int, Any]) -> int:
     table = Table(title=f"provider instances ({len(rows)})", show_header=True, header_style="bold")
     table.add_column("ID", no_wrap=True)
+    table.add_column("Machine", no_wrap=True)
     table.add_column("Name", no_wrap=True)
     table.add_column("Status", no_wrap=True)
     table.add_column("GPU", no_wrap=True)
@@ -88,6 +89,12 @@ def _print_instances(rows: List[Dict[str, Any]], tracked: Dict[int, str]) -> int
             pass
         if name == "-":
             untracked += 1
+        machine_id = inst.get("machine_id")
+        if machine_id is None and raw_id is not None:
+            try:
+                machine_id = machines.get(int(raw_id))
+            except (TypeError, ValueError):
+                machine_id = None
         status = str(inst.get("actual_status") or inst.get("status") or "unknown")
         num = inst.get("num_gpus") or 1
         gpu = str(inst.get("gpu_name") or "-")
@@ -100,6 +107,7 @@ def _print_instances(rows: List[Dict[str, Any]], tracked: Dict[int, str]) -> int
         label = str(inst.get("label") or inst.get("container_name") or inst.get("image") or "")
         table.add_row(
             iid,
+            str(machine_id) if machine_id is not None else "-",
             name,
             f"[{_status_style(status)}]{status}[/]",
             gpu,
@@ -140,4 +148,8 @@ def cmd_info(config: Config) -> None:
         click.echo("No instances on this account.")
         return
     rows.sort(key=_instance_sort_key)
-    _print_instances(rows, _common.tracked_instance_ids(config.root_dir))
+    _print_instances(
+        rows,
+        _common.tracked_instance_ids(config.root_dir),
+        _common.tracked_instance_machines(config.root_dir),
+    )
