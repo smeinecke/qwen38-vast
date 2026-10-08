@@ -51,6 +51,14 @@ The model weights are downloaded at instance startup, not baked into the image.
   in `token_only` mode. The proxy applies them client-side: it truncates the
   decoded output at the first match, logs a warning, and aborts the upstream
   stream early. EOS and `n_predict` limits still stop generation remotely.
+- Usage accounting follows the OpenAI convention: non-streaming responses
+  always carry a `usage` object; streaming emits the terminal `choices: []`
+  usage chunk only when the request sets `stream_options.include_usage`.
+  Counts come from the upstream `tokens_predicted`/`tokens_evaluated`
+  counters; the per-request cache-hit count `timings.cache_n` surfaces as
+  `prompt_tokens_details.cached_tokens` (upstream `tokens_cached` is the
+  slot's cumulative KV cache size and is ignored), and upstream `timings`
+  is passed through next to `usage`.
 - Proxy activity is logged to `.hostai-cache/proxy.log` (metadata only — token
   counts, timings, and warnings; never prompt or output content).
 - Opt-in content logging (`[proxy] log_content` or `HOSTAI_PROXY_LOG_CONTENT=1`)

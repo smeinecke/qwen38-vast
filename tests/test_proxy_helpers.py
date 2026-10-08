@@ -306,9 +306,21 @@ def test_complete_chat_tokens():
     data = asyncio.run(_run_complete_chat({
         "tokens": [10, 11, 12],
         "tokens_predicted": 3,
+        "tokens_evaluated": 3,
+        # tokens_cached is the slot's total KV cache content (prompt +
+        # generated + carried context), not this request's cache hits — the
+        # per-request count is timings.cache_n.
+        "tokens_cached": 99,
+        "timings": {"predicted_n": 3, "cache_n": 2},
         "stop": True,
     }))
     assert data["object"] == "chat.completion"
+    usage = data["usage"]
+    assert usage["prompt_tokens"] == 3
+    assert usage["completion_tokens"] == 3
+    assert usage["total_tokens"] == 6
+    assert usage["prompt_tokens_details"]["cached_tokens"] == 2
+    assert data["timings"]["predicted_n"] == 3
 
 
 def test_complete_chat_text_fallback():

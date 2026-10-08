@@ -47,12 +47,28 @@ async def upstream_app():
             if tool_prompt:
                 chunks = [
                     {"tokens": [7], "stop": False},
-                    {"tokens": [8], "stop": True, "stopped_eos": True},
+                    {
+                        "tokens": [8],
+                        "stop": True,
+                        "stopped_eos": True,
+                        "tokens_predicted": 2,
+                        "tokens_evaluated": 1,
+                    },
                 ]
             else:
                 chunks = [
                     {"tokens": [1, 2], "stop": False},
-                    {"tokens": [3], "stop": True, "stopped_eos": True},
+                    {
+                        "tokens": [3],
+                        "stop": True,
+                        "stopped_eos": True,
+                        "tokens_predicted": 3,
+                        "tokens_evaluated": 3,
+                        # tokens_cached is the slot's total KV cache content —
+                        # the per-request cache-hit count is timings.cache_n.
+                        "tokens_cached": 65,
+                        "timings": {"predicted_n": 3, "cache_n": 1},
+                    },
                 ]
             for chunk in chunks:
                 await response.write(f"data: {json.dumps(chunk)}\n\n".encode())
@@ -133,6 +149,42 @@ def test_proxy_stream_chat(config, running_state, fake_tokenizer, tmp_path):
         assert resp.status == 200
         text = await resp.text()
         assert text.startswith("data:")
+        # No stream_options: no usage chunk may be emitted.
+        assert '"usage"' not in text
+
+    asyncio.run(run_proxy(config, running_state, fake_tokenizer, tmp_path, requests))
+
+
+def test_proxy_stream_usage_chunk(config, running_state, fake_tokenizer, tmp_path):
+    """stream_options.include_usage yields a terminal usage chunk like OpenAI."""
+    running_state.unsecure = True
+    config.proxy.tokenized_only = True
+    config.model.model = "qwen-test"
+
+    async def requests(client):
+        resp = await client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 10,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        })
+        assert resp.status == 200
+        text = await resp.text()
+        chunks = [
+            json.loads(line[5:].strip())
+            for line in text.splitlines()
+            if line.startswith("data:") and line[5:].strip() != "[DONE]"
+        ]
+        usage = chunks[-1]
+        assert usage["choices"] == []
+        assert usage["usage"]["prompt_tokens"] == 3
+        assert usage["usage"]["completion_tokens"] == 3
+        assert usage["usage"]["total_tokens"] == 6
+        assert usage["usage"]["prompt_tokens_details"]["cached_tokens"] == 1
+        assert usage["timings"]["predicted_n"] == 3
+        # The finish-reason chunk precedes the usage chunk.
+        assert chunks[-2]["choices"][0]["finish_reason"] == "stop"
+        assert text.rstrip().endswith("data: [DONE]")
 
     asyncio.run(run_proxy(config, running_state, fake_tokenizer, tmp_path, requests))
 

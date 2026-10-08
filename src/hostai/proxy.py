@@ -652,6 +652,8 @@ class TokenizedProxy:
 
         tools = body.get("tools")
         stream = bool(body.get("stream", False))
+        stream_options = body.get("stream_options")
+        include_usage = bool(isinstance(stream_options, dict) and stream_options.get("include_usage"))
 
         stop_param = body.get("stop")
         if isinstance(stop_param, str):
@@ -714,7 +716,14 @@ class TokenizedProxy:
         try:
             if stream:
                 return await self._stream_chat(
-                    request, upstream_response, stop_strings, expect_reasoning, tools, req_id
+                    request,
+                    upstream_response,
+                    stop_strings,
+                    expect_reasoning,
+                    tools,
+                    req_id,
+                    prompt_tokens=len(token_ids),
+                    include_usage=include_usage,
                 )
             return await self._complete_chat(upstream_response, len(token_ids), stop_strings, tools, req_id)
         except (asyncio.CancelledError, ConnectionError):
@@ -794,6 +803,9 @@ class TokenizedProxy:
 
         finish_reason = self._map_finish_reason(data)
         completion_tokens = data.get("tokens_predicted", 0) or 0
+        evaluated = data.get("tokens_evaluated") or prompt_tokens
+        timings = data.get("timings")
+        timings = timings if isinstance(timings, dict) else None
 
         tokens = data.get("tokens") or []
         if tokens:
@@ -840,12 +852,10 @@ class TokenizedProxy:
                     "finish_reason": finish_reason,
                 }
             ],
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-            },
+            "usage": self._usage_dict(evaluated, completion_tokens, (timings or {}).get("cache_n")),
         }
+        if timings:
+            output["timings"] = timings
         self._log_content(
             "response",
             req_id,
@@ -854,6 +864,44 @@ class TokenizedProxy:
             usage=output["usage"],
         )
         return web.json_response(output)
+
+    @staticmethod
+    def _usage_dict(prompt_tokens: int, completion_tokens: int, cached_tokens: Any = None) -> Dict[str, Any]:
+        """OpenAI ``usage`` object, with a cached-token detail when known."""
+        usage: Dict[str, Any] = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+        # Emit the detail whenever upstream reported the counter (0 is real
+        # data: the prompt was not cached) — absent only when it is unknown.
+        if isinstance(cached_tokens, int) and not isinstance(cached_tokens, bool) and cached_tokens >= 0:
+            usage["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
+        return usage
+
+    @staticmethod
+    def _stream_usage(
+        last_obj: Optional[Dict[str, Any]],
+        prompt_tokens: int,
+        detok: _TokenDetokenizer,
+    ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+        """Usage for a finished stream: upstream counters win, detok is the fallback.
+
+        Upstream chunks carry cumulative ``tokens_predicted``/``tokens_evaluated``
+        and the final one adds ``timings`` (with ``cache_n`` = per-request
+        cached prompt tokens) — all of which the proxy would otherwise drop.
+        Note ``tokens_cached`` is deliberately unused: it counts every token
+        resident in the slot's KV cache, not this request's cache hits.
+        ``timings`` is returned separately so the caller can attach it next to
+        ``usage`` like llama.cpp does.
+        """
+        stats = last_obj or {}
+        predicted = stats.get("tokens_predicted") or detok.token_count
+        evaluated = stats.get("tokens_evaluated") or prompt_tokens
+        timings = stats.get("timings")
+        timings = timings if isinstance(timings, dict) else None
+        usage = TokenizedProxy._usage_dict(evaluated, predicted, (timings or {}).get("cache_n"))
+        return usage, timings
 
     def _build_sse_chunk(
         self,
@@ -876,6 +924,27 @@ class TokenizedProxy:
                 }
             ],
         }
+        return f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
+
+    @staticmethod
+    def _build_usage_chunk(
+        completion_id: str,
+        created: int,
+        model: str,
+        usage: Dict[str, Any],
+        timings: Optional[Dict[str, Any]] = None,
+    ) -> bytes:
+        """Terminal ``choices: []`` chunk carrying ``usage`` (stream_options)."""
+        chunk: Dict[str, Any] = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [],
+            "usage": usage,
+        }
+        if timings:
+            chunk["timings"] = timings
         return f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
 
     def _detect_token_mode(
@@ -954,7 +1023,10 @@ class TokenizedProxy:
         stop: bool,
         finish: Optional[str],
         req_id: str = "",
+        usage_chunk: Optional[bytes] = None,
     ) -> web.StreamResponse:
+        if usage_chunk:
+            await stream.write(usage_chunk)
         await stream.write(b"data: [DONE]\n\n")
         self._log_content(
             "done",
@@ -986,6 +1058,8 @@ class TokenizedProxy:
         expect_reasoning: bool = True,
         tools: Optional[List[Dict[str, Any]]] = None,
         req_id: str = "",
+        prompt_tokens: int = 0,
+        include_usage: bool = False,
     ) -> web.StreamResponse:
         stream = web.StreamResponse(
             status=200,
@@ -1011,6 +1085,9 @@ class TokenizedProxy:
         # SSE data: lines can be split across TCP chunks; buffer between
         # reads so a partial line is never parsed as JSON and dropped.
         buffer = ""
+        # Upstream counters (tokens_predicted/evaluated/cached, timings) ride
+        # along on every chunk; the last one seen feeds the usage chunk.
+        last_obj: Optional[Dict[str, Any]] = None
 
         try:
             while True:
@@ -1033,6 +1110,7 @@ class TokenizedProxy:
                         obj = json.loads(data)
                     except json.JSONDecodeError:
                         continue
+                    last_obj = obj
 
                     deltas, finish, token_mode, sent_reasoning, sent_content = self._process_stream_chunk(
                         obj, detok, token_mode, sent_reasoning, sent_content, tools
@@ -1049,7 +1127,12 @@ class TokenizedProxy:
 
                     stop = obj.get("stop", False)
                     if stop or (token_mode and detok.stopped):
-                        return await self._stream_end(stream, response, detok, token_mode, stop, finish, req_id)
+                        usage_chunk = self._usage_chunk(
+                            completion_id, created, model, include_usage, last_obj, prompt_tokens, detok
+                        )
+                        return await self._stream_end(
+                            stream, response, detok, token_mode, stop, finish, req_id, usage_chunk
+                        )
         except ConnectionError:
             # A write to a dead client socket lands here.
             response.close()
@@ -1070,6 +1153,11 @@ class TokenizedProxy:
             for tail in detok.finish():
                 self._log_content("delta", req_id, **tail)
                 await stream.write(self._build_sse_chunk(completion_id, created, model, tail, None))
+        usage_chunk = self._usage_chunk(
+            completion_id, created, model, include_usage, last_obj, prompt_tokens, detok
+        )
+        if usage_chunk:
+            await stream.write(usage_chunk)
         await stream.write(b"data: [DONE]\n\n")
         self._log_content(
             "done",
@@ -1079,6 +1167,22 @@ class TokenizedProxy:
             tool_calls=detok.saw_tool_calls,
         )
         return stream
+
+    def _usage_chunk(
+        self,
+        completion_id: str,
+        created: int,
+        model: str,
+        include_usage: bool,
+        last_obj: Optional[Dict[str, Any]],
+        prompt_tokens: int,
+        detok: _TokenDetokenizer,
+    ) -> Optional[bytes]:
+        """Terminal usage chunk, emitted only when stream_options asked for it."""
+        if not include_usage:
+            return None
+        usage, timings = self._stream_usage(last_obj, prompt_tokens, detok)
+        return self._build_usage_chunk(completion_id, created, model, usage, timings)
 
     @staticmethod
     def _map_finish_reason(data: Dict[str, Any]) -> Optional[str]:
