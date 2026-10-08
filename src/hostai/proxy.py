@@ -800,7 +800,7 @@ class TokenizedProxy:
             "id": f"chatcmpl-{os.urandom(12).hex()}",
             "object": "chat.completion",
             "created": int(time.time()),
-            "model": self.config.model.model or "local",
+            "model": self.state.model or self.config.model.model or "local",
             "choices": [
                 {
                     "index": 0,
@@ -967,7 +967,7 @@ class TokenizedProxy:
         await stream.prepare(request)
 
         completion_id = f"chatcmpl-{os.urandom(12).hex()}"
-        model = self.config.model.model or "local"
+        model = self.state.model or self.config.model.model or "local"
         created = int(time.time())
         sent_reasoning = False
         sent_content = False
@@ -1124,7 +1124,7 @@ class TokenizedProxy:
     async def _models(self, request: web.Request) -> web.Response:
         if not self.ready:
             raise web.HTTPServiceUnavailable(reason="proxy not ready")
-        model_id = self.config.model.model or "local"
+        model_id = self.state.model or self.config.model.model or "local"
         return web.json_response(
             {
                 "object": "list",

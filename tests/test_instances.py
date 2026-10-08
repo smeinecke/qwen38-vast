@@ -288,6 +288,8 @@ def _up_profile_mock():
     profile.monitor_group = ""
     profile.image = "test-img"
     profile.min_gpu_vram_mb = None
+    profile.model = None
+    profile.model_sha256 = None
     return profile
 
 

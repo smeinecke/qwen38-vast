@@ -761,7 +761,7 @@ def _env_dict(
     _env_model_overrides(config, profile, env)
 
     for key, value in (
-        ("MODEL_SHA256", config.model.model_sha256),
+        ("MODEL_SHA256", profile.model_sha256 or config.model.model_sha256),
         ("DRAFT_SHA256", config.model.draft_sha256),
     ):
         if value:
@@ -1339,7 +1339,7 @@ def _resolve_fresh_offer(
     local_port = _resolve_client_port(config, user_port=local_port, instance=instance)
     profiles, profile, image = _resolve_profile(config, profile_name)
     ctx_size = config.hostai.ctx_size_override if config.hostai.ctx_size_override else profile.ctx_size
-    model = config.model.model
+    model = profile.model or config.model.model
     selected_image = image_for_profile(config, image.image_tag)
     disk_gb = market.resolved_disk_gb(profile, config)
     interruptible = bid_price is not None

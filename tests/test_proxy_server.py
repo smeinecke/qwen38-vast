@@ -102,7 +102,7 @@ def test_proxy_health_and_models(config, running_state, fake_tokenizer, tmp_path
         resp = await client.get("/v1/models")
         assert resp.status == 200
         data = await resp.json()
-        assert data["data"][0]["id"] == config.model.model
+        assert data["data"][0]["id"] == running_state.model
 
         resp = await client.get("/metrics")
         assert resp.status == 200

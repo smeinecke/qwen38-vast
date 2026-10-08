@@ -70,7 +70,7 @@ def test_extra_args_no_cache(config):
 def test_env_dict_includes_ssh_public_key(config):
     key = "ssh-ed25519 AAAA test"
     config.secrets["SSH_PUBLIC_KEY"] = key
-    profile = mock.Mock(name="p", image="img", cache_ram=None, ctx_checkpoints=None)
+    profile = mock.Mock(name="p", image="img", cache_ram=None, ctx_checkpoints=None, model_sha256=None)
     image = mock.Mock(name="img")
     env = up._env_dict(config, profile, image, "model", 32768, "apikey", False, False, "session")
     assert env["HOSTAI_SSH_PUBLIC_KEY_B64"] == base64.b64encode(key.encode()).decode()
@@ -81,7 +81,7 @@ def test_env_dict_slot_cache_enabled(config):
     config.cache.enabled = True
     config.cache.host = "cache.example.com"
     config.cache.rclone = False
-    profile = mock.Mock(name="p", image="img", cache_ram=None, ctx_checkpoints=None)
+    profile = mock.Mock(name="p", image="img", cache_ram=None, ctx_checkpoints=None, model_sha256=None)
     image = mock.Mock(name="img")
     env = up._env_dict(config, profile, image, "model", 32768, "apikey", False, False, "session")
     assert env["HOSTAI_SLOT_CACHE_ENABLED"] == "1"
@@ -90,14 +90,14 @@ def test_env_dict_slot_cache_enabled(config):
 
 def test_env_dict_default_reasoning_effort(config):
     config.model.reasoning_effort = "medium"
-    profile = mock.Mock(name="p", image="img", cache_ram=None, ctx_checkpoints=None)
+    profile = mock.Mock(name="p", image="img", cache_ram=None, ctx_checkpoints=None, model_sha256=None)
     image = mock.Mock(name="img")
     env = up._env_dict(config, profile, image, "model", 32768, "apikey", False, False, "session")
     assert env["REASONING_EFFORT"] == "medium"
 
 
 def test_env_dict_n_predict(config):
-    profile = mock.Mock(name="p", image="img", cache_ram=None, ctx_checkpoints=None)
+    profile = mock.Mock(name="p", image="img", cache_ram=None, ctx_checkpoints=None, model_sha256=None)
     image = mock.Mock(name="img")
     env = up._env_dict(config, profile, image, "model", 32768, "apikey", False, False, "session")
     assert env["N_PREDICT"] == "-1"
@@ -390,6 +390,8 @@ def _make_profile_mock():
     profile.monitor_group = ""
     profile.image = "test-img"
     profile.min_gpu_vram_mb = None
+    profile.model = None
+    profile.model_sha256 = None
     return profile
 
 

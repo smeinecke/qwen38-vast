@@ -70,6 +70,8 @@ class Profile:
     ctx_checkpoints: Optional[int] = None
     disk_gb: Optional[int] = None
     min_gpu_vram_mb: Optional[int] = None
+    model: Optional[str] = None
+    model_sha256: Optional[str] = None
 
 
 @dataclass
