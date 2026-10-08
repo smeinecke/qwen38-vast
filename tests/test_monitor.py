@@ -497,7 +497,7 @@ def test_cmd_monitor_logs(config, project_dir):
     assert "log line 2" in result.output
 
 
-def test_monitor_skips_merges_state_and_cli(project_dir):
+def test_monitor_skips_merges_state_and_cli(config, project_dir):
     current = _state(
         project_dir,
         instance_id=123,
@@ -505,15 +505,24 @@ def test_monitor_skips_merges_state_and_cli(project_dir):
         skip_offers=[5],
         skip_countries=["DE"],
     )
-    merged = _monitor_skips(current, OfferExclusions(machines=[1], offers=[7], countries=["US"]))
+    merged = _monitor_skips(config, current, OfferExclusions(machines=[1], offers=[7], countries=["US"]))
     assert merged.machines == (9, 1)
     assert merged.offers == (5, 7)
     assert merged.countries == ("DE", "US")
 
 
-def test_monitor_skips_empty_state(project_dir):
+def test_monitor_skips_merges_config_blocklist(config, project_dir):
+    config.blocklist.machines = [50]
+    config.blocklist.countries = ["cn"]
+    current = _state(project_dir, skip_machines=[9])
+    merged = _monitor_skips(config, current, OfferExclusions(machines=[1]))
+    assert merged.machines == (50, 9, 1)
+    assert merged.countries == ("cn",)
+
+
+def test_monitor_skips_empty_state(config, project_dir):
     current = _state(project_dir)
-    merged = _monitor_skips(current)
+    merged = _monitor_skips(config, current)
     assert merged.machines == ()
     assert merged.offers == ()
     assert merged.countries == ()

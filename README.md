@@ -377,11 +377,14 @@ HOSTAI_MONITOR_MAX_RESULTS=5
 HOSTAI_MONITOR_AUTO_START=0
 ```
 
-`hostai up` and `monitor once|watch|start` accept `--skip-machine`,
-`--skip-offer` and `--skip-country` (all repeatable) to exclude specific Vast
-machine IDs, offer IDs or countries from the search. Exclusions given to `up`
-are recorded in `state.json`, so a running or auto-started monitor never
-recommends a host you already ruled out.
+`hostai up`, `hostai lookup` and `monitor once|watch|start` accept
+`--skip-machine`, `--skip-offer` and `--skip-country` (all repeatable) to
+exclude specific Vast machine IDs, offer IDs or countries from the search.
+Exclusions given to `up` are recorded in `state.json`, so a running or
+auto-started monitor never recommends a host you already ruled out. A global
+`[blocklist]` section in `hostai.toml` (`machines`/`offers`/`countries`
+arrays, or `HOSTAI_BLOCKLIST_*` env vars) applies to every search without
+repeating flags.
 
 For a compatible profile switch, preserve the external slot cache normally:
 

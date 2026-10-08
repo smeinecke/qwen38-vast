@@ -34,6 +34,15 @@ max_history_age_days = 30
 model_download_gb = 18.83
 image_size_gb = 5.0
 
+# Global offer blocklist: applied to every offer search (up, lookup, monitor)
+# in addition to the per-invocation --skip-machine/--skip-offer/--skip-country
+# flags.  Env overrides: HOSTAI_BLOCKLIST_MACHINES="111,222" (comma-separated),
+# HOSTAI_BLOCKLIST_OFFERS, HOSTAI_BLOCKLIST_COUNTRIES.
+[blocklist]
+# machines = [12345]
+# offers = []
+# countries = []
+
 [model]
 hf_repo = "HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF"
 hf_revision = "993a5971fda8f30dd1b7eb2654792ba4415c7460"

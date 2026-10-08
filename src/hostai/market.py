@@ -11,9 +11,9 @@ import json
 import re
 import statistics
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 import click
 import pycountry
@@ -122,14 +122,39 @@ class OfferExclusions:
     machines: Tuple[int, ...] = ()
     offers: Tuple[int, ...] = ()
     countries: Tuple[str, ...] = ()
+    _machine_ids: FrozenSet[str] = field(init=False, repr=False, compare=False)
+    _offer_ids: FrozenSet[str] = field(init=False, repr=False, compare=False)
+    _country_codes: FrozenSet[str] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "machines", tuple(self.machines))
         object.__setattr__(self, "offers", tuple(self.offers))
         object.__setattr__(self, "countries", tuple(self.countries))
+        object.__setattr__(self, "_machine_ids", frozenset(str(m) for m in self.machines))
+        object.__setattr__(self, "_offer_ids", frozenset(str(i) for i in self.offers))
+        object.__setattr__(
+            self,
+            "_country_codes",
+            frozenset(c for c in (normalize_country_code(x) for x in self.countries) if c),
+        )
 
     def __bool__(self) -> bool:
         return bool(self.machines or self.offers or self.countries)
+
+    def is_excluded(self, offer: Dict[str, Any]) -> bool:
+        """Return True when *offer* sits on a skipped machine, carries a
+        skipped offer/contract id, or is located in a skipped country."""
+        if self._machine_ids and str(offer.get("machine_id")) in self._machine_ids:
+            return True
+        if self._offer_ids and (
+            str(offer.get("id")) in self._offer_ids or str(offer.get("ask_contract_id")) in self._offer_ids
+        ):
+            return True
+        if self._country_codes:
+            geo = offer_country_code(offer)
+            if geo and geo in self._country_codes:
+                return True
+        return False
 
     def merged(self, other: "OfferExclusions") -> "OfferExclusions":
         """Return a new exclusions object combining both sets, deduplicated."""
@@ -189,6 +214,16 @@ class OfferExclusions:
         )
 
 
+def config_exclusions(config: Config) -> OfferExclusions:
+    """Global blocklist from ``hostai.toml`` (``[blocklist]`` section)."""
+    blocklist = config.blocklist
+    return OfferExclusions(
+        machines=tuple(blocklist.machines),
+        offers=tuple(blocklist.offers),
+        countries=tuple(blocklist.countries),
+    )
+
+
 def is_same_or_better_gpu(
     profiles: Profiles,
     current_gpu: Optional[str],
@@ -221,6 +256,7 @@ def build_search_query(
     unverified: bool = False,
     offer: Optional[int] = None,
     bid_price: Optional[float] = None,
+    machine: Optional[int] = None,
 ) -> Tuple[str, float]:
     """Build a Vast query string from profile and config.
 
@@ -255,6 +291,9 @@ def build_search_query(
 
     if offer is None and "dph" not in query:
         query += f" dph_total <= {max_dph}"
+
+    if machine is not None:
+        query += f" machine_id={machine}"
 
     # Replace any explicit disk_space constraint with the resolved disk
     # allocation.  A value lower than the resolved allocation would be a
@@ -624,6 +663,7 @@ def filter_eligible_offers(
     *,
     max_dph: float,
     offer: Optional[int] = None,
+    machine: Optional[int] = None,
     current_gpu: Optional[str] = None,
     profiles: Optional[Profiles] = None,
     ctx_size: Optional[int] = None,
@@ -631,30 +671,24 @@ def filter_eligible_offers(
 ) -> List[Dict[str, Any]]:
     """Filter search results by price, specific id, hardware rank, and context.
 
-    ``exclusions`` drops offers on skipped machine IDs (e.g. a dedicated host
-    that failed a previous boot), offers with skipped offer/contract IDs, and
-    offers whose geolocation resolves to a skipped country.
+    ``machine`` pins the result to a single Vast machine ID.  ``exclusions``
+    drops offers on skipped machine IDs (e.g. a dedicated host that failed a
+    previous boot), offers with skipped offer/contract IDs, and offers whose
+    geolocation resolves to a skipped country.
     """
     exclusions = exclusions or OfferExclusions()
-    skipped = {str(m) for m in exclusions.machines}
-    skipped_ids = {str(i) for i in exclusions.offers}
-    skipped_countries = {c for c in (normalize_country_code(x) for x in exclusions.countries) if c}
     matches: List[Dict[str, Any]] = []
     for o in offers:
-        if skipped and str(o.get("machine_id")) in skipped:
+        if exclusions.is_excluded(o):
             continue
-        if skipped_ids and (str(o.get("id")) in skipped_ids or str(o.get("ask_contract_id")) in skipped_ids):
-            continue
-        if skipped_countries:
-            geo = offer_country_code(o)
-            if geo and geo in skipped_countries:
-                continue
         if offer is not None:
             if str(o.get("id")) != str(offer) and str(o.get("ask_contract_id")) != str(offer):
                 continue
         else:
             if _effective_dph(o) > max_dph:
                 continue
+        if machine is not None and str(o.get("machine_id")) != str(machine):
+            continue
 
         if current_gpu is not None and profiles is not None:
             if not is_same_or_better_gpu(profiles, current_gpu, str(o.get("gpu_name", ""))):
@@ -674,6 +708,7 @@ def search_offers(
     storage: float,
     max_dph: float,
     offer: Optional[int] = None,
+    machine: Optional[int] = None,
     offer_type: str = "on-demand",
     unverified: bool = False,
     order: str = "dph_total",
@@ -681,10 +716,10 @@ def search_offers(
 ) -> List[Dict[str, Any]]:
     """Search Vast and return raw offers.
 
-    Uses a higher limit when an explicit *offer* id is requested so the
-    requested contract is likely to appear in the result set.
+    Uses a higher limit when an explicit *offer* id or *machine* id is
+    requested so the requested target is likely to appear in the result set.
     """
-    search_limit = 100 if offer is not None else limit
+    search_limit = 100 if (offer is not None or machine is not None) else limit
     try:
         provider = get_provider(config)
         return provider.search_offers(
@@ -707,6 +742,7 @@ def select_offer(
     max_dph: float,
     unverified: bool,
     offer: Optional[int],
+    machine: Optional[int] = None,
     storage: float,
     offer_type: str = "on-demand",
     current_gpu: Optional[str] = None,
@@ -728,6 +764,7 @@ def select_offer(
         storage=storage,
         max_dph=max_dph,
         offer=offer,
+        machine=machine,
         offer_type=offer_type,
         unverified=unverified,
     )
@@ -746,6 +783,7 @@ def select_offer(
         offers,
         max_dph=max_dph,
         offer=offer,
+        machine=machine,
         current_gpu=current_gpu,
         profiles=profiles,
         ctx_size=ctx_size,
@@ -754,9 +792,11 @@ def select_offer(
 
     if not matches:
         if offer is not None:
-            raise click.ClickException(f"no matching offer for id {offer}")
+            pin = f" on machine {machine}" if machine is not None else ""
+            raise click.ClickException(f"no matching offer for id {offer}{pin}")
         suffix = f" (excluding {exclusions.describe()})" if exclusions else ""
-        raise click.ClickException(f"no matching offer at or below ${max_dph:.2f}/h{suffix}")
+        pin = f" on machine {machine}" if machine is not None else ""
+        raise click.ClickException(f"no matching offer{pin} at or below ${max_dph:.2f}/h{suffix}")
 
     if cache_state is None:
         cache_state = _resolve_cache_state(config)

@@ -32,6 +32,7 @@ _LOCAL_OFFERS = [
     {
         "id": 100001,
         "ask_contract_id": 100001,
+        "machine_id": 8001,
         "gpu_name": "Tesla V100",
         "num_gpus": 1,
         "gpu_ram": 32,
@@ -55,6 +56,7 @@ _LOCAL_OFFERS = [
     {
         "id": 100002,
         "ask_contract_id": 100002,
+        "machine_id": 8002,
         "gpu_name": "RTX 4090",
         "num_gpus": 1,
         "gpu_ram": 24,
@@ -76,8 +78,10 @@ _LOCAL_OFFERS = [
         "direct_port_count": 1,
     },
     {
+    {
         "id": 100003,
         "ask_contract_id": 100003,
+        "machine_id": 8003,
         "gpu_name": "RTX 5090",
         "num_gpus": 1,
         "gpu_ram": 32,
@@ -289,6 +293,7 @@ class LocalProvider(Provider):
             "public_ipaddr": "127.0.0.1",
             "ports": {"22/tcp": [{"HostPort": ssh_port}]},
             "gpu_name": offer["gpu_name"],
+            "machine_id": offer.get("machine_id"),
             "dph_total": 0.0,
             "disk_gb": int(disk),
             "image": run_image,
@@ -569,6 +574,7 @@ class LocalProvider(Provider):
             "public_ipaddr": "127.0.0.1",
             "ports": {"22/tcp": [{"HostPort": ssh_port}]},
             "gpu_name": offer["gpu_name"],
+            "machine_id": offer.get("machine_id"),
             "dph_total": 0.0,
             "image": config.get("Image", ""),
             "container_id": container_id,

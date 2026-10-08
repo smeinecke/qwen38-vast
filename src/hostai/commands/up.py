@@ -99,6 +99,7 @@ def _resolve_session_seconds(config: Config, expected_session: Optional[str]) ->
 @click.option("--keep-on-failure", is_flag=True, help="Do not destroy the instance if provisioning fails.")
 @click.option("--abort-if-shm-too-small", is_flag=True, help="Fail if /dev/shm is too small.")
 @click.option("--offer", type=int, help="Use a specific offer ID.")
+@click.option("--machine", type=int, help="Pin to offers on this Vast machine ID.")
 @click.option(
     "--skip-machine",
     "skip_machines",
@@ -153,6 +154,7 @@ def cmd_up(
     keep_on_failure: bool,
     abort_if_shm_too_small: bool,
     offer: Optional[int],
+    machine: Optional[int],
     skip_machines: Tuple[int, ...],
     skip_offers: Tuple[int, ...],
     skip_countries: Tuple[str, ...],
@@ -173,9 +175,12 @@ def cmd_up(
         instance = state_mod.validate_instance_name(instance_name) if instance_name else state_mod.DEFAULT_INSTANCE
     except ValueError as exc:
         raise click.ClickException(str(exc))
-    exclusions = market.OfferExclusions(machines=skip_machines, offers=skip_offers, countries=skip_countries)
+    cli_exclusions = market.OfferExclusions(machines=skip_machines, offers=skip_offers, countries=skip_countries)
+    exclusions = market.config_exclusions(config).merged(cli_exclusions)
     if offer is not None and offer in exclusions.offers:
-        raise click.ClickException(f"--offer {offer} conflicts with --skip-offer {offer}")
+        raise click.ClickException(f"--offer {offer} conflicts with a skipped offer id")
+    if machine is not None and machine in exclusions.machines:
+        raise click.ClickException(f"--machine {machine} conflicts with a skipped machine id")
 
     if scoring_mode:
         config.market.scoring_mode = scoring_mode
@@ -200,12 +205,16 @@ def cmd_up(
     with _common.lifecycle_lock(config, "up --restart" if restart else "up", instance=instance):
         if restart:
             for flag, values in (
-                ("--skip-machine", exclusions.machines),
-                ("--skip-offer", exclusions.offers),
-                ("--skip-country", exclusions.countries),
+                ("--skip-machine", cli_exclusions.machines),
+                ("--skip-offer", cli_exclusions.offers),
+                ("--skip-country", cli_exclusions.countries),
             ):
                 if values:
                     _log(f"[up] {flag} is ignored for --restart (existing instance)", err=True)
+            if offer is not None:
+                _log("[up] --offer is ignored for --restart (existing instance)", err=True)
+            if machine is not None:
+                _log("[up] --machine is ignored for --restart (existing instance)", err=True)
             _do_restart(
                 config,
                 instance,
@@ -228,6 +237,7 @@ def cmd_up(
                 no_cache,
                 abort_if_shm_too_small,
                 offer,
+                machine=machine,
                 exclusions=exclusions,
                 bid_price=bid_price,
                 session_seconds=session_seconds,
@@ -1323,6 +1333,7 @@ def _resolve_fresh_offer(
     session_seconds: Optional[int],
     allow_unvalidated: bool,
     instance: str = state_mod.DEFAULT_INSTANCE,
+    machine: Optional[int] = None,
 ) -> _FreshOffer:
     """Resolve profile, search query and select a market offer."""
     local_port = _resolve_client_port(config, user_port=local_port, instance=instance)
@@ -1334,7 +1345,14 @@ def _resolve_fresh_offer(
     interruptible = bid_price is not None
 
     query, max_dph = market.build_search_query(
-        config, profiles, profile, max_price=max_price, unverified=unverified, offer=offer, bid_price=bid_price
+        config,
+        profiles,
+        profile,
+        max_price=max_price,
+        unverified=unverified,
+        offer=offer,
+        bid_price=bid_price,
+        machine=machine,
     )
     _log(
         f"[profile] {profile.name} | sm_{image.cuda_arch} | ctx={ctx_size} | image={selected_image} | disk={disk_gb}GB"
@@ -1370,6 +1388,7 @@ def _resolve_fresh_offer(
         max_dph=max_dph,
         unverified=unverified,
         offer=offer,
+        machine=machine,
         storage=disk_gb,
         offer_type=offer_type,
         session_seconds=session_seconds,
@@ -1624,6 +1643,7 @@ def _do_fresh(
     abort_if_shm_too_small: bool,
     offer: Optional[int],
     *,
+    machine: Optional[int] = None,
     exclusions: Optional[market.OfferExclusions] = None,
     bid_price: Optional[float] = None,
     session_seconds: Optional[int] = None,
@@ -1648,6 +1668,7 @@ def _do_fresh(
             session_seconds,
             allow_unvalidated,
             instance,
+            machine=machine,
         )
 
         if dry_run:

@@ -102,14 +102,19 @@ def _resolve_monitor_targets(
     raise click.ClickException("no monitorable profile configured")
 
 
-def _monitor_skips(current: State, exclusions: Optional[market.OfferExclusions] = None) -> market.OfferExclusions:
-    """Merge CLI exclusions with the ones ``up`` recorded in state.json.
+def _monitor_skips(
+    config: Config, current: State, exclusions: Optional[market.OfferExclusions] = None
+) -> market.OfferExclusions:
+    """Merge CLI exclusions, the config blocklist, and the ones ``up`` recorded
+    in state.json.
 
     Exclusions passed to ``hostai up`` (e.g. a host that failed provisioning)
-    stay attached to the deployment, so the monitor does not recommend an
-    offer the user already ruled out.
+    stay attached to the deployment, and the ``[blocklist]`` config section
+    applies globally, so the monitor does not recommend an offer the user
+    already ruled out.
     """
-    return market.OfferExclusions.from_state(current.data).merged(exclusions or market.OfferExclusions())
+    merged = market.OfferExclusions.from_state(current.data).merged(exclusions or market.OfferExclusions())
+    return market.config_exclusions(config).merged(merged)
 
 
 def _monitor_price_cap(current: State, max_price: Optional[float]) -> Optional[float]:
@@ -260,7 +265,9 @@ def cmd_monitor_once(
     targets = _resolve_monitor_targets(config, profiles, profile, group, current)
     current_dph = current.dph if current.exists else None
     exclusions = _monitor_skips(
-        current, market.OfferExclusions(machines=skip_machines, offers=skip_offers, countries=skip_countries)
+        config,
+        current,
+        market.OfferExclusions(machines=skip_machines, offers=skip_offers, countries=skip_countries),
     )
 
     all_offers = _search_profiles(config, profiles, targets, current, max_price=max_price)
@@ -325,7 +332,9 @@ def cmd_monitor_watch(
             # Re-merge each round: exclusions recorded by a new `up` land in
             # state.json between iterations.
             exclusions = _monitor_skips(
-                current, market.OfferExclusions(machines=skip_machines, offers=skip_offers, countries=skip_countries)
+                config,
+                current,
+                market.OfferExclusions(machines=skip_machines, offers=skip_offers, countries=skip_countries),
             )
             all_offers = _search_profiles(config, profiles, targets, current, max_price=max_price)
             best = _ranked_best_for_monitor(

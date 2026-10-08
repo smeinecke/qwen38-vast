@@ -1,7 +1,11 @@
 # Changelog
 
+## 2026-10-07
+
+- `hostai up --machine <id>` pins provisioning to a specific Vast machine: `machine_id=N` is added to the server-side search query and enforced client-side in `filter_eligible_offers` (covers the local/fake providers). The `max_dph` cap still applies — the cheapest offer on that machine within budget wins. Conflicts with `--skip-machine`/blocklist entries are rejected, and `--restart` warns that `--machine`/`--offer` are ignored.
 ## 2026-10-05
 
+- New `[blocklist]` config section (`machines`/`offers`/`countries` arrays; env `HOSTAI_BLOCKLIST_*`, comma-separated): a global exclusion list merged into every offer search — `up`, `lookup`, `monitor once|watch` — on top of per-invocation `--skip-*` flags and `state.json` skips.
 - `start.sh` downloads now carry a progress watchdog: hf (especially hf_xet) can hang forever on half-broken egress — a reachable `huggingface.co` but dead xet CAS endpoints or poisoned DNS — without ever exiting. `_download_once` watches `/models` growth and kills hf after `HOSTAI_DL_STALL_SECONDS` (default 120s, poll 15s, up to 3 restarts); each stall retry first disables xet and then switches `HF_ENDPOINT` to `HF_MIRROR_ENDPOINT` if reachable, so downloads degrade gracefully instead of wedging the boot. A clean hf failure still propagates immediately.
 - `hostai up --restart` now resurrects a dead `start.sh` inside a still-running container: the entrypoint keeps sshd alive after a boot failure (failed download, etc.) while Vast reports the instance "running", so `--restart` previously waited on a `/health` that could never appear. When `/run/qwen38/start.exitcode` exists and no start.sh/llama-server process remains, `up --restart` relaunches `/usr/local/bin/start.sh` over SSH with the original docker env (from `/proc/1/environ`); `hf download` resumes partial files.
 - Wired up four config knobs that were documented in `hostai.toml.example` but never read: `[model] hf_repo` and `draft` are now forwarded to the container (`HF_REPO`/`DRAFT` env), `[image] unsecure` is honored by `hostai up` (`--unsecure` still wins), and `[monitor] max_results` now controls the per-profile search limit (previously hardcoded to 10).

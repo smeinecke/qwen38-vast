@@ -512,12 +512,94 @@ def test_cmd_up_skip_offer_and_country(config, project_dir):
     assert exclusions.countries == ("de",)
 
 
+def test_cmd_up_config_blocklist_merges(config, project_dir):
+    config.hostai.default_profile = "test"
+    config.blocklist.machines = [7]
+    runner = CliRunner()
+    with mock.patch("hostai.commands.up._resolve_client_port", return_value=18080):
+        with mock.patch(
+            "hostai.commands.up._resolve_profile", return_value=(mock.Mock(), _make_profile_mock(), _make_image_mock())
+        ):
+            with mock.patch("hostai.commands.up.image_for_profile", return_value="ghcr.io/test"):
+                with mock.patch("hostai.commands.up.market.resolved_disk_gb", return_value=35):
+                    with mock.patch("hostai.commands.up.market.build_search_query", return_value=("query", 1.0)):
+                        with mock.patch(
+                            "hostai.commands.up.market.select_offer",
+                            return_value={"id": 1, "dph_total": 0.5, "gpu_name": "A100", "machine_id": 99},
+                        ) as select:
+                            with mock.patch("hostai.commands.up.market.offer_summary", return_value="summary"):
+                                provider = mock.Mock()
+                                provider.name = "vast"
+                                with mock.patch("hostai.commands.up._provider", return_value=provider):
+                                    result = runner.invoke(
+                                        up.cmd_up,
+                                        ["--skip-machine", "42", "--dry-run"],
+                                        obj=config,
+                                    )
+    assert result.exit_code == 0
+    # Config blocklist comes first, CLI skips merge after it.
+    assert select.call_args.kwargs["exclusions"].machines == (7, 42)
+
+
 def test_cmd_up_offer_conflicts_with_skip_offer(config, project_dir):
     config.hostai.default_profile = "test"
     runner = CliRunner()
     result = runner.invoke(up.cmd_up, ["--offer", "7", "--skip-offer", "7"], obj=config)
     assert result.exit_code != 0
-    assert "conflicts with --skip-offer" in result.output
+    assert "conflicts with a skipped offer id" in result.output
+
+
+def test_cmd_up_machine_pin(config, project_dir):
+    config.hostai.default_profile = "test"
+    runner = CliRunner()
+    with mock.patch("hostai.commands.up._resolve_client_port", return_value=18080):
+        with mock.patch(
+            "hostai.commands.up._resolve_profile", return_value=(mock.Mock(), _make_profile_mock(), _make_image_mock())
+        ):
+            with mock.patch("hostai.commands.up.image_for_profile", return_value="ghcr.io/test"):
+                with mock.patch("hostai.commands.up.market.resolved_disk_gb", return_value=35):
+                    with mock.patch(
+                        "hostai.commands.up.market.build_search_query", return_value=("query", 1.0)
+                    ) as build:
+                        with mock.patch(
+                            "hostai.commands.up.market.select_offer",
+                            return_value={"id": 1, "dph_total": 0.5, "gpu_name": "A100", "machine_id": 4242},
+                        ) as select:
+                            with mock.patch("hostai.commands.up.market.offer_summary", return_value="summary"):
+                                provider = mock.Mock()
+                                provider.name = "vast"
+                                with mock.patch("hostai.commands.up._provider", return_value=provider):
+                                    result = runner.invoke(
+                                        up.cmd_up,
+                                        ["--machine", "4242", "--dry-run"],
+                                        obj=config,
+                                    )
+    assert result.exit_code == 0
+    assert build.call_args.kwargs["machine"] == 4242
+    assert select.call_args.kwargs["machine"] == 4242
+
+
+def test_cmd_up_machine_conflicts_with_skip_machine(config, project_dir):
+    config.hostai.default_profile = "test"
+    runner = CliRunner()
+    result = runner.invoke(up.cmd_up, ["--machine", "7", "--skip-machine", "7"], obj=config)
+    assert result.exit_code != 0
+    assert "conflicts with a skipped machine id" in result.output
+
+
+def test_cmd_up_restart_ignores_machine_and_offer(config, project_dir):
+    config.hostai.default_profile = "test"
+    runner = CliRunner()
+    with mock.patch("hostai.commands.up._do_restart") as restart:
+        result = runner.invoke(
+            up.cmd_up,
+            ["--restart", "--machine", "9", "--offer", "3"],
+            obj=config,
+        )
+    assert result.exit_code == 0
+    restart.assert_called_once()
+    assert "--machine is ignored" in result.output
+    assert "--offer is ignored" in result.output
 
 
 def test_cmd_up_restart_ignores_skip_options(config, project_dir):

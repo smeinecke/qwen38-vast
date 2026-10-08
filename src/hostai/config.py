@@ -12,7 +12,7 @@ import sys
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional, Type, TypeVar, Union, cast, get_args, get_origin
+from typing import Any, Dict, List, Optional, Type, TypeVar, Union, cast, get_args, get_origin
 
 try:
     import tomllib  # type: ignore
@@ -56,6 +56,12 @@ def _coerce(value: Any, field_type: Any) -> Any:
     if origin is Union:
         inner = [a for a in get_args(field_type) if a is not type(None)]
         field_type = inner[0] if inner else str
+        origin = get_origin(field_type)
+    if origin is list:
+        # TOML arrays arrive as lists; env vars arrive comma-separated.
+        inner = get_args(field_type)[0] if get_args(field_type) else str
+        items = value if isinstance(value, (list, tuple)) else str(value).split(",")
+        return [_coerce(v, inner) for v in (str(i).strip() for i in items) if v != ""]
     if field_type is bool:
         return _as_bool(value)
     if field_type is int:
@@ -130,6 +136,15 @@ class MarketSection:
     # 18.83 decimal GB is the default Q4_K_P main model (17.92) + FastMTP-32K draft (0.90).
     model_download_gb: float = 18.83
     image_size_gb: float = 5.0
+
+
+@dataclass
+class BlocklistSection:
+    """Global offer blocklist; applied to every offer search (up, lookup, monitor)."""
+
+    machines: List[int] = field(default_factory=list)
+    offers: List[int] = field(default_factory=list)
+    countries: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -237,6 +252,7 @@ class Config:
     provider: ProviderSection = field(default_factory=ProviderSection)
     hostai: HostaiSection = field(default_factory=HostaiSection)
     market: MarketSection = field(default_factory=MarketSection)
+    blocklist: BlocklistSection = field(default_factory=BlocklistSection)
     model: ModelSection = field(default_factory=ModelSection)
     image: ImageSection = field(default_factory=ImageSection)
     vast: VastSection = field(default_factory=VastSection)
@@ -254,7 +270,7 @@ class Config:
 
 
 # Mapping from legacy .env / environment variable name to (section, attribute, converter).
-ENV_MAP: Dict[str, tuple[str, str, Optional[Type[Any]]]] = {
+ENV_MAP: Dict[str, tuple[str, str, Any]] = {
     "HOSTAI_PROVIDER": ("provider", "backend", str),
     "HOSTAI_LOCAL_IMAGE": ("provider", "local_image", str),
     "HOSTAI_LOCAL_SHM_SIZE_GB": ("provider", "local_shm_size_gb", int),
@@ -275,6 +291,9 @@ ENV_MAP: Dict[str, tuple[str, str, Optional[Type[Any]]]] = {
     "HOSTAI_MAX_HISTORY_AGE_DAYS": ("market", "max_history_age_days", int),
     "HOSTAI_MODEL_DOWNLOAD_GB": ("market", "model_download_gb", float),
     "HOSTAI_IMAGE_SIZE_GB": ("market", "image_size_gb", float),
+    "HOSTAI_BLOCKLIST_MACHINES": ("blocklist", "machines", List[int]),
+    "HOSTAI_BLOCKLIST_OFFERS": ("blocklist", "offers", List[int]),
+    "HOSTAI_BLOCKLIST_COUNTRIES": ("blocklist", "countries", List[str]),
     "HF_REPO": ("model", "hf_repo", str),
     "HF_REVISION": ("model", "hf_revision", str),
     "MODEL": ("model", "model", str),

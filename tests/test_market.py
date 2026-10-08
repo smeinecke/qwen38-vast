@@ -134,6 +134,36 @@ def test_filter_eligible_offers_respects_max_dph_and_gpu_rank(config):
     assert [o["id"] for o in matches] == [2]
 
 
+def test_build_search_query_pins_machine(config):
+    profiles = Profiles(
+        schema_version=1,
+        images=[],
+        profiles=[make_profile()],
+        monitor_hardware=MonitorHardware(),
+        market_policy=MarketPolicy(require_free_traffic=False),
+    )
+    query, _ = market.build_search_query(config, profiles, make_profile(), machine=4242)
+    assert "machine_id=4242" in query
+
+
+def test_filter_eligible_offers_machine_pin():
+    """--machine keeps only offers hosted on the requested machine."""
+    offers = [
+        {"id": 1, "gpu_name": "RTX 4090", "dph_total": 0.3, "machine_id": 111},
+        {"id": 2, "gpu_name": "RTX 4090", "dph_total": 0.4, "machine_id": "222"},
+    ]
+    matches = market.filter_eligible_offers(offers, max_dph=1.0, machine=222)
+    assert [o["id"] for o in matches] == [2]
+
+
+def test_filter_eligible_offers_machine_pin_still_capped_by_dph():
+    """Unlike --offer, a machine pin does not lift the price cap."""
+    offers = [
+        {"id": 1, "gpu_name": "RTX 4090", "dph_total": 0.9, "machine_id": 222},
+    ]
+    assert market.filter_eligible_offers(offers, max_dph=0.5, machine=222) == []
+
+
 def test_filter_eligible_offers_skip_machines():
     """Skipped machine IDs must remove all offers hosted on those machines."""
     offers = [
@@ -573,6 +603,93 @@ def test_select_offer_skip_machines_no_match(config):
                 offer=None,
                 storage=35,
                 exclusions=market.OfferExclusions(machines=[111]),
+            )
+
+
+def test_select_offer_machine_pin(config):
+    """A machine pin selects the cheapest offer on that machine, not globally."""
+    profiles = Profiles(
+        schema_version=1,
+        images=[],
+        profiles=[make_profile()],
+        monitor_hardware=MonitorHardware(),
+        market_policy=MarketPolicy(),
+    )
+    offers = [
+        {"id": 1, "gpu_name": "RTX 4090", "dph_total": 0.3, "machine_id": 111},
+        {"id": 2, "gpu_name": "RTX 4090", "dph_total": 0.4, "machine_id": 222},
+        {"id": 3, "gpu_name": "RTX 4090", "dph_total": 0.45, "machine_id": 222},
+    ]
+    with mock.patch("hostai.market.search_offers", return_value=offers):
+        best = market.select_offer(
+            config,
+            profiles,
+            "query",
+            max_dph=0.5,
+            unverified=False,
+            offer=None,
+            machine=222,
+            storage=35,
+        )
+    assert best["id"] == 2
+
+
+def test_select_offer_machine_no_match(config):
+    profiles = Profiles(
+        schema_version=1,
+        images=[],
+        profiles=[make_profile()],
+        monitor_hardware=MonitorHardware(),
+        market_policy=MarketPolicy(),
+    )
+    offers = [{"id": 1, "gpu_name": "RTX 4090", "dph_total": 0.3, "machine_id": 111}]
+    with mock.patch("hostai.market.search_offers", return_value=offers):
+        with pytest.raises(click.ClickException, match="on machine 999"):
+            market.select_offer(
+                config,
+                profiles,
+                "query",
+                max_dph=0.5,
+                unverified=False,
+                offer=None,
+                machine=999,
+                storage=35,
+            )
+
+
+def test_select_offer_offer_and_machine_pin(config):
+    """--offer and --machine combine: the offer must sit on that machine."""
+    profiles = Profiles(
+        schema_version=1,
+        images=[],
+        profiles=[make_profile()],
+        monitor_hardware=MonitorHardware(),
+        market_policy=MarketPolicy(),
+    )
+    offers = [{"id": 1, "gpu_name": "RTX 4090", "dph_total": 0.3, "machine_id": 111}]
+    with mock.patch("hostai.market.search_offers", return_value=offers):
+        best = market.select_offer(
+            config,
+            profiles,
+            "query",
+            max_dph=0.5,
+            unverified=False,
+            offer=1,
+            machine=111,
+            storage=35,
+        )
+    assert best["id"] == 1
+    with mock.patch("hostai.market.search_offers", return_value=offers):
+        with pytest.raises(click.ClickException, match="id 1 on machine 222"):
+            market.select_offer(
+                config,
+                profiles,
+                "query",
+                max_dph=0.5,
+                unverified=False,
+                offer=1,
+                machine=222,
+                storage=35,
             )
 
 

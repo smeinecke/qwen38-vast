@@ -25,6 +25,7 @@
 
 ## Lifecycle & Cost
 
+- `hostai up`, `hostai lookup` and `monitor once|watch|start` share `--skip-machine`/`--skip-offer`/`--skip-country`; all skip logic lives in `market.OfferExclusions.is_excluded`. A global `[blocklist]` section in `hostai.toml` (env `HOSTAI_BLOCKLIST_*`) merges into every search via `market.config_exclusions`.
 - `hostai info` shows provider ground truth: account balance/credit (via `get_account_info`) and every instance on the account (via `list_instances`), marking which ids are tracked by local state and summing the running $/h burn.
 - `hostai down --id <provider-id>` (repeatable) destroys/pauses by raw provider id: ids matching tracked instances run the full shutdown path; untracked ids go through `down_remote_instance`, which skips cache save, telemetry archive, and daemon cleanup entirely. `--id` conflicts with `--all`/`--name`.
 - `hostai up` can auto-start a watchdog when `watchdog_auto_start = true` is set in `[vast]`.
