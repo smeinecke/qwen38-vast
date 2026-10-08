@@ -618,10 +618,13 @@ GPU_QUERY_OVERRIDE='num_gpus=1 gpu_ram>=48 cpu_ram>=32 reliability>0.98 inet_dow
 
 `hostai lookup` searches Vast offers for a profile without renting
 (`'*'` searches all profiles; `--max-price`, `--unverified`, `--max-results`,
-`--json`, `--csv`):
+`--json`, `--csv`). The table shows each offer's `machine` id and accepts the
+same `--skip-machine`/`--skip-offer`/`--skip-country` filters as `up`, so you
+can preview the market while excluding a bad host:
 
 ```bash
 uv run hostai lookup 5090-128k --max-price 0.55
+uv run hostai lookup v100-128k --skip-machine 12345
 uv run hostai lookup '*' --csv
 ```
 

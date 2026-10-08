@@ -1,6 +1,8 @@
 import csv
+import fnmatch
 import io
 import json
+import re
 from typing import Any, Dict, List, Optional
 
 import click
@@ -36,10 +38,17 @@ def _resolve_query(
 
 
 def _filter_offers(
-    offers: List[Dict[str, Any]], max_dph: float, require_free: bool, max_down: float, max_up: float
+    offers: List[Dict[str, Any]],
+    max_dph: float,
+    require_free: bool,
+    max_down: float,
+    max_up: float,
+    exclusions: Optional[market.OfferExclusions] = None,
 ) -> List[Dict[str, Any]]:
     out = []
     for o in offers:
+        if exclusions and exclusions.is_excluded(o):
+            continue
         o["_effective_dph"] = o.get("dph_total", 999999)
         if o["_effective_dph"] > max_dph:
             continue
@@ -67,6 +76,7 @@ def _render_table(offers: List[Dict[str, Any]], max_results: int, show_profiles:
         show_lines=True,
     )
     table.add_column("id", justify="right", no_wrap=True)
+    table.add_column("machine", justify="right", no_wrap=True)
     table.add_column("gpu", overflow="fold", no_wrap=False)
     table.add_column("n", justify="right", no_wrap=True)
     table.add_column("dph", justify="right", no_wrap=True)
@@ -80,6 +90,7 @@ def _render_table(offers: List[Dict[str, Any]], max_results: int, show_profiles:
     for o in offers[:max_results]:
         row = [
             str(o.get("id") or o.get("ask_contract_id") or "?"),
+            _fmt_num(o.get("machine_id"), ".0f"),
             str(o.get("gpu_name") or "?"),
             _fmt_num(o.get("num_gpus"), ".0f"),
             _fmt_num(o.get("dph_total")),
@@ -123,6 +134,7 @@ def _search_profile(
     profile: Any,
     max_price: Optional[float],
     unverified: bool,
+    exclusions: Optional[market.OfferExclusions] = None,
 ) -> List[Dict[str, Any]]:
     """Search and filter offers for one profile, tagging matches with its name."""
     image = profiles.image_by_name(profile.image)
@@ -145,6 +157,7 @@ def _search_profile(
         profiles.market_policy.require_free_traffic,
         config.market.max_inet_down_cost,
         config.market.max_inet_up_cost,
+        exclusions=exclusions,
     )
     for o in matches:
         o["_profiles"] = [profile.name]
@@ -152,17 +165,54 @@ def _search_profile(
 
 
 @click.command(
-    "lookup", help="Search Vast offers for a profile without renting. Use '*' as the profile to search all profiles."
+    "lookup",
+    help="Search Vast offers for a profile without renting. Supports '*', glob patterns like '*-256k', and comma/semicolon-separated lists.",
 )
 @click.argument("profile", required=False)
-@click.option("-p", "--profile", "profile_opt", help="Profile to look up, or '*' for all profiles.")
+@click.option(
+    "-p",
+    "--profile",
+    "profile_opt",
+    help="Profile(s): name, glob pattern ('*-256k'), comma/semicolon-separated list, or '*' for all.",
+)
 @click.option("--max-price", type=float, default=None, help="Maximum all-in $/h.")
 @click.option("--unverified", is_flag=True, default=None, help="Also consider unverified/unknown hosts.")
 @click.option("--max-results", type=int, default=10, show_default=True, help="Number of results to show.")
+@click.option(
+    "--skip-machine",
+    "skip_machines",
+    type=int,
+    multiple=True,
+    help="Exclude offers hosted on this Vast machine ID (repeatable).",
+)
+@click.option(
+    "--skip-offer",
+    "skip_offers",
+    type=int,
+    multiple=True,
+    help="Exclude this Vast offer ID (repeatable).",
+)
+@click.option(
+    "--skip-country",
+    "skip_countries",
+    multiple=True,
+    help="Exclude offers in this country (alpha-2 code or name, repeatable).",
+)
 @click.option("--json", "output_format", flag_value="json", help="Output raw JSON array.")
 @click.option("--csv", "output_format", flag_value="csv", help="Output CSV.")
 @click.pass_obj
-def cmd_lookup(config: Config, profile, profile_opt, max_price, unverified, max_results, output_format):
+def cmd_lookup(
+    config: Config,
+    profile,
+    profile_opt,
+    max_price,
+    unverified,
+    max_results,
+    skip_machines,
+    skip_offers,
+    skip_countries,
+    output_format,
+):
     if max_results <= 0:
         raise click.ClickException("--max-results must be a positive integer")
     if max_price is not None and max_price < 0:
@@ -177,10 +227,28 @@ def cmd_lookup(config: Config, profile, profile_opt, max_price, unverified, max_
         if not selected_profiles:
             raise click.ClickException("profiles.json defines no profiles")
     else:
-        selected = _resolve_profile(config, profiles, profile_name)
-        if not selected:
-            raise click.ClickException(f"unknown profile '{profile_name or config.hostai.default_profile}'")
-        selected_profiles = [selected]
+        names = [n.strip() for n in re.split(r"[,;]", profile_name or "") if n.strip()] or [None]
+        selected_profiles = []
+        for n in names:
+            if n is not None and "*" in n:
+                found = [
+                    p
+                    for p in profiles.profiles
+                    if fnmatch.fnmatchcase(p.name, n)
+                    or any(fnmatch.fnmatchcase(a, n) for a in p.aliases or [])
+                ]
+                if not found:
+                    raise click.ClickException(f"profile pattern '{n}' matched no profiles")
+            else:
+                selected = _resolve_profile(config, profiles, n)
+                if not selected:
+                    raise click.ClickException(f"unknown profile '{n or config.hostai.default_profile}'")
+                found = [selected]
+            for p in found:
+                if all(q.name != p.name for q in selected_profiles):
+                    selected_profiles.append(p)
+
+    multi = len(selected_profiles) > 1
 
     unverified = unverified if unverified is not None else config.market.allow_unverified
     # max_dph is identical for every profile; track it for the summary line.
@@ -191,12 +259,18 @@ def cmd_lookup(config: Config, profile, profile_opt, max_price, unverified, max_
     except Exception as e:
         raise click.ClickException(f"search failed: {e}")
 
+    exclusions = market.config_exclusions(config).merged(
+        market.OfferExclusions(machines=skip_machines, offers=skip_offers, countries=skip_countries)
+    )
+    if exclusions:
+        click.echo(f"[exclude] {exclusions.describe()}")
+
     merged: Dict[Any, Dict[str, Any]] = {}
     for p in selected_profiles:
         try:
-            matches = _search_profile(config, profiles, provider, p, max_price, unverified)
+            matches = _search_profile(config, profiles, provider, p, max_price, unverified, exclusions)
         except Exception as e:
-            if not star:
+            if not (star or multi):
                 raise click.ClickException(f"search failed: {e}")
             click.echo(f"[warn] {p.name}: {e}")
             continue
@@ -212,7 +286,7 @@ def cmd_lookup(config: Config, profile, profile_opt, max_price, unverified, max_
     matches = sorted(merged.values(), key=lambda x: x["_effective_dph"])
 
     if not matches:
-        scope = " across all profiles" if star else ""
+        scope = " across the selected profiles" if (star or multi) else ""
         click.echo(f"No matching offers below ${display_max_dph:.2f}/h{scope}.")
         return
 
@@ -221,4 +295,4 @@ def cmd_lookup(config: Config, profile, profile_opt, max_price, unverified, max_
     elif output_format == "csv":
         click.echo(_render_csv(matches[:max_results]))
     else:
-        _render_table(matches, max_results, show_profiles=star)
+        _render_table(matches, max_results, show_profiles=star or multi)

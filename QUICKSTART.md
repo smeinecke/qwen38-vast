@@ -252,9 +252,10 @@ uv run hostai monitor stop
 destroying the instance. Set `HOSTAI_MONITOR_AUTO_START=1` to start the monitor
 automatically after a successful `hostai up`.
 
-`hostai up` and `monitor once|watch|start` accept `--skip-machine`,
-`--skip-offer` and `--skip-country` (repeatable) to exclude hosts, offers or
-countries from the search; exclusions passed to `up` carry over to the monitor.
+`hostai up`, `hostai lookup` and `monitor once|watch|start` accept
+`--skip-machine`, `--skip-offer` and `--skip-country` (repeatable) to exclude
+hosts, offers or countries from the search; exclusions passed to `up` carry
+over to the monitor.
 
 ## 9. Stop billing
 
