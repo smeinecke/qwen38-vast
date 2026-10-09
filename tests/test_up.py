@@ -67,10 +67,23 @@ def test_extra_args_no_cache(config):
     assert up._extra_args(config, no_cache=True) == ""
 
 
+def _spec_profile(**overrides):
+    # spec= is a reserved Mock constructor arg, so spec/spec_depth/spec_p_min
+    # must be assigned after construction to be real attributes.
+    profile = mock.Mock(name="p", image="img", cache_ram=None, ctx_checkpoints=None,
+                        model_sha256=None)
+    profile.spec = None
+    profile.spec_depth = None
+    profile.spec_p_min = None
+    for key, value in overrides.items():
+        setattr(profile, key, value)
+    return profile
+
+
 def test_env_dict_includes_ssh_public_key(config):
     key = "ssh-ed25519 AAAA test"
     config.secrets["SSH_PUBLIC_KEY"] = key
-    profile = mock.Mock(name="p", image="img", cache_ram=None, ctx_checkpoints=None, model_sha256=None)
+    profile = _spec_profile()
     image = mock.Mock(name="img")
     env = up._env_dict(config, profile, image, "model", 32768, "apikey", False, False, "session")
     assert env["HOSTAI_SSH_PUBLIC_KEY_B64"] == base64.b64encode(key.encode()).decode()
@@ -81,7 +94,7 @@ def test_env_dict_slot_cache_enabled(config):
     config.cache.enabled = True
     config.cache.host = "cache.example.com"
     config.cache.rclone = False
-    profile = mock.Mock(name="p", image="img", cache_ram=None, ctx_checkpoints=None, model_sha256=None)
+    profile = _spec_profile()
     image = mock.Mock(name="img")
     env = up._env_dict(config, profile, image, "model", 32768, "apikey", False, False, "session")
     assert env["HOSTAI_SLOT_CACHE_ENABLED"] == "1"
@@ -90,14 +103,14 @@ def test_env_dict_slot_cache_enabled(config):
 
 def test_env_dict_default_reasoning_effort(config):
     config.model.reasoning_effort = "medium"
-    profile = mock.Mock(name="p", image="img", cache_ram=None, ctx_checkpoints=None, model_sha256=None)
+    profile = _spec_profile()
     image = mock.Mock(name="img")
     env = up._env_dict(config, profile, image, "model", 32768, "apikey", False, False, "session")
     assert env["REASONING_EFFORT"] == "medium"
 
 
 def test_env_dict_n_predict(config):
-    profile = mock.Mock(name="p", image="img", cache_ram=None, ctx_checkpoints=None, model_sha256=None)
+    profile = _spec_profile()
     image = mock.Mock(name="img")
     env = up._env_dict(config, profile, image, "model", 32768, "apikey", False, False, "session")
     assert env["N_PREDICT"] == "-1"
@@ -107,6 +120,62 @@ def test_env_dict_n_predict(config):
     config.proxy.default_max_tokens = 0
     env = up._env_dict(config, profile, image, "model", 32768, "apikey", False, False, "session")
     assert env["N_PREDICT"] == "-1"
+
+
+def test_env_dict_spec_defaults(config):
+    env = up._env_dict(config, _spec_profile(), mock.Mock(name="img"),
+                       "model", 32768, "apikey", False, False, "session")
+    assert env["SPEC"] == "fastmtp"
+    assert env["USE_FASTMTP"] == "1"
+    assert "SPEC_DEPTH" not in env
+    assert "SPEC_P_MIN" not in env
+
+
+def test_env_dict_spec_off(config):
+    config.model.spec = "off"
+    env = up._env_dict(config, _spec_profile(), mock.Mock(name="img"),
+                       "model", 32768, "apikey", False, False, "session")
+    assert env["SPEC"] == "off"
+    assert env["USE_FASTMTP"] == "0"
+
+
+def test_env_dict_spec_embedded_from_use_fastmtp(config):
+    config.model.use_fastmtp = False
+    env = up._env_dict(config, _spec_profile(), mock.Mock(name="img"),
+                       "model", 32768, "apikey", False, False, "session")
+    assert env["SPEC"] == "embedded"
+    assert env["USE_FASTMTP"] == "0"
+
+
+def test_env_dict_spec_profile_overrides(config):
+    profile = _spec_profile(spec="embedded", spec_depth=4, spec_p_min=0.5)
+    env = up._env_dict(config, profile, mock.Mock(name="img"),
+                       "model", 32768, "apikey", False, False, "session")
+    assert env["SPEC"] == "embedded"
+    assert env["USE_FASTMTP"] == "0"
+    assert env["SPEC_DEPTH"] == "4"
+    assert env["SPEC_P_MIN"] == "0.5"
+
+
+def test_env_dict_spec_config_wins_over_profile(config):
+    config.model.spec = "off"
+    env = up._env_dict(config, _spec_profile(spec="fastmtp"), mock.Mock(name="img"),
+                       "model", 32768, "apikey", False, False, "session")
+    assert env["SPEC"] == "off"
+
+
+def test_env_dict_spec_alias(config):
+    config.model.spec = "mtp"
+    env = up._env_dict(config, _spec_profile(), mock.Mock(name="img"),
+                       "model", 32768, "apikey", False, False, "session")
+    assert env["SPEC"] == "embedded"
+
+
+def test_env_dict_spec_invalid(config):
+    config.model.spec = "bogus"
+    with pytest.raises(click.ClickException):
+        up._env_dict(config, _spec_profile(), mock.Mock(name="img"),
+                     "model", 32768, "apikey", False, False, "session")
 
 
 def test_resolve_client_port_free(config, project_dir):
@@ -392,6 +461,11 @@ def _make_profile_mock():
     profile.min_gpu_vram_mb = None
     profile.model = None
     profile.model_sha256 = None
+    profile.cache_ram = None
+    profile.ctx_checkpoints = None
+    profile.spec = None
+    profile.spec_depth = None
+    profile.spec_p_min = None
     return profile
 
 

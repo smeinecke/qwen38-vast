@@ -154,6 +154,9 @@ class ModelSection:
     model: str = "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf"
     draft: str = "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-FastMTP-32K.gguf"
     use_fastmtp: bool = True
+    spec: str = ""
+    spec_depth: Optional[int] = None
+    spec_p_min: Optional[float] = None
     reasoning_effort: str = "xhigh"
     cache_ram: Optional[int] = None
     ctx_checkpoints: Optional[int] = None
@@ -299,6 +302,9 @@ ENV_MAP: Dict[str, tuple[str, str, Any]] = {
     "MODEL": ("model", "model", str),
     "DRAFT": ("model", "draft", str),
     "USE_FASTMTP": ("model", "use_fastmtp", bool),
+    "SPEC": ("model", "spec", str),
+    "SPEC_DEPTH": ("model", "spec_depth", int),
+    "SPEC_P_MIN": ("model", "spec_p_min", float),
     "REASONING_EFFORT": ("model", "reasoning_effort", str),
     "CACHE_RAM": ("model", "cache_ram", int),
     "CTX_CHECKPOINTS": ("model", "ctx_checkpoints", int),

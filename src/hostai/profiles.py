@@ -68,6 +68,9 @@ class Profile:
     monitor_search: bool = True
     cache_ram: Optional[int] = None
     ctx_checkpoints: Optional[int] = None
+    spec: Optional[str] = None
+    spec_depth: Optional[int] = None
+    spec_p_min: Optional[float] = None
     disk_gb: Optional[int] = None
     min_gpu_vram_mb: Optional[int] = None
     model: Optional[str] = None

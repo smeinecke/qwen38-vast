@@ -683,6 +683,23 @@ def _find_unclaimed_port(start: int, claimed: Set[int]) -> Optional[int]:
     return None
 
 
+SPEC_MODES = ("fastmtp", "embedded", "off")
+_SPEC_ALIASES = {"mtp": "embedded", "none": "off", "disabled": "off"}
+
+
+def _resolve_spec_mode(config: Config, profile: Any) -> str:
+    """Resolve the speculative-decoding mode: global config wins, then profile, then use_fastmtp."""
+    spec = config.model.spec or getattr(profile, "spec", None) or (
+        "fastmtp" if config.model.use_fastmtp else "embedded"
+    )
+    spec = _SPEC_ALIASES.get(str(spec).strip().lower(), str(spec).strip().lower())
+    if spec not in SPEC_MODES:
+        raise click.ClickException(
+            f"invalid spec mode '{spec}' (expected: {', '.join(SPEC_MODES)})"
+        )
+    return spec
+
+
 def _env_model_overrides(config: Config, profile: Any, env: Dict[str, str]) -> None:
     cache_ram = config.model.cache_ram if config.model.cache_ram is not None else profile.cache_ram
     ctx_checkpoints = (
@@ -692,6 +709,12 @@ def _env_model_overrides(config: Config, profile: Any, env: Dict[str, str]) -> N
         env["CACHE_RAM"] = str(cache_ram)
     if ctx_checkpoints:
         env["CTX_CHECKPOINTS"] = str(ctx_checkpoints)
+    spec_depth = config.model.spec_depth or getattr(profile, "spec_depth", None)
+    if spec_depth:
+        env["SPEC_DEPTH"] = str(spec_depth)
+    spec_p_min = config.model.spec_p_min or getattr(profile, "spec_p_min", None)
+    if spec_p_min:
+        env["SPEC_P_MIN"] = str(spec_p_min)
     if config.model.cache_type_k and config.model.cache_type_k != "default":
         env["CACHE_TYPE_K"] = config.model.cache_type_k
     if config.model.cache_type_v and config.model.cache_type_v != "default":
@@ -736,12 +759,16 @@ def _env_dict(
     session: str,
 ) -> Dict[str, str]:
     slot_dir = cache._default_local_dir(config)
+    spec = _resolve_spec_mode(config, profile)
     env: Dict[str, str] = {
         "HOSTAI_PROFILE": profile.name,
         "LLAMA_API_KEY": api_key,
         "MODEL": model,
         "CTX_SIZE": str(ctx_size),
-        "USE_FASTMTP": str(int(config.model.use_fastmtp)),
+        # SPEC drives start.sh on current images; USE_FASTMTP is still sent so
+        # older image tags keep working (they only know the boolean).
+        "SPEC": spec,
+        "USE_FASTMTP": "1" if spec == "fastmtp" else "0",
         "REASONING_EFFORT": config.model.reasoning_effort,
         "HF_REPO": config.model.hf_repo,
         "HF_REVISION": config.model.hf_revision,

@@ -17,7 +17,11 @@ MODEL="${MODEL:-Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf}"
 DRAFT="${DRAFT:-Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-FastMTP-32K.gguf}"
 MODEL_DIR="${MODEL_DIR:-/models}"
 CTX_SIZE="${CTX_SIZE:-65536}"
-DEPTH="${DEPTH:-3}"
+# SPEC_DEPTH replaces DEPTH (kept as a deprecated alias). It bounds the
+# speculative draft length (--spec-draft-n-max). The verify batch grows with
+# it, so VRAM headroom after model+KV limits how large this can safely be.
+SPEC_DEPTH="${SPEC_DEPTH:-${DEPTH:-3}}"
+SPEC_P_MIN="${SPEC_P_MIN:-0}"
 BATCH_SIZE="${BATCH_SIZE:-2048}"
 UBATCH_SIZE="${UBATCH_SIZE:-512}"
 REASONING_EFFORT="${REASONING_EFFORT:-xhigh}"
@@ -25,6 +29,21 @@ REASONING_EFFORT="${REASONING_EFFORT:-xhigh}"
 # (run until EOS or context end), matching llama-server semantics.
 N_PREDICT="${N_PREDICT:--1}"
 USE_FASTMTP="${USE_FASTMTP:-1}"
+# SPEC selects the speculative-decoding mode: fastmtp (sidecar draft),
+# embedded (built-in MTP head, no draft download) or off (no speculation).
+# Empty derives from USE_FASTMTP for backward compatibility.
+SPEC="${SPEC:-}"
+if [[ -z "$SPEC" ]]; then
+  if [[ "$USE_FASTMTP" == "1" ]]; then
+    SPEC="fastmtp"
+  else
+    SPEC="embedded"
+  fi
+fi
+case "$SPEC" in
+  mtp) SPEC="embedded" ;;
+  none|disabled) SPEC="off" ;;
+esac
 HOSTAI_PROFILE="${HOSTAI_PROFILE:-custom}"
 
 # Slot cache location. The client may suggest a path via HOSTAI_SLOT_CACHE_LOCAL_DIR,
@@ -309,21 +328,35 @@ if [[ -n "${CTX_CHECKPOINTS:-}" ]]; then
   server_args+=(--ctx-checkpoints "$CTX_CHECKPOINTS")
 fi
 
-if [[ "$USE_FASTMTP" == "1" ]]; then
-  download_file "$DRAFT"
-  verify_sha256 "$DRAFT" "$DRAFT_SHA256"
-  record_disk_usage "after-draft-model"
-  server_args+=(
-    --spec-draft-model "$MODEL_DIR/$DRAFT"
-    --spec-draft-ngl all
-    --spec-type draft-mtp
-    --spec-draft-n-max "$DEPTH"
-    --spec-draft-p-min 0
-  )
-else
-  # Stock/embedded MTP path; useful as a fallback when debugging FastMTP.
-  server_args+=(--spec-type draft-mtp)
-fi
+case "$SPEC" in
+  fastmtp)
+    download_file "$DRAFT"
+    verify_sha256 "$DRAFT" "$DRAFT_SHA256"
+    record_disk_usage "after-draft-model"
+    server_args+=(
+      --spec-draft-model "$MODEL_DIR/$DRAFT"
+      --spec-draft-ngl all
+      --spec-type draft-mtp
+      --spec-draft-n-max "$SPEC_DEPTH"
+      --spec-draft-p-min "$SPEC_P_MIN"
+    )
+    ;;
+  embedded)
+    # Stock/embedded MTP path; useful as a fallback when debugging FastMTP.
+    server_args+=(
+      --spec-type draft-mtp
+      --spec-draft-n-max "$SPEC_DEPTH"
+      --spec-draft-p-min "$SPEC_P_MIN"
+    )
+    ;;
+  off)
+    echo "[serve] speculative decoding disabled (SPEC=off)"
+    ;;
+  *)
+    echo >&2 "ERROR: unknown SPEC='$SPEC' (expected: fastmtp, embedded, off)"
+    exit 2
+    ;;
+esac
 
 # Do not forward the Hugging Face credential into llama-server's environment.
 unset HF_TOKEN HUGGING_FACE_HUB_TOKEN || true
@@ -380,7 +413,7 @@ fi
 record_disk_usage "before-serve"
 
 ARCH=$(uname -m 2>/dev/null || echo "unknown")
-echo "[serve] profile=$HOSTAI_PROFILE model=$MODEL revision=$HF_REVISION ctx=$CTX_SIZE fastmtp=$USE_FASTMTP bind=$llama_bind slot_save_path=$SLOT_SAVE_PATH arch=$ARCH"
+echo "[serve] profile=$HOSTAI_PROFILE model=$MODEL revision=$HF_REVISION ctx=$CTX_SIZE spec=$SPEC bind=$llama_bind slot_save_path=$SLOT_SAVE_PATH arch=$ARCH"
 echo "[runtime] arch=$ARCH GPU snapshot:"
 nvidia-smi --query-gpu=timestamp,index,name,driver_version,memory.total,power.limit --format=csv,noheader 2>&1 || nvidia-smi 2>&1 || true
 

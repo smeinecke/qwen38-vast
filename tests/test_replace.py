@@ -403,6 +403,9 @@ def test_create_fresh_instance_sidecar_and_api_key(config, project_dir):
         image="img", cache_ram=None, ctx_checkpoints=None,
         disk_gb=None, min_gpu_vram_mb=None, monitor_group="", model=None, model_sha256=None,
     )
+    plan.profile.spec = None
+    plan.profile.spec_depth = None
+    plan.profile.spec_p_min = None
     plan.profile.name = "test"
     plan.image = mock.Mock(cuda_arch="sm_90", image_tag="img")
     plan.ctx_size = 32768

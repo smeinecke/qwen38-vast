@@ -49,6 +49,14 @@ hf_revision = "993a5971fda8f30dd1b7eb2654792ba4415c7460"
 model = "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf"
 draft = "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-FastMTP-32K.gguf"
 use_fastmtp = true
+# Speculative decoding mode: "fastmtp" (sidecar draft), "embedded" (built-in
+# MTP head, no draft download) or "off". Empty derives from use_fastmtp.
+# spec_depth bounds draft length (verify batches grow with it), spec_p_min
+# prunes weak drafts. Per-profile spec/spec_depth/spec_p_min in profiles.json
+# apply when these are empty.
+spec = ""
+spec_depth = 0
+spec_p_min = 0
 reasoning_effort = "xhigh"
 cache_ram = ""
 ctx_checkpoints = ""

@@ -290,6 +290,11 @@ def _up_profile_mock():
     profile.min_gpu_vram_mb = None
     profile.model = None
     profile.model_sha256 = None
+    profile.cache_ram = None
+    profile.ctx_checkpoints = None
+    profile.spec = None
+    profile.spec_depth = None
+    profile.spec_p_min = None
     return profile
 
 

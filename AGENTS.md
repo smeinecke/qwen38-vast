@@ -34,6 +34,12 @@
 - `hostai cost volume-break-even` estimates whether a persistent model volume is cheaper than re-downloading.
 - `hostai replace` swaps the running machine for a new one (`up`'s selection options; current `machine_id` auto-excluded unless `--allow-same-machine`/`--machine`/`--offer`). The new run stages under `state.replace.json` and `state.json` flips atomically only after the new machine's remote `/health` answers over SSH; the running proxy watches that file and hot-retargets (`TokenizedProxy.retarget` + tunnel re-create) so `proxy.sock`/port never drop. The old `api_key`/port/upstream-socket path are carried over, and the old instance is destroyed only after `/_hostai/backend` confirms the new id is healthy — a retarget timeout destroys nothing (state tracks the new instance; the old stays up for manual `down --id`).
 
+## Speculative decoding
+
+- `SPEC` env selects the mode inside the container: `fastmtp` (FastMTP-32K sidecar draft, default), `embedded` (built-in MTP/NextN head, no draft download) or `off` (no speculation). Empty SPEC derives from `USE_FASTMTP` for backward compatibility; per-profile `spec`/`spec_depth`/`spec_p_min` fields in profiles.json override the global `[model]` settings, and `[model] spec` overrides `use_fastmtp`.
+- `SPEC_DEPTH` (llama `--spec-draft-n-max`, default 3) bounds draft length. The verify batch grows with it, so on GPUs with little free VRAM after model+KV, large drafts can OOM-abort llama-server mid-generation. `SPEC_P_MIN` (llama `--spec-draft-p-min`, default 0) prunes low-probability drafts.
+- Spec gains approach zero on compute-bound GPUs (e.g. Pascal P100): verify batches cost ~linearly more than single-token decode there even at high acceptance. Check per-run `draft acceptance`/`eval time` lines in server.log when evaluating a new GPU class.
+
 ## Container disk and model storage
 
 - The default `market.disk_gb` is 35, sized for the Q4_K_P main model (~16.7 GiB = 17.92 decimal GB) + FastMTP-32K draft (~0.84 GiB = 0.90 decimal GB) + ~5 GB image/runtime overhead + safety margin.  You can override per-profile with `disk_gb` in `profiles.json`.
