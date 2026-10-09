@@ -235,6 +235,8 @@
       "monitor_group": "q4-64k",
       "gpu_query": "num_gpus=1 gpu_name=RTX_5090 gpu_ram>=32 cpu_ram>=32 reliability>0.95 inet_down>=300 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
       "monitor_search": true,
+      "spec": "fastmtp",
+      "spec_depth": 3,
       "disk_gb": 35
     },
     {
@@ -249,6 +251,8 @@
       "monitor_group": "q4-128k",
       "gpu_query": "num_gpus=1 gpu_name=RTX_5090 gpu_ram>=32 cpu_ram>=32 reliability>0.95 inet_down>=300 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
       "monitor_search": false,
+      "spec": "fastmtp",
+      "spec_depth": 3,
       "disk_gb": 35
     },
     {
@@ -264,6 +268,8 @@
       "monitor_group": "q4-128k",
       "gpu_query": "num_gpus=1 gpu_name in [\"RTX_5090\",\"RTX_PRO_4500\",\"RTX_PRO_5000\"] gpu_ram>=32 cpu_ram>=32 reliability>0.95 inet_down>=300 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
       "monitor_search": true,
+      "spec": "fastmtp",
+      "spec_depth": 3,
       "disk_gb": 35
     },
     {
@@ -278,6 +284,8 @@
       "monitor_group": "q4-256k",
       "gpu_query": "num_gpus=1 gpu_name=RTX_PRO_6000 gpu_ram>=90 cpu_ram>=32 reliability>0.95 inet_down>=300 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
       "monitor_search": true,
+      "spec": "fastmtp",
+      "spec_depth": 3,
       "disk_gb": 35,
       "model": "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q6_K_P.gguf",
       "model_sha256": "70c8139f4dcd05d3818bc9843cde7301faa44f66321e5966965929baa9c24a6a"
@@ -293,6 +301,8 @@
       "cache_ram": 32768,
       "ctx_checkpoints": 0,
       "gpu_query": "num_gpus=1 gpu_name in [\"RTX_PRO_6000\",\"RTX_PRO_6000_WS\",\"RTX_PRO_6000_S\"] gpu_ram>=90 cpu_ram>=32 reliability>0.95 inet_down>=300 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
+      "spec": "fastmtp",
+      "spec_depth": 3,
       "disk_gb": 35,
       "model": "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q6_K_P.gguf",
       "model_sha256": "70c8139f4dcd05d3818bc9843cde7301faa44f66321e5966965929baa9c24a6a"
@@ -310,6 +320,8 @@
       "monitor_group": "q4-128k",
       "gpu_query": "num_gpus=1 gpu_name in [\"RTX_PRO_6000\",\"RTX_PRO_6000_WS\",\"RTX_PRO_6000_S\"] gpu_ram>=90 cpu_ram>=32 reliability>0.95 inet_down>=300 disk_bw>=200 cuda_vers>=12.8 rented=False rentable=True direct_port_count>=1",
       "monitor_search": true,
+      "spec": "fastmtp",
+      "spec_depth": 3,
       "disk_gb": 35,
       "model": "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q6_K_P.gguf",
       "model_sha256": "70c8139f4dcd05d3818bc9843cde7301faa44f66321e5966965929baa9c24a6a"
@@ -370,6 +382,8 @@
       "monitor_group": "q4-128k",
       "gpu_query": "num_gpus=1 gpu_name=GB10 cpu_arch=arm64 gpu_ram>=115 cpu_ram>=32 reliability>0.90 inet_down>=300 disk_bw>=200 cuda_max_good>=13.0 rented=False rentable=True direct_port_count>=1",
       "monitor_search": false,
+      "spec": "fastmtp",
+      "spec_depth": 3,
       "disk_gb": 40,
       "min_gpu_vram_mb": 115000,
       "model": "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q6_K_P.gguf",
@@ -390,6 +404,8 @@
       "monitor_group": "q4-256k",
       "gpu_query": "num_gpus=1 gpu_name=GB10 cpu_arch=arm64 gpu_ram>=115 cpu_ram>=32 reliability>0.90 inet_down>=300 disk_bw>=200 cuda_max_good>=13.0 rented=False rentable=True direct_port_count>=1",
       "monitor_search": false,
+      "spec": "fastmtp",
+      "spec_depth": 3,
       "disk_gb": 40,
       "min_gpu_vram_mb": 115000,
       "model": "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q6_K_P.gguf",
@@ -408,6 +424,8 @@
       "monitor_group": "q4-128k",
       "gpu_query": "num_gpus=1 gpu_name in [\"Tesla V100\"] gpu_ram>=32 cpu_ram>=32 reliability>0.95 inet_down>=300 disk_bw>=200 cuda_vers>=12.2 rented=False rentable=True direct_port_count>=1",
       "monitor_search": true,
+      "spec": "fastmtp",
+      "spec_depth": 3,
       "disk_gb": 35
     },
     {
