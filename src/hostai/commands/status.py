@@ -134,10 +134,10 @@ def _fetch_gpu_snapshot(ssh_url: str, known_hosts: Path) -> Optional[str]:
     # for the total attributed to GPU processes.
     remote = (
         "line=$(nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu"
-        " --format=csv,noheader 2>/dev/null); echo \"$line\"; "
+        ' --format=csv,noheader 2>/dev/null); echo "$line"; '
         "if echo \"$line\" | grep -q 'N/A'; then "
         "awk '/MemTotal/{t=$2}/MemAvailable/{a=$2}END"
-        "{printf \"sys-mem used=%.1f GiB avail=%.1f GiB total=%.1f GiB\\n\", (t-a)/1048576, a/1048576, t/1048576}' /proc/meminfo; "
+        '{printf "sys-mem used=%.1f GiB avail=%.1f GiB total=%.1f GiB\\n", (t-a)/1048576, a/1048576, t/1048576}\' /proc/meminfo; '
         "nvidia-smi --query-compute-apps=used_memory --format=csv,noheader,nounits 2>/dev/null"
         " | awk '{s+=$1}END{if(s>0) printf \"gpu-procs %.1f GiB\\n\", s/1024}'; "
         "fi"

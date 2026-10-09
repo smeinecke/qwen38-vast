@@ -1153,9 +1153,7 @@ class TokenizedProxy:
             for tail in detok.finish():
                 self._log_content("delta", req_id, **tail)
                 await stream.write(self._build_sse_chunk(completion_id, created, model, tail, None))
-        usage_chunk = self._usage_chunk(
-            completion_id, created, model, include_usage, last_obj, prompt_tokens, detok
-        )
+        usage_chunk = self._usage_chunk(completion_id, created, model, include_usage, last_obj, prompt_tokens, detok)
         if usage_chunk:
             await stream.write(usage_chunk)
         await stream.write(b"data: [DONE]\n\n")

@@ -689,14 +689,12 @@ _SPEC_ALIASES = {"mtp": "embedded", "none": "off", "disabled": "off"}
 
 def _resolve_spec_mode(config: Config, profile: Any) -> str:
     """Resolve the speculative-decoding mode: global config wins, then profile, then use_fastmtp."""
-    spec = config.model.spec or getattr(profile, "spec", None) or (
-        "fastmtp" if config.model.use_fastmtp else "embedded"
+    spec = (
+        config.model.spec or getattr(profile, "spec", None) or ("fastmtp" if config.model.use_fastmtp else "embedded")
     )
     spec = _SPEC_ALIASES.get(str(spec).strip().lower(), str(spec).strip().lower())
     if spec not in SPEC_MODES:
-        raise click.ClickException(
-            f"invalid spec mode '{spec}' (expected: {', '.join(SPEC_MODES)})"
-        )
+        raise click.ClickException(f"invalid spec mode '{spec}' (expected: {', '.join(SPEC_MODES)})")
     return spec
 
 

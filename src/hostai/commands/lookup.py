@@ -234,8 +234,7 @@ def cmd_lookup(
                 found = [
                     p
                     for p in profiles.profiles
-                    if fnmatch.fnmatchcase(p.name, n)
-                    or any(fnmatch.fnmatchcase(a, n) for a in p.aliases or [])
+                    if fnmatch.fnmatchcase(p.name, n) or any(fnmatch.fnmatchcase(a, n) for a in p.aliases or [])
                 ]
                 if not found:
                     raise click.ClickException(f"profile pattern '{n}' matched no profiles")

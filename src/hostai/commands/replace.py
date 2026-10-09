@@ -63,10 +63,7 @@ def _remote_health_probe(state: State) -> str:
     key = shlex.quote(state.api_key or "")
     dest = ssh._default_remote_dest(state)
     if ":" in dest:
-        return (
-            f"curl -fsS --max-time 8 -o /dev/null "
-            f"-H 'Authorization: Bearer {key}' http://{dest}/health"
-        )
+        return f"curl -fsS --max-time 8 -o /dev/null -H 'Authorization: Bearer {key}' http://{dest}/health"
     return (
         f"curl -fsSk --max-time 8 --unix-socket {shlex.quote(dest)} -o /dev/null "
         f"-H 'Authorization: Bearer {key}' https://localhost/health"
@@ -166,9 +163,7 @@ def _boot_staged(
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "no output").strip()
-        raise click.ClickException(
-            f"remote llama-server preflight failed (rc={result.returncode}): {detail}"
-        )
+        raise click.ClickException(f"remote llama-server preflight failed (rc={result.returncode}): {detail}")
     state.data["cuda_arch"] = image.cuda_arch
 
     _deliver_tls_cert(config, state, known_hosts)
@@ -194,8 +189,7 @@ def _destroy_staged(config: Config, staged: State, staged_file: Path) -> None:
             _log(f"[replace] cleaned up staged instance {staged.instance_id}")
         except Exception as exc:
             _log(
-                f"[replace] WARNING: failed to destroy staged instance "
-                f"{staged.instance_id}: {exc}",
+                f"[replace] WARNING: failed to destroy staged instance {staged.instance_id}: {exc}",
                 err=True,
             )
     staged_file.unlink(missing_ok=True)
@@ -335,9 +329,7 @@ def _do_replace(
     old = State.load(state_file)
     if not old.instance_id:
         flag = "" if instance == state_mod.DEFAULT_INSTANCE else f" --name {instance}"
-        raise click.ClickException(
-            f"nothing to replace for instance '{instance}'; run 'hostai up{flag}' first"
-        )
+        raise click.ClickException(f"nothing to replace for instance '{instance}'; run 'hostai up{flag}' first")
 
     old_id = old.instance_id
     old_machine = old.data.get("machine_id")
@@ -365,9 +357,7 @@ def _do_replace(
     if not no_cache and not dry_run:
         try:
             run_dir = _resolve_run_dir(config, old)
-            cache_mod.save_and_upload_slot_cache(
-                config, old, run_dir, False, known_hosts
-            )
+            cache_mod.save_and_upload_slot_cache(config, old, run_dir, False, known_hosts)
         except Exception as exc:
             _log(f"[replace] slot-cache save on old instance failed: {exc}; continuing", err=True)
 
@@ -421,9 +411,7 @@ def _do_replace(
         if not staged.unsecure and not staged.data["upstream_socket"]:
             staged.data["upstream_socket"] = str(state_file.parent / "upstream.sock")
         staged.data["proxy_pid"] = proxy_pid or old.data.get("proxy_pid")
-        staged.data["proxy_port"] = (
-            old.data.get("proxy_port") or config.proxy.port or old.local_port
-        )
+        staged.data["proxy_port"] = old.data.get("proxy_port") or config.proxy.port or old.local_port
         staged.data["instance_name"] = instance
         staged.save()
 
