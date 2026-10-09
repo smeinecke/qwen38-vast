@@ -5,6 +5,7 @@
 - Dependencies are managed with `uv` and locked in `uv.lock`.
 - Use `uv run pytest` to run the test suite.
 - Use `uv run ruff check src/hostai` for linting and `uv run ruff check --fix src/hostai` for auto-fixes.
+- Use `uv run ruff format --check .` for formatting; CI (`check.yml`, Makefile `format` target) enforces it on the whole repo including `tests/`. Run `uv run ruff format .` before pushing - `ruff check` alone does not catch format drift.
 - Use `uv run pyright src/hostai` for type checking.
 - Use `bash -n start.sh` to validate shell script syntax.
 - Some tests download the Qwen/Qwen3.8-27B tokenizer and are marked `slow`; use `uv run pytest -m "not slow"` to skip them.
@@ -23,6 +24,7 @@
 - Opt-in content logging is available via `[proxy] log_content = true` (or `HOSTAI_PROXY_LOG_CONTENT=1`). It writes one JSON record per line (request, delta, response, done, error events) to `.hostai-cache/proxy-content.jsonl`, flushed per line so `tail -f` shows prompts and streaming responses live. It is off by default; `proxy.log` stays content-free either way.
 - `hostai log` renders that JSONL as a live chat-style transcript (follows by default; `-n` for backlog size, `--no-follow` to print once, `--ops` to tail the raw operational `proxy.log`).
 - The remote container image must be rebuilt/pushed when `Dockerfile`, `start.sh`, `patches/`, or `src/hostai/remote_guard.py` change because the guard runs inside the image.
+- `docker.yml` runs on push to main but skips the build matrix when no docker-path files changed. It also has `cancel-in-progress: true`: a follow-up push (e.g. a lint fix) cancels a running image build. If that happens, re-trigger manually with `gh workflow run docker.yml --ref main`.
 
 ## Lifecycle & Cost
 
